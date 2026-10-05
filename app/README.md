@@ -1,6 +1,6 @@
 # OptImageEditor app
 
-Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1-a（ビューワーの骨組み）。
+Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1-a（ビューワーの骨組み）が完了。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
 
 ## 前提（Windows）
 
@@ -36,6 +36,7 @@ npm run tauri build  # 配布用にビルドする（src-tauri/target/release/ �
 | Ctrl+W | 画像を閉じる（GPU のテクスチャを解放する） |
 | F11 | 全画面 |
 | F2 | 計測パネルの表示 / 非表示（「コピー」で計測結果をクリップボードへ） |
+| F3 / F5 | （計測用）読み込み方式の切り替え（共有メモリ / IPC 一括 / IPC 分割並列）/ 再読み込み |
 | 起動時の引数 | `optimageeditor.exe <画像のパス>` で、その画像を開いて起動する（「プログラムから開く」の土台） |
 
 ## 構成
