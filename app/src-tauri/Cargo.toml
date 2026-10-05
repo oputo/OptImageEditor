@@ -30,6 +30,10 @@ rayon = "1"
 webview2-com = "0.39"
 windows-core = "0.62"
 
+# Keep `tauri dev` representative for performance: optimize our own crate (image decoding hot loops) in dev builds too
+[profile.dev.package.optimageeditor]
+opt-level = 3
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1

@@ -7,7 +7,8 @@
 | ブラウザの `File.slice()`（HTML5 ドロップ、フェーズ 0） | — | 61 ms | 165 ms | 0.42 秒 |
 | Rust `read_range` → IPC（一括） | 13.5〜13.9 ms | 476 ms | 440 ms | 1.09 秒 |
 | Rust `read_range` → IPC（8MB に分割して並列） | 2〜8 ms × 11 | 492 ms | 442 ms | 1.09 秒 |
-| **Rust → WebView2 SharedBuffer（案 A、実装済み）** | 23〜24 ms | **79 ms** | 455 ms | **0.69 秒** |
+| Rust → WebView2 SharedBuffer（案 A） | 23〜24 ms | 79 ms | 455 ms（JS） | 0.69 秒 |
+| **Rust で統合画像を並列デコード → 共有メモリ（案 2）** | 13〜15 ms | 14 ms | **76 ms（Rust、dev ビルド）** | **0.30 秒**（GPU 転送 185 ms） |
 
 ## 分かったこと
 
@@ -32,3 +33,10 @@
 - 次の候補:
   1. JS 側のデコードが遅くなった原因の調査（Edge ブラウザで `npm run dev` を開いた場合との比較、デコード内訳の計測）
   2. 表示用の統合画像のデコードを Rust に移す（RLE の展開を行単位で並列化し、RGBA を共有メモリに直接書き、JS はコピーせずに GPU へ転送する）
+
+## 案 2 の結果（2026-10-06）
+
+- 合計 1.09 秒 → 0.69 秒 → **0.30 秒**。デコードは 455ms（JS）→ 76ms（Rust、最適化なしの dev ビルド）。
+- 残りの大半は GPU 転送（185ms）。対策として次の 2 点を入れた（再計測待ち）:
+  - Rust 側で事前乗算（premultiplied alpha）した RGBA を出力し、WebGL の `UNPACK_PREMULTIPLY_ALPHA_WEBGL` を外す。ブラウザ側での画素ごとの変換をなくし、速い転送経路に乗せるため。
+  - dev ビルドでも自クレート（画像デコード処理）を `opt-level = 3` にする。`tauri dev` での計測値を実運用に近づけるため。

@@ -87,7 +87,7 @@ async fn read_range_shared(webview: tauri::Webview, path: String, offset: u64, l
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompositeLoad {
-    /// true: RGBA8 pixels were posted as a shared buffer (event "sharedbufferreceived" with oieId = id)
+    /// true: premultiplied RGBA8 pixels were posted as a shared buffer (event "sharedbufferreceived" with oieId = id)
     posted: bool,
     /// set when the file cannot be handled here (the page then uses its own decoder)
     unsupported: Option<String>,
@@ -128,7 +128,7 @@ async fn load_composite_shared(webview: tauri::Webview, path: String, id: u32) -
         f.read_exact(&mut data).map_err(|e| e.to_string())?;
         let read_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = std::time::Instant::now();
-        composite::decode_rgba(&info2, &data, dst).map_err(|e| e.to_string())?;
+        composite::decode_rgba(&info2, &data, dst, true).map_err(|e| e.to_string())?;
         Ok((read_ms, t1.elapsed().as_secs_f64() * 1000.0))
     })
     .await;

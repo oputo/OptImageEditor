@@ -65,7 +65,7 @@ export async function loadImage(src: FileSource): Promise<LoadedImage> {
         bitsPerChannel: info.depth,
         layerInfo: `${Math.abs(info.layerCount)} layer records${info.hasAlpha ? " (transparent)" : ""}`,
         note: info.depth > 8 ? "表示用に 8bit へ変換" : undefined,
-        image: { kind: "rgba", width: info.width, height: info.height, data: new Uint8ClampedArray(pixels.buffer) },
+        image: { kind: "rgba", width: info.width, height: info.height, data: new Uint8ClampedArray(pixels.buffer), premultiplied: true },
         stats: { fileSize: src.size, bytesRead: info.imageDataLen, readMs: load.readMs, decodeMs: load.decodeMs, workerMs: performance.now() - t0 },
         release: pixels.release,
         via: "shared + Rust decode",

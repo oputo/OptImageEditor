@@ -129,8 +129,9 @@ fn unpack_bits(src: &[u8], dst: &mut [u8]) -> Result<(), CompositeError> {
 }
 
 /// Decodes the image data section (`data` = bytes from `info.image_data_offset` to EOF) into RGBA8 `out`
-/// (straight / non-premultiplied alpha, length = width * height * 4).
-pub fn decode_rgba(info: &CompositeInfo, data: &[u8], out: &mut [u8]) -> Result<(), CompositeError> {
+/// (length = width * height * 4). With `premultiply` the color is multiplied by alpha (what the GPU wants);
+/// otherwise straight alpha.
+pub fn decode_rgba(info: &CompositeInfo, data: &[u8], out: &mut [u8], premultiply: bool) -> Result<(), CompositeError> {
     let (w, h) = (info.width as usize, info.height as usize);
     if out.len() != w * h * 4 { return Err(CompositeError::Invalid("output size".into())); }
     let gray = match info.color_mode {
@@ -215,15 +216,22 @@ pub fn decode_rgba(info: &CompositeInfo, data: &[u8], out: &mut [u8]) -> Result<
                 for px in dst.chunks_exact_mut(4) { px[1] = px[0]; px[2] = px[0]; }
             }
             if info.has_alpha {
-                // Photoshop stores the merged image matted against white: undo it
+                // Photoshop stores the merged image matted against white: C = c*a + 255*(1-a).
                 for px in dst.chunks_exact_mut(4) {
                     let a = px[3] as f32;
-                    if a > 0.0 && a < 255.0 {
-                        let k = 255.0 / a;
-                        for c in 0..3 {
-                            let v = (px[c] as f32 - 255.0) * k + 255.0;
-                            px[c] = v.round().clamp(0.0, 255.0) as u8;
-                        }
+                    if a >= 255.0 { continue; }
+                    if a <= 0.0 {
+                        if premultiply { px[0] = 0; px[1] = 0; px[2] = 0; }
+                        continue;
+                    }
+                    for c in 0..3 {
+                        let v = if premultiply {
+                            // premultiplied color = c*a = C - 255*(1-a)
+                            px[c] as f32 - (255.0 - a)
+                        } else {
+                            (px[c] as f32 - 255.0) * (255.0 / a) + 255.0
+                        };
+                        px[c] = v.round().clamp(0.0, if premultiply { a } else { 255.0 }) as u8;
                     }
                 }
             }
@@ -239,7 +247,7 @@ pub fn load_rgba(path: &str) -> Result<(CompositeInfo, Vec<u8>), CompositeError>
     let info = read_info(&mut f)?;
     let data = read_at(&mut f, info.image_data_offset, info.image_data_len as usize)?;
     let mut out = vec![0u8; info.width as usize * info.height as usize * 4];
-    decode_rgba(&info, &data, &mut out)?;
+    decode_rgba(&info, &data, &mut out, false)?;
     Ok((info, out))
 }
 
@@ -254,6 +262,34 @@ mod tests {
         let mut dst = [0u8; 8];
         unpack_bits(&src, &mut dst).unwrap();
         assert_eq!(dst, [1, 2, 3, 0xAA, 0xAA, 0xAA, 0xAA, 9]);
+    }
+
+    /// Premultiplied output must equal straight output * alpha (within rounding).
+    #[test]
+    fn premultiplied_matches_straight() {
+        let Ok(dir) = std::env::var("OIE_SAMPLES") else { return };
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().map(|x| x != "psd").unwrap_or(true) { continue; }
+            let mut f = File::open(&p).unwrap();
+            let info = read_info(&mut f).unwrap();
+            if !info.has_alpha { continue; }
+            let data = read_at(&mut f, info.image_data_offset, info.image_data_len as usize).unwrap();
+            let n = info.width as usize * info.height as usize * 4;
+            let (mut straight, mut pre) = (vec![0u8; n], vec![0u8; n]);
+            decode_rgba(&info, &data, &mut straight, false).unwrap();
+            decode_rgba(&info, &data, &mut pre, true).unwrap();
+            let mut max = 0i32;
+            for (s, q) in straight.chunks_exact(4).zip(pre.chunks_exact(4)) {
+                assert_eq!(s[3], q[3]);
+                for c in 0..3 {
+                    let want = (s[c] as f32 * s[3] as f32 / 255.0).round() as i32;
+                    max = max.max((want - q[c] as i32).abs());
+                }
+            }
+            eprintln!("{}: premultiplied max diff {max}", p.file_name().unwrap().to_string_lossy());
+            assert!(max <= 1, "{}", p.display());
+        }
     }
 
     /// Compares against reference RGBA dumps produced by `tools/composite_ref.py` (psd-tools).

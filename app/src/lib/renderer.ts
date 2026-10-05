@@ -31,7 +31,7 @@ void main() {
 type Tile = { tex: WebGLTexture; x: number; y: number; w: number; h: number };
 
 export type ImageSource =
-  | { kind: "rgba"; width: number; height: number; data: Uint8ClampedArray }
+  | { kind: "rgba"; width: number; height: number; data: Uint8ClampedArray; premultiplied?: boolean }
   | { kind: "bitmap"; width: number; height: number; bitmap: ImageBitmap };
 
 export class Renderer {
@@ -121,7 +121,8 @@ export class Renderer {
         const levels = Math.floor(Math.log2(Math.max(w, h))) + 1;
         gl.texStorage2D(gl.TEXTURE_2D, levels, gl.RGBA8, w, h);
         if (src.kind === "rgba") {
-          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+          // already-premultiplied data takes the fast upload path (no per-pixel conversion in the browser)
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !src.premultiplied);
           gl.pixelStorei(gl.UNPACK_ROW_LENGTH, src.width);
           gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, x);
           gl.pixelStorei(gl.UNPACK_SKIP_ROWS, y);
