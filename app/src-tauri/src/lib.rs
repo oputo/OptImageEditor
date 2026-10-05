@@ -59,6 +59,131 @@ async fn read_range(path: String, offset: u64, length: u64) -> Result<Response, 
     .map_err(|e| e.to_string())?
 }
 
+/// Zero-copy read for Windows: the file range is read straight into a WebView2 shared buffer
+/// (ICoreWebView2SharedBuffer) which is then posted to the page ("sharedbufferreceived" event).
+/// Returns Ok(false) when not available (other OS / old WebView2 runtime) so the caller falls back to `read_range`.
+#[tauri::command]
+async fn read_range_shared(webview: tauri::Webview, path: String, offset: u64, length: u64, id: u32) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        shared::read_range_shared(webview, path, offset, length, id).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (webview, path, offset, length, id);
+        Ok(false)
+    }
+}
+
+#[cfg(windows)]
+mod shared {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Environment12, ICoreWebView2SharedBuffer, ICoreWebView2_17,
+        COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
+    };
+    use windows_core::{Interface, PCWSTR};
+
+    thread_local! {
+        // shared buffers waiting to be posted; COM objects live on the UI thread only
+        static PENDING: RefCell<HashMap<u32, ICoreWebView2SharedBuffer>> = RefCell::new(HashMap::new());
+    }
+
+    /// Runs `f` on the UI thread (where WebView2 COM objects live) and waits for its result.
+    async fn on_ui<T: Send + 'static>(
+        webview: &tauri::Webview,
+        f: impl FnOnce(tauri::webview::PlatformWebview) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        webview
+            .with_webview(move |pw| { let _ = tx.send(f(pw)); })
+            .map_err(|e| e.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || rx.recv().map_err(|e| e.to_string())?)
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    fn discard(id: u32) {
+        PENDING.with(|m| {
+            if let Some(sb) = m.borrow_mut().remove(&id) {
+                unsafe { let _ = sb.Close(); }
+            }
+        });
+    }
+
+    pub async fn read_range_shared(webview: tauri::Webview, path: String, offset: u64, length: u64, id: u32) -> Result<bool, String> {
+        let size = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
+        let start = offset.min(size);
+        let len = length.min(size - start);
+        if len == 0 {
+            return Ok(false);
+        }
+
+        // 1) create the shared buffer on the UI thread; None = API not supported by this WebView2 runtime
+        let ptr: Option<usize> = on_ui(&webview, move |pw| unsafe {
+            let env12 = match pw.environment().cast::<ICoreWebView2Environment12>() {
+                Ok(e) => e,
+                Err(_) => return Ok(None),
+            };
+            let sb = env12.CreateSharedBuffer(len).map_err(|e| format!("CreateSharedBuffer: {e}"))?;
+            let mut p: *mut u8 = std::ptr::null_mut();
+            sb.Buffer(&mut p).map_err(|e| format!("SharedBuffer.Buffer: {e}"))?;
+            PENDING.with(|m| m.borrow_mut().insert(id, sb));
+            Ok(Some(p as usize))
+        })
+        .await?;
+        let Some(ptr) = ptr else { return Ok(false) };
+
+        // 2) read the file straight into the shared memory (off the UI thread)
+        let t0 = std::time::Instant::now();
+        let path2 = path.clone();
+        let read = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            // SAFETY: the buffer stays mapped until it is closed in step 3 (or by `discard`)
+            let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+            let mut f = File::open(&path2).map_err(|e| format!("{path2}: {e}"))?;
+            f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+            f.read_exact(dst).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+        if let Err(e) = read {
+            let _ = on_ui(&webview, move |_| { discard(id); Ok(()) }).await;
+            return Err(e);
+        }
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[read_range_shared] {:>8.1} MB  disk {:>6.1} ms  offset {}",
+            len as f64 / 1048576.0,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            start
+        );
+        #[cfg(not(debug_assertions))]
+        let _ = t0;
+
+        // 3) post it to the page, then close our native view of it (the page keeps its own mapping)
+        on_ui(&webview, move |pw| unsafe {
+            let sb = PENDING.with(|m| m.borrow_mut().remove(&id)).ok_or("shared buffer lost")?;
+            let result = (|| -> Result<(), String> {
+                let core = pw.controller().CoreWebView2().map_err(|e| e.to_string())?;
+                let core17 = core.cast::<ICoreWebView2_17>().map_err(|e| format!("ICoreWebView2_17: {e}"))?;
+                let json: Vec<u16> = format!("{{\"oieId\":{id}}}").encode_utf16().chain(std::iter::once(0)).collect();
+                core17
+                    .PostSharedBufferToScript(&sb, COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY, PCWSTR(json.as_ptr()))
+                    .map_err(|e| format!("PostSharedBufferToScript: {e}"))
+            })();
+            let _ = sb.Close();
+            result
+        })
+        .await?;
+        Ok(true)
+    }
+}
+
 /// Natural ordering: "img2" < "img10", case-insensitive (similar to Windows Explorer).
 fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (a, b) = (a.to_lowercase(), b.to_lowercase());
@@ -123,7 +248,7 @@ fn startup_paths() -> Vec<String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![file_info, read_range, list_images, startup_paths])
+        .invoke_handler(tauri::generate_handler![file_info, read_range, read_range_shared, list_images, startup_paths])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
