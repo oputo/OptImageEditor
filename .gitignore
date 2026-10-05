@@ -1,0 +1,24 @@
+# 検証用の素材（実案件データを含む可能性があるため管理対象外）
+_tmp/
+
+# Claude Desktop がファイルを書き出すフォルダ
+Claude outputs/
+
+# Node / Tauri
+node_modules/
+dist/
+src-tauri/target/
+*.log
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# 検証スクリプトの出力
+spike/**/out/
+
+# OS が作る作業ファイル
+Thumbs.db
+desktop.ini
+.DS_Store
