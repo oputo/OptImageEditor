@@ -30,6 +30,9 @@ export class BrowserFileSource implements FileSource {
 
 export type FileInfo = { size: number; modifiedMs: number };
 
+/** Diagnostics: how large reads go through the Tauri IPC (switch with F3 in the app). */
+export const readTuning: { mode: "single" | "parallel"; chunkBytes: number } = { mode: "single", chunkBytes: 8 << 20 };
+
 export class TauriFileSource implements FileSource {
   private constructor(readonly path: string, readonly size: number) {}
   get name() { return baseName(this.path); }
@@ -41,8 +44,21 @@ export class TauriFileSource implements FileSource {
 
   async read(offset: number, length: number): Promise<ArrayBuffer> {
     const len = Math.max(0, Math.min(length, this.size - offset));
-    // Rust returns raw bytes (tauri::ipc::Response) -> ArrayBuffer, no JSON/base64 overhead
-    return invoke<ArrayBuffer>("read_range", { path: this.path, offset, length: len });
+    const chunk = readTuning.chunkBytes;
+    if (readTuning.mode === "single" || len <= chunk) {
+      // Rust returns raw bytes (tauri::ipc::Response) -> ArrayBuffer, no JSON/base64 overhead
+      return invoke<ArrayBuffer>("read_range", { path: this.path, offset, length: len });
+    }
+    // parallel: split into chunks, request them concurrently, then join
+    const parts: Promise<ArrayBuffer>[] = [];
+    for (let o = 0; o < len; o += chunk) {
+      parts.push(invoke<ArrayBuffer>("read_range", { path: this.path, offset: offset + o, length: Math.min(chunk, len - o) }));
+    }
+    const bufs = await Promise.all(parts);
+    const out = new Uint8Array(len);
+    let p = 0;
+    for (const b of bufs) { out.set(new Uint8Array(b), p); p += b.byteLength; }
+    return out.buffer;
   }
 
   readAll() { return this.read(0, this.size); }

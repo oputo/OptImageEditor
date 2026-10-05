@@ -4,10 +4,10 @@
   import Viewer from "./lib/Viewer.svelte";
   import type { Renderer } from "./lib/renderer";
   import { loadImage, SUPPORTED_EXT, type LoadedImage } from "./lib/loader";
-  import { BrowserFileSource, TauriFileSource, baseName, isTauri, type FileSource } from "./lib/source";
+  import { BrowserFileSource, TauriFileSource, baseName, isTauri, readTuning, type FileSource } from "./lib/source";
   import { listFolderImages, onNativeDrop, pickFile, setWindowTitle, startupPaths, toggleFullscreen } from "./lib/desktop";
 
-  type Meta = Omit<LoadedImage, "image"> & { uploadMs: number; totalMs: number };
+  type Meta = Omit<LoadedImage, "image"> & { uploadMs: number; totalMs: number; readMode: string };
 
   let renderer = $state<Renderer | undefined>();
   let current = $state<Meta | null>(null);
@@ -19,6 +19,7 @@
   let zoom = $state(0);
   let dragOver = $state(false);
   let showStats = $state(false);
+  let readMode = $state(readTuning.mode);
   let fileInput: HTMLInputElement;
   let loadToken = 0;
 
@@ -38,7 +39,7 @@
       renderer.fit();
       zoom = renderer.scale;
       const { image: _img, ...meta } = img;
-      current = { ...meta, uploadMs, totalMs: performance.now() - t0 };
+      current = { ...meta, uploadMs, totalMs: performance.now() - t0, readMode: src.path ? readTuning.mode : "browser" };
       const pos = folder.length ? ` (${index + 1}/${folder.length})` : "";
       setWindowTitle(`${img.name}${pos} — OptImageEditor`);
     } catch (e) {
@@ -127,6 +128,8 @@
     else if (!ctrl && k === "End") goTo(folder.length - 1);
     else if (k === "F11") toggleFullscreen();
     else if (k === "F2") showStats = !showStats;
+    else if (k === "F3") { readTuning.mode = readTuning.mode === "single" ? "parallel" : "single"; readMode = readTuning.mode; showStats = true; }
+    else if (k === "F5" && current?.path) openPath(current.path);
     else handled = false;
     if (handled) e.preventDefault();
   }
@@ -147,7 +150,7 @@
           `path        ${current.path ?? "(browser)"}`,
           `file size   ${mb(current.stats.fileSize)}  (read ${mb(current.stats.bytesRead)})`,
           `image       ${current.width} x ${current.height}  ${current.bitsPerChannel}bit${current.layerInfo ? "  " + current.layerInfo : ""}${current.note ? `  (${current.note})` : ""}`,
-          `read file   ${ms(current.stats.readMs)}`,
+          `read file   ${ms(current.stats.readMs)}  (IPC mode: ${current.readMode}${current.readMode === "parallel" ? `, ${readTuning.chunkBytes >> 20} MB chunks` : ""})`,
           `decode      ${ms(current.stats.decodeMs)}  (worker round-trip ${ms(current.stats.workerMs)})`,
           `GPU upload  ${ms(current.uploadMs)}  max tex ${renderer?.maxTextureSize ?? "?"}`,
           `TOTAL       ${ms(current.totalMs)}`,
@@ -207,6 +210,7 @@
   {#if showStats && current}
     <div class="stats">
       <pre>{statsText}</pre>
+      <span class="hint-keys">F3: 読み込み方式 {readMode === "single" ? "一括" : "分割並列"} → 切替 ／ F5: 再読み込み</span>
       <button onclick={copyStats}>コピー</button>
     </div>
   {/if}
@@ -270,5 +274,6 @@
     background: rgba(0, 0, 0, 0.75); border: 1px solid var(--border); border-radius: 4px;
     padding: 8px 10px; display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
   }
+  .hint-keys { color: var(--muted); font-size: 11px; }
   .stats pre { margin: 0; font: 12px/1.5 Consolas, "Cascadia Mono", monospace; color: #cfe3ff; white-space: pre; user-select: text; }
 </style>

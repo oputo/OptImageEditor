@@ -35,6 +35,7 @@ fn file_info(path: String) -> Result<FileInfo, String> {
 async fn read_range(path: String, offset: u64, length: u64) -> Result<Response, String> {
     // run the blocking file IO off the async runtime's worker threads
     tauri::async_runtime::spawn_blocking(move || -> Result<Response, String> {
+        let t0 = std::time::Instant::now();
         let mut f = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
         let size = f.metadata().map_err(|e| e.to_string())?.len();
         let start = offset.min(size);
@@ -42,6 +43,16 @@ async fn read_range(path: String, offset: u64, length: u64) -> Result<Response, 
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; len];
         f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        // diagnostics: disk read time on the Rust side (shown in the `tauri dev` terminal)
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[read_range] {:>8.1} MB  disk {:>6.1} ms  offset {}",
+            len as f64 / 1048576.0,
+            t0.elapsed().as_secs_f64() * 1000.0,
+            start
+        );
+        #[cfg(not(debug_assertions))]
+        let _ = t0;
         Ok(Response::new(buf))
     })
     .await
