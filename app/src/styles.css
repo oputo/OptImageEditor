@@ -1,0 +1,100 @@
+:root {
+  --bg: #1e1e1e;
+  --panel: #2b2b2b;
+  --border: #3a3a3a;
+  --text: #ddd;
+  --muted: #999;
+  --accent: #4a9eff;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 "Segoe UI", "Yu Gothic UI", sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+body { display: flex; flex-direction: column; }
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 8px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+#toolbar button {
+  background: #3a3a3a;
+  color: var(--text);
+  border: 1px solid #4a4a4a;
+  border-radius: 4px;
+  padding: 3px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+#toolbar button:hover { background: #454545; }
+
+.sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+
+#zoom-label { min-width: 56px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+#file-label { margin-left: 8px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+#stage { position: relative; flex: 1; min-height: 0; }
+
+#view {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+}
+#view.panning { cursor: grabbing; }
+
+#drop-hint {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 15px;
+  pointer-events: none;
+}
+#stage.drag-over #drop-hint { color: var(--accent); }
+#stage.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }
+
+#busy {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.75);
+  padding: 6px 14px;
+  border-radius: 4px;
+}
+
+#stats {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  margin: 0;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.7);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: 12px/1.5 Consolas, "Cascadia Mono", monospace;
+  color: #cfe3ff;
+  pointer-events: none;
+  white-space: pre;
+}

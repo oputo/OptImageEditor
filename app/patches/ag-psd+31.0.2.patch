@@ -1,0 +1,160 @@
+diff --git a/node_modules/ag-psd/dist-es/psdReader.js b/node_modules/ag-psd/dist-es/psdReader.js
+index 2261784..f51be9c 100644
+--- a/node_modules/ag-psd/dist-es/psdReader.js
++++ b/node_modules/ag-psd/dist-es/psdReader.js
+@@ -269,6 +269,8 @@ function readPsd(reader, readOptions = {}) {
+     readSection(reader, 1, left => {
+         while (left() > 0) {
+             realignWithSignature(reader, isValidSignature);
++            const __resStart = reader.offset - 4;
++            let __resUnknown = false;
+             const id = readUint16(reader);
+             readPascalString(reader, 2); // name
+             readSection(reader, 2, left => {
+@@ -287,8 +289,12 @@ function readPsd(reader, readOptions = {}) {
+                 else {
+                     // options.logMissingFeatures && console.log(`Unhandled image resource: ${id} (${left()})`);
+                     skipBytes(reader, left());
++                    __resUnknown = !handler;
+                 }
+             });
++            if (__resUnknown) {
++                (imageResources._rawUnknownResources || (imageResources._rawUnknownResources = [])).push({ id, data: __rawBytes(reader, __resStart, reader.offset) });
++            }
+         }
+     });
+     const { layersGroup, layerGroupsEnabledId } = imageResources, rest = __rest(imageResources, ["layersGroup", "layerGroupsEnabledId"]);
+@@ -787,8 +793,11 @@ function realignWithSignature(reader, isValid) {
+ function isValidAdditionalInfoSignature(sig) {
+     return sig === '8BIM' || sig === '8B64';
+ }
++function __rawBytes(reader, start, end) { return new Uint8Array(reader.view.buffer, reader.view.byteOffset + start, end - start).slice(); }
+ function readAdditionalLayerInfo(reader, target, psd, imageResources) {
+     const sig = realignWithSignature(reader, isValidAdditionalInfoSignature);
++    const __start = reader.offset - 4;
++    let __unknown = false;
+     const key = readSignature(reader);
+     // `largeAdditionalInfoKeys` fallback, because some keys don't have 8B64 signature even when they are 64bit
+     const u64 = sig === '8B64' || (reader.large && helpers_1.largeAdditionalInfoKeys.indexOf(key) !== -1);
+@@ -806,12 +815,18 @@ function readAdditionalLayerInfo(reader, target, psd, imageResources) {
+         else {
+             reader.logMissingFeatures && reader.log(`Unhandled additional info: ${key}`);
+             skipBytes(reader, left());
++            __unknown = true;
+         }
+         if (left()) {
+             reader.logMissingFeatures && reader.log(`Unread ${left()} bytes left for additional info: ${key}`);
+             skipBytes(reader, left());
+         }
+     }, false, u64);
++    if (__unknown) {
++        // some blocks (e.g. 'CAI ') are padded to 4 bytes while ag-psd only consumes 2-byte padding: keep the zero padding too
++        while ((reader.offset - __start) % 4 && reader.offset < reader.view.byteLength && reader.view.getUint8(reader.offset) === 0) reader.offset++;
++        (target._rawUnknownInfo || (target._rawUnknownInfo = [])).push({ key, data: __rawBytes(reader, __start, reader.offset) });
++    }
+ }
+ function createImageDataBitDepth(width, height, bitDepth, channels, memoryLimit) {
+     const sizeInBytes = width * height * channels * Math.max(1, bitDepth / 8);
+diff --git a/node_modules/ag-psd/dist-es/psdWriter.js b/node_modules/ag-psd/dist-es/psdWriter.js
+index c57f679..4d34bc1 100644
+--- a/node_modules/ag-psd/dist-es/psdWriter.js
++++ b/node_modules/ag-psd/dist-es/psdWriter.js
+@@ -264,6 +264,7 @@ function writePsd(writer, psd, options = {}) {
+                 writeSection(writer, 2, () => handler.write(writer, imageResources, i));
+             }
+         }
++        for (const raw of (imageResources._rawUnknownResources || [])) writeBytes(writer, raw.data);
+     });
+     // layer and mask info
+     writeSection(writer, 2, () => {
+@@ -448,6 +449,10 @@ function writeGlobalLayerMaskInfo(writer, info) {
+     });
+ }
+ function writeAdditionalLayerInfo(writer, target, psd, options) {
++    __writeAdditionalLayerInfoKnown(writer, target, psd, options);
++    for (const raw of (target._rawUnknownInfo || [])) writeBytes(writer, raw.data);
++}
++function __writeAdditionalLayerInfoKnown(writer, target, psd, options) {
+     for (const handler of additionalInfo_1.infoHandlers) {
+         let key = handler.key;
+         if (key === 'Txt2' && options.invalidateTextLayers)
+diff --git a/node_modules/ag-psd/dist/psdReader.js b/node_modules/ag-psd/dist/psdReader.js
+index 2261784..f51be9c 100644
+--- a/node_modules/ag-psd/dist/psdReader.js
++++ b/node_modules/ag-psd/dist/psdReader.js
+@@ -269,6 +269,8 @@ function readPsd(reader, readOptions = {}) {
+     readSection(reader, 1, left => {
+         while (left() > 0) {
+             realignWithSignature(reader, isValidSignature);
++            const __resStart = reader.offset - 4;
++            let __resUnknown = false;
+             const id = readUint16(reader);
+             readPascalString(reader, 2); // name
+             readSection(reader, 2, left => {
+@@ -287,8 +289,12 @@ function readPsd(reader, readOptions = {}) {
+                 else {
+                     // options.logMissingFeatures && console.log(`Unhandled image resource: ${id} (${left()})`);
+                     skipBytes(reader, left());
++                    __resUnknown = !handler;
+                 }
+             });
++            if (__resUnknown) {
++                (imageResources._rawUnknownResources || (imageResources._rawUnknownResources = [])).push({ id, data: __rawBytes(reader, __resStart, reader.offset) });
++            }
+         }
+     });
+     const { layersGroup, layerGroupsEnabledId } = imageResources, rest = __rest(imageResources, ["layersGroup", "layerGroupsEnabledId"]);
+@@ -787,8 +793,11 @@ function realignWithSignature(reader, isValid) {
+ function isValidAdditionalInfoSignature(sig) {
+     return sig === '8BIM' || sig === '8B64';
+ }
++function __rawBytes(reader, start, end) { return new Uint8Array(reader.view.buffer, reader.view.byteOffset + start, end - start).slice(); }
+ function readAdditionalLayerInfo(reader, target, psd, imageResources) {
+     const sig = realignWithSignature(reader, isValidAdditionalInfoSignature);
++    const __start = reader.offset - 4;
++    let __unknown = false;
+     const key = readSignature(reader);
+     // `largeAdditionalInfoKeys` fallback, because some keys don't have 8B64 signature even when they are 64bit
+     const u64 = sig === '8B64' || (reader.large && helpers_1.largeAdditionalInfoKeys.indexOf(key) !== -1);
+@@ -806,12 +815,18 @@ function readAdditionalLayerInfo(reader, target, psd, imageResources) {
+         else {
+             reader.logMissingFeatures && reader.log(`Unhandled additional info: ${key}`);
+             skipBytes(reader, left());
++            __unknown = true;
+         }
+         if (left()) {
+             reader.logMissingFeatures && reader.log(`Unread ${left()} bytes left for additional info: ${key}`);
+             skipBytes(reader, left());
+         }
+     }, false, u64);
++    if (__unknown) {
++        // some blocks (e.g. 'CAI ') are padded to 4 bytes while ag-psd only consumes 2-byte padding: keep the zero padding too
++        while ((reader.offset - __start) % 4 && reader.offset < reader.view.byteLength && reader.view.getUint8(reader.offset) === 0) reader.offset++;
++        (target._rawUnknownInfo || (target._rawUnknownInfo = [])).push({ key, data: __rawBytes(reader, __start, reader.offset) });
++    }
+ }
+ function createImageDataBitDepth(width, height, bitDepth, channels, memoryLimit) {
+     const sizeInBytes = width * height * channels * Math.max(1, bitDepth / 8);
+diff --git a/node_modules/ag-psd/dist/psdWriter.js b/node_modules/ag-psd/dist/psdWriter.js
+index c57f679..4d34bc1 100644
+--- a/node_modules/ag-psd/dist/psdWriter.js
++++ b/node_modules/ag-psd/dist/psdWriter.js
+@@ -264,6 +264,7 @@ function writePsd(writer, psd, options = {}) {
+                 writeSection(writer, 2, () => handler.write(writer, imageResources, i));
+             }
+         }
++        for (const raw of (imageResources._rawUnknownResources || [])) writeBytes(writer, raw.data);
+     });
+     // layer and mask info
+     writeSection(writer, 2, () => {
+@@ -448,6 +449,10 @@ function writeGlobalLayerMaskInfo(writer, info) {
+     });
+ }
+ function writeAdditionalLayerInfo(writer, target, psd, options) {
++    __writeAdditionalLayerInfoKnown(writer, target, psd, options);
++    for (const raw of (target._rawUnknownInfo || [])) writeBytes(writer, raw.data);
++}
++function __writeAdditionalLayerInfoKnown(writer, target, psd, options) {
+     for (const handler of additionalInfo_1.infoHandlers) {
+         let key = handler.key;
+         if (key === 'Txt2' && options.invalidateTextLayers)

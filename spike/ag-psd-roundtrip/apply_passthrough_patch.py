@@ -1,4 +1,4 @@
-"""Patch ag-psd 31.0.2 (dist/*.js) so that unknown data is preserved verbatim on round-trip.
+"""Patch ag-psd 31.0.2 (dist/*.js and dist-es/*.js) so that unknown data is preserved verbatim on round-trip.
 
 1. Additional layer info (per layer and document level) without a handler
    -> raw bytes of the whole block (signature..padding) stored in target._rawUnknownInfo, re-emitted on write.
@@ -7,13 +7,15 @@
 Usage: python apply_passthrough_patch.py [node_modules/ag-psd]
 """
 import sys, pathlib
-root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "node_modules/ag-psd") / "dist"
+pkg = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "node_modules/ag-psd")
+roots = [pkg / d for d in ("dist", "dist-es") if (pkg / d).is_dir()]   # dist-es is used by bundlers (Vite)
 
 def patch(fname, old, new, count=1):
-    p = root / fname; s = p.read_text(encoding="utf-8")
-    if new in s: print(f"  already patched: {fname}"); return
-    assert s.count(old) == count, f"{fname}: expected {count} match(es), found {s.count(old)}"
-    p.write_text(s.replace(old, new), encoding="utf-8"); print(f"  patched: {fname}")
+    for root in roots:
+        p = root / fname; s = p.read_text(encoding="utf-8")
+        if new in s: print(f"  already patched: {root.name}/{fname}"); continue
+        assert s.count(old) == count, f"{root.name}/{fname}: expected {count} match(es), found {s.count(old)}"
+        p.write_text(s.replace(old, new), encoding="utf-8"); print(f"  patched: {root.name}/{fname}")
 
 RAW = "function __rawBytes(reader, start, end) { return new Uint8Array(reader.view.buffer, reader.view.byteOffset + start, end - start).slice(); }\n"
 
