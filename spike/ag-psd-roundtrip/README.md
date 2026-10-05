@@ -63,7 +63,8 @@ python compare.py <orig.psd> out/<name>.rt.psd   # 差分レポート（pip inst
 | 3. `test_text_1.edit.psd` を開いたとき | 開いた時点で「Some text layers might need to be updated before they can be used for vector based output. Do you want to update these layers now?」という確認が出る。ダイアログの背後では `<A>` が古い描画のまま。`Layer 1` の非表示は反映されている。解像度（168ppi）とフォント（Eras Demi ITC / 60px）は保持されている |
 
 - 3 の確認は、`invalidateTextLayers` を指定したときの想定どおりの挙動（PS に再描画を依頼する印）。
-- 「Update」を押すと新しい文字列で再描画されると推測しているが、未確認。
+- 「Update」を押すと `<A>` が「<A> edited by ag-psd」で再描画され、編集可能なテキストレイヤーとして保持されることを確認した（2026-10-05、オーナーが確認）。
+- → アプリでテキストを編集した場合の保存方式として、**A 案（再描画の印を付けて保存し、PS 側で描き直してもらう）が成立する**。PS で開いたときにダイアログが 1 回出ることだけが代償になる。
 
 ## 暫定的な評価（推測を含む）
 
