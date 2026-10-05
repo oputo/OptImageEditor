@@ -13,6 +13,12 @@
 | `docs/ps_feature_inventory.md` | Photoshop 機能の棚卸し（使用頻度と難度） |
 | `docs/psd_samples_findings.md` | サンプル PSD の解析結果 |
 
+## 検証（spike）
+
+| フォルダ | 内容 |
+|---|---|
+| `spike/ag-psd-roundtrip/` | ag-psd による PSD 往復テストと、未知ブロックを保持する改修（フェーズ 0） |
+
 ## ツール
 
 - `tools/psd_scan.py` — PSD のレイヤー構成と機能の使用状況を集計する（`pip install psd-tools`）
