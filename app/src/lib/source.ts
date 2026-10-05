@@ -46,7 +46,8 @@ const chromeWebview = (): ChromeWebview | undefined =>
   (window as unknown as { chrome?: { webview?: ChromeWebview } }).chrome?.webview;
 
 let sharedSeq = 0;
-const sharedWaiters = new Map<number, (buf: ArrayBuffer) => void>();
+type SharedPixels = { buffer: ArrayBuffer; release: () => void };
+const sharedWaiters = new Map<number, (p: SharedPixels) => void>();
 let sharedListening = false;
 
 function listenShared(wv: ChromeWebview) {
@@ -54,36 +55,67 @@ function listenShared(wv: ChromeWebview) {
   sharedListening = true;
   wv.addEventListener("sharedbufferreceived", (e) => {
     const id = e.additionalData?.oieId;
-    const buf = e.getBuffer();
+    const buffer = e.getBuffer();
     const resolve = id !== undefined ? sharedWaiters.get(id) : undefined;
-    if (!resolve) { wv.releaseBuffer(buf); return; }
+    if (!resolve) { wv.releaseBuffer(buffer); return; }
     sharedWaiters.delete(id!);
-    // copy out of the shared memory and release it right away (the copy is a plain, transferable ArrayBuffer)
-    const copy = buf.slice(0);
-    wv.releaseBuffer(buf);
-    resolve(copy);
+    let released = false;
+    resolve({ buffer, release: () => { if (!released) { released = true; wv.releaseBuffer(buffer); } } });
   });
 }
 
-/** Returns null when shared buffers are not available (not Windows / old WebView2), so the caller can fall back. */
-async function readShared(path: string, offset: number, length: number): Promise<ArrayBuffer | null> {
-  const wv = chromeWebview();
-  if (!wv) return null;
+/** Registers a waiter for shared buffer `id`, runs `post` (which asks Rust to post it) and waits for the buffer.
+ *  `pixels` is null when `post` reports that nothing was posted. */
+async function receiveShared<T>(post: (id: number) => Promise<T>, posted: (r: T) => boolean): Promise<{ result: T; pixels: SharedPixels | null }> {
+  const wv = chromeWebview()!;
   listenShared(wv);
   const id = ++sharedSeq;
-  const arrived = new Promise<ArrayBuffer>((resolve, reject) => {
+  const arrived = new Promise<SharedPixels>((resolve, reject) => {
     sharedWaiters.set(id, resolve);
     setTimeout(() => { if (sharedWaiters.delete(id)) reject(new Error("shared buffer timeout")); }, 30000);
   });
-  let posted: boolean;
+  let result: T;
   try {
-    posted = await invoke<boolean>("read_range_shared", { path, offset, length, id });
+    result = await post(id);
   } catch (e) {
     sharedWaiters.delete(id);
     throw e;
   }
-  if (!posted) { sharedWaiters.delete(id); return null; }
-  return arrived;
+  if (!posted(result)) { sharedWaiters.delete(id); return { result, pixels: null }; }
+  return { result, pixels: await arrived };
+}
+
+/** Returns null when shared buffers are not available (not Windows / old WebView2), so the caller can fall back. */
+async function readShared(path: string, offset: number, length: number): Promise<ArrayBuffer | null> {
+  if (!chromeWebview()) return null;
+  const { pixels } = await receiveShared(
+    (id) => invoke<boolean>("read_range_shared", { path, offset, length, id }),
+    (ok) => ok,
+  );
+  if (!pixels) return null;
+  // copy out of the shared memory and release it right away (the copy is a plain, transferable ArrayBuffer)
+  const copy = pixels.buffer.slice(0);
+  pixels.release();
+  return copy;
+}
+
+export type CompositeInfo = {
+  width: number; height: number; channels: number; depth: number; colorMode: number;
+  psb: boolean; layerCount: number; hasAlpha: boolean; imageDataOffset: number; imageDataLen: number;
+};
+export type CompositeLoad = {
+  posted: boolean; unsupported: string | null; info: CompositeInfo | null; readMs: number; decodeMs: number;
+};
+
+/** Viewer fast path (Windows): Rust decodes the PSD composite in parallel straight into shared memory (RGBA8).
+ *  `pixels` is null when not available or unsupported (the caller falls back to the JS decoder). */
+export async function loadCompositeShared(path: string): Promise<{ load: CompositeLoad; pixels: SharedPixels | null }> {
+  if (!chromeWebview()) return { load: { posted: false, unsupported: null, info: null, readMs: 0, decodeMs: 0 }, pixels: null };
+  const { result, pixels } = await receiveShared(
+    (id) => invoke<CompositeLoad>("load_composite_shared", { path, id }),
+    (r) => r.posted,
+  );
+  return { load: result, pixels };
 }
 
 export class TauriFileSource implements FileSource {

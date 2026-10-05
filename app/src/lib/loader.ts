@@ -2,7 +2,7 @@
 import type { DecodeRequest, DecodeResult } from "./decoder.worker";
 import type { ImageSource } from "./renderer";
 import { readPsdCompositeOnly } from "./psdSlice";
-import type { FileSource } from "./source";
+import { loadCompositeShared, readTuning, type FileSource } from "./source";
 
 export const SUPPORTED_EXT = ["psd", "psb", "png", "jpg", "jpeg", "webp"];
 export const isPsd = (name: string) => /\.(psd|psb)$/i.test(name);
@@ -25,6 +25,10 @@ export type LoadedImage = {
   note?: string;
   image: ImageSource;
   stats: LoadStats;
+  /** set when `image` points into shared memory: call after uploading to the GPU */
+  release?: () => void;
+  /** how the bytes / pixels got here */
+  via: string;
 };
 
 const worker = new Worker(new URL("./decoder.worker.ts", import.meta.url), { type: "module" });
@@ -46,6 +50,30 @@ function decode(name: string, buffer: ArrayBuffer): Promise<DecodeResult> {
 
 export async function loadImage(src: FileSource): Promise<LoadedImage> {
   const t0 = performance.now();
+  let fallbackNote: string | undefined;
+
+  // Fast path (desktop, Windows): Rust decodes the PSD composite in parallel into shared memory
+  if (src.path && isPsd(src.name) && readTuning.mode === "shared") {
+    const { load, pixels } = await loadCompositeShared(src.path);
+    if (pixels && load.info) {
+      const info = load.info;
+      return {
+        name: src.name,
+        path: src.path,
+        width: info.width,
+        height: info.height,
+        bitsPerChannel: info.depth,
+        layerInfo: `${Math.abs(info.layerCount)} layer records${info.hasAlpha ? " (transparent)" : ""}`,
+        note: info.depth > 8 ? "表示用に 8bit へ変換" : undefined,
+        image: { kind: "rgba", width: info.width, height: info.height, data: new Uint8ClampedArray(pixels.buffer) },
+        stats: { fileSize: src.size, bytesRead: info.imageDataLen, readMs: load.readMs, decodeMs: load.decodeMs, workerMs: performance.now() - t0 },
+        release: pixels.release,
+        via: "shared + Rust decode",
+      };
+    }
+    if (load.unsupported) fallbackNote = `Rust デコード非対応: ${load.unsupported}`;
+  }
+
   let buffer: ArrayBuffer;
   let bytesRead = src.size;
   let layerRecords: number | null = null;
@@ -80,8 +108,9 @@ export async function loadImage(src: FileSource): Promise<LoadedImage> {
     height: res.height,
     bitsPerChannel: res.bitsPerChannel,
     layerInfo: layerRecords !== null ? `${layerRecords} layer records` : res.layerCount !== null ? `${res.layerCount} layers` : null,
-    note: res.note,
+    note: [res.note, fallbackNote].filter(Boolean).join(" / ") || undefined,
     image,
     stats: { fileSize: src.size, bytesRead, readMs, decodeMs: res.decodeMs, workerMs },
+    via: src.path ? `${readTuning.lastUsed || readTuning.mode} + JS decode` : "browser + JS decode",
   };
 }

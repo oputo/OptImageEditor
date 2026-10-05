@@ -7,7 +7,7 @@
   import { BrowserFileSource, TauriFileSource, baseName, isTauri, readTuning, READ_MODES, READ_MODE_LABEL, type FileSource } from "./lib/source";
   import { listFolderImages, onNativeDrop, pickFile, setWindowTitle, startupPaths, toggleFullscreen } from "./lib/desktop";
 
-  type Meta = Omit<LoadedImage, "image"> & { uploadMs: number; totalMs: number; readMode: string };
+  type Meta = Omit<LoadedImage, "image" | "release"> & { uploadMs: number; totalMs: number };
 
   let renderer = $state<Renderer | undefined>();
   let current = $state<Meta | null>(null);
@@ -35,11 +35,16 @@
     try {
       const img = await loadImage(src);
       if (token !== loadToken || !renderer) return; // a newer request superseded this one
-      const uploadMs = await renderer.setImage(img.image);
+      let uploadMs: number;
+      try {
+        uploadMs = await renderer.setImage(img.image);
+      } finally {
+        img.release?.(); // shared memory is no longer needed once the pixels are on the GPU
+      }
       renderer.fit();
       zoom = renderer.scale;
-      const { image: _img, ...meta } = img;
-      current = { ...meta, uploadMs, totalMs: performance.now() - t0, readMode: src.path ? (readTuning.lastUsed || readTuning.mode) : "browser" };
+      const { image: _img, release: _rel, ...meta } = img;
+      current = { ...meta, uploadMs, totalMs: performance.now() - t0 };
       const pos = folder.length ? ` (${index + 1}/${folder.length})` : "";
       setWindowTitle(`${img.name}${pos} — OptImageEditor`);
     } catch (e) {
@@ -150,8 +155,9 @@
           `path        ${current.path ?? "(browser)"}`,
           `file size   ${mb(current.stats.fileSize)}  (read ${mb(current.stats.bytesRead)})`,
           `image       ${current.width} x ${current.height}  ${current.bitsPerChannel}bit${current.layerInfo ? "  " + current.layerInfo : ""}${current.note ? `  (${current.note})` : ""}`,
-          `read file   ${ms(current.stats.readMs)}  (via: ${current.readMode}${current.readMode === "parallel" ? `, ${readTuning.chunkBytes >> 20} MB chunks` : ""})`,
-          `decode      ${ms(current.stats.decodeMs)}  (worker round-trip ${ms(current.stats.workerMs)})`,
+          `via         ${current.via}`,
+          `read file   ${ms(current.stats.readMs)}`,
+          `decode      ${ms(current.stats.decodeMs)}  (read+decode round-trip ${ms(current.stats.workerMs)})`,
           `GPU upload  ${ms(current.uploadMs)}  max tex ${renderer?.maxTextureSize ?? "?"}`,
           `TOTAL       ${ms(current.totalMs)}`,
           `texture mem ${mb(renderer?.textureBytes ?? 0)}`,

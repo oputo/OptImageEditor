@@ -1,4 +1,5 @@
 // OptImageEditor — Rust side.
+mod composite;
 // File access is done here so the WebView can read byte ranges of large files (PSD composite-only reads)
 // and list sibling images for folder navigation.
 
@@ -64,23 +65,92 @@ async fn read_range(path: String, offset: u64, length: u64) -> Result<Response, 
 /// Returns Ok(false) when not available (other OS / old WebView2 runtime) so the caller falls back to `read_range`.
 #[tauri::command]
 async fn read_range_shared(webview: tauri::Webview, path: String, offset: u64, length: u64, id: u32) -> Result<bool, String> {
-    #[cfg(windows)]
-    {
-        shared::read_range_shared(webview, path, offset, length, id).await
+    let size = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
+    let start = offset.min(size);
+    let len = length.min(size - start);
+    if len == 0 {
+        return Ok(false);
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (webview, path, offset, length, id);
-        Ok(false)
+    let t0 = std::time::Instant::now();
+    let posted = shared::post_shared(&webview, len, id, move |dst| {
+        let mut f = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
+        f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+        f.read_exact(dst).map_err(|e| e.to_string())
+    })
+    .await?;
+    #[cfg(debug_assertions)]
+    eprintln!("[read_range_shared] {:>8.1} MB  {:>6.1} ms  offset {}", len as f64 / 1048576.0, t0.elapsed().as_secs_f64() * 1000.0, start);
+    let _ = t0;
+    Ok(posted.is_some())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompositeLoad {
+    /// true: RGBA8 pixels were posted as a shared buffer (event "sharedbufferreceived" with oieId = id)
+    posted: bool,
+    /// set when the file cannot be handled here (the page then uses its own decoder)
+    unsupported: Option<String>,
+    info: Option<composite::CompositeInfo>,
+    read_ms: f64,
+    decode_ms: f64,
+}
+
+/// Viewer fast path: decodes the PSD/PSB composite in parallel (Rust) straight into shared memory as RGBA8.
+#[tauri::command]
+async fn load_composite_shared(webview: tauri::Webview, path: String, id: u32) -> Result<CompositeLoad, String> {
+    let p2 = path.clone();
+    let info = tauri::async_runtime::spawn_blocking(move || -> Result<composite::CompositeInfo, composite::CompositeError> {
+        let mut f = File::open(&p2)?;
+        composite::read_info(&mut f)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let info = match info {
+        Ok(i) => i,
+        Err(composite::CompositeError::Unsupported(m)) => {
+            return Ok(CompositeLoad { posted: false, unsupported: Some(m), info: None, read_ms: 0.0, decode_ms: 0.0 })
+        }
+        Err(e) => return Err(format!("{path}: {e}")),
+    };
+    // reject what decode_rgba cannot handle before allocating shared memory
+    if !matches!(info.color_mode, 1 | 3) || !matches!(info.depth, 8 | 16) {
+        let m = format!("color mode {} / {} bit", info.color_mode, info.depth);
+        return Ok(CompositeLoad { posted: false, unsupported: Some(m), info: Some(info), read_ms: 0.0, decode_ms: 0.0 });
+    }
+    let len = info.width as u64 * info.height as u64 * 4;
+    let info2 = info.clone();
+    let result = shared::post_shared(&webview, len, id, move |dst| -> Result<(f64, f64), String> {
+        let t0 = std::time::Instant::now();
+        let mut f = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
+        f.seek(SeekFrom::Start(info2.image_data_offset)).map_err(|e| e.to_string())?;
+        let mut data = vec![0u8; info2.image_data_len as usize];
+        f.read_exact(&mut data).map_err(|e| e.to_string())?;
+        let read_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        composite::decode_rgba(&info2, &data, dst).map_err(|e| e.to_string())?;
+        Ok((read_ms, t1.elapsed().as_secs_f64() * 1000.0))
+    })
+    .await;
+    match result {
+        Ok(Some((read_ms, decode_ms))) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[load_composite_shared] {}x{}  read {:>6.1} ms  decode {:>6.1} ms", info.width, info.height, read_ms, decode_ms);
+            Ok(CompositeLoad { posted: true, unsupported: None, info: Some(info), read_ms, decode_ms })
+        }
+        Ok(None) => Ok(CompositeLoad { posted: false, unsupported: None, info: Some(info), read_ms: 0.0, decode_ms: 0.0 }),
+        Err(e) if e.starts_with("unsupported") => {
+            Ok(CompositeLoad { posted: false, unsupported: Some(e), info: Some(info), read_ms: 0.0, decode_ms: 0.0 })
+        }
+        Err(e) => Err(e),
     }
 }
 
+/// WebView2 SharedBuffer helper. `post_shared` returns Ok(None) when shared buffers are not available.
 #[cfg(windows)]
 mod shared {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
 
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2Environment12, ICoreWebView2SharedBuffer, ICoreWebView2_17,
@@ -115,16 +185,16 @@ mod shared {
         });
     }
 
-    pub async fn read_range_shared(webview: tauri::Webview, path: String, offset: u64, length: u64, id: u32) -> Result<bool, String> {
-        let size = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
-        let start = offset.min(size);
-        let len = length.min(size - start);
-        if len == 0 {
-            return Ok(false);
-        }
-
+    /// Creates a shared buffer of `len` bytes, lets `fill` write into it on a worker thread,
+    /// then posts it to the page with additional data `{"oieId": id}`.
+    pub async fn post_shared<T: Send + 'static>(
+        webview: &tauri::Webview,
+        len: u64,
+        id: u32,
+        fill: impl FnOnce(&mut [u8]) -> Result<T, String> + Send + 'static,
+    ) -> Result<Option<T>, String> {
         // 1) create the shared buffer on the UI thread; None = API not supported by this WebView2 runtime
-        let ptr: Option<usize> = on_ui(&webview, move |pw| unsafe {
+        let ptr: Option<usize> = on_ui(webview, move |pw| unsafe {
             let env12 = match pw.environment().cast::<ICoreWebView2Environment12>() {
                 Ok(e) => e,
                 Err(_) => return Ok(None),
@@ -136,37 +206,27 @@ mod shared {
             Ok(Some(p as usize))
         })
         .await?;
-        let Some(ptr) = ptr else { return Ok(false) };
+        let Some(ptr) = ptr else { return Ok(None) };
 
-        // 2) read the file straight into the shared memory (off the UI thread)
-        let t0 = std::time::Instant::now();
-        let path2 = path.clone();
-        let read = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // 2) fill it off the UI thread
+        let filled = tauri::async_runtime::spawn_blocking(move || {
             // SAFETY: the buffer stays mapped until it is closed in step 3 (or by `discard`)
             let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
-            let mut f = File::open(&path2).map_err(|e| format!("{path2}: {e}"))?;
-            f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
-            f.read_exact(dst).map_err(|e| e.to_string())
+            fill(dst)
         })
         .await
         .map_err(|e| e.to_string())
         .and_then(|r| r);
-        if let Err(e) = read {
-            let _ = on_ui(&webview, move |_| { discard(id); Ok(()) }).await;
-            return Err(e);
-        }
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[read_range_shared] {:>8.1} MB  disk {:>6.1} ms  offset {}",
-            len as f64 / 1048576.0,
-            t0.elapsed().as_secs_f64() * 1000.0,
-            start
-        );
-        #[cfg(not(debug_assertions))]
-        let _ = t0;
+        let value = match filled {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = on_ui(webview, move |_| { discard(id); Ok(()) }).await;
+                return Err(e);
+            }
+        };
 
         // 3) post it to the page, then close our native view of it (the page keeps its own mapping)
-        on_ui(&webview, move |pw| unsafe {
+        on_ui(webview, move |pw| unsafe {
             let sb = PENDING.with(|m| m.borrow_mut().remove(&id)).ok_or("shared buffer lost")?;
             let result = (|| -> Result<(), String> {
                 let core = pw.controller().CoreWebView2().map_err(|e| e.to_string())?;
@@ -180,7 +240,20 @@ mod shared {
             result
         })
         .await?;
-        Ok(true)
+        Ok(Some(value))
+    }
+}
+
+/// Other platforms: no shared buffers (callers fall back to IPC / the JS decoder).
+#[cfg(not(windows))]
+mod shared {
+    pub async fn post_shared<T: Send + 'static>(
+        _webview: &tauri::Webview,
+        _len: u64,
+        _id: u32,
+        _fill: impl FnOnce(&mut [u8]) -> Result<T, String> + Send + 'static,
+    ) -> Result<Option<T>, String> {
+        Ok(None)
     }
 }
 
@@ -248,7 +321,7 @@ fn startup_paths() -> Vec<String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![file_info, read_range, read_range_shared, list_images, startup_paths])
+        .invoke_handler(tauri::generate_handler![file_info, read_range, read_range_shared, load_composite_shared, list_images, startup_paths])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

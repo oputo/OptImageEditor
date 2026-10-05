@@ -47,10 +47,11 @@ npm run tauri build  # 配布用にビルドする（src-tauri/target/release/ �
 | `src/lib/renderer.ts` | WebGL2 の描画。`MAX_TEXTURE_SIZE`（上限 8192）を超える画像はタイルに分割する。縮小時はミップマップ、200% 以上はニアレストネイバー。透明部分は市松模様 |
 | `src/lib/loader.ts` | ファイルの読み込みからデコードまで（デコード処理は Web Worker） |
 | `src/lib/decoder.worker.ts` | PSD は ag-psd で統合画像だけを読む。PNG / JPG は `createImageBitmap` |
+| `src-tauri/src/composite.rs` | PSD / PSB の統合画像デコーダ（RGB / グレー、8 / 16bit、非圧縮 / RLE）。行単位で並列に RGBA へ展開し、透明がある場合は白マットを除去する。テスト: `python ../tools/composite_ref.py <dir>` の後、`OIE_SAMPLES=<dir> cargo test --release -- --nocapture samples` |
 | `src/lib/psdSlice.ts` | PSD / PSB のレイヤー部分を読み飛ばし、必要な範囲だけを読む |
 | `src/lib/source.ts` | ファイルの範囲読み込みの共通部分（Tauri: Rust の `read_range` / ブラウザ: `File.slice`） |
 | `src/lib/desktop.ts` | Tauri 連携（ネイティブのドラッグ＆ドロップ、ファイルダイアログ、フォルダ一覧、起動時の引数、ウィンドウタイトル、全画面） |
-| `src-tauri/src/lib.rs` | Rust コマンド: `file_info` / `read_range`（バイト列をそのまま返す）/ `list_images`（自然順ソート）/ `startup_paths` |
+| `src-tauri/src/lib.rs` | Rust コマンド: `load_composite_shared`（統合画像を Rust でデコードし、WebView2 の共有メモリで渡す）/ `read_range_shared`（共有メモリでの範囲読み込み）/ `read_range`（IPC、フォールバック用）/ `file_info` / `list_images`（自然順ソート）/ `startup_paths` |
 | `patches/ag-psd+31.0.2.patch` | 未知ブロックを保持する改修（`spike/ag-psd-roundtrip` を参照）。patch-package で自動適用 |
 
 ## 制約（現時点）
