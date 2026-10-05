@@ -146,9 +146,17 @@ python compare_extra.py <orig.psd> out/<name>.rt.psd   # スマートオブジ�
 - 書き込み時のメモリはファイルサイズの約 5 倍に達する。数百 MB 級の PSD では WebView のメモリ上限が問題になる可能性がある（推測）。
 - 対策の候補: `useRawData`（レイヤーの画素を必要になるまで展開しない）、書き込み処理を Rust 側に移す。
 
-### PS 27.10 での確認（依頼中）
+### PS 27.10 での確認（2026-10-05、オーナーが確認）
 
-`_tmp/roundtrip/test_AdjustmentLayer_1.passthrough.psd` と `test_smartObjectLayer_1.passthrough.psd`
+`_tmp/roundtrip/test_AdjustmentLayer_1.passthrough.psd` と `test_smartObjectLayer_1.passthrough.psd` について確認した。
+
+| 確認項目 | 結果 |
+|---|---|
+| エラーなく開けるか | OK |
+| スマートオブジェクトをダブルクリックして中身を開けるか | OK |
+| 色相・彩度の調整レイヤーを編集できるか | OK |
+
+→ **フェーズ 0 の PSD 入出力の検証は合格**。改修版 ag-psd（T 案）で進める。
 
 ## 暫定的な評価（推測を含む）
 
