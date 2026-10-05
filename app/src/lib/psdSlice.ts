@@ -2,8 +2,9 @@
 //
 // PSD layout: header(26) | color mode data | image resources | layer & mask info | image data (composite)
 // The layer & mask section usually makes up most of the file (hundreds of MB), but the composite
-// sits after it. Using File.slice() we read the small sections, skip the layer section entirely,
+// sits after it. With random access we read the small sections, skip the layer section entirely,
 // and rebuild a minimal PSD whose layer section is empty. ag-psd then only decodes the composite.
+import type { FileSource } from "./source";
 
 export type PsdSliceResult = {
   buffer: ArrayBuffer; // minimal PSD: header + color mode + resources + empty layer section + image data
@@ -14,10 +15,10 @@ export type PsdSliceResult = {
 const readU32 = (v: DataView, o: number) => v.getUint32(o);
 const readU64 = (v: DataView, o: number) => Number(v.getBigUint64(o));
 
-export async function readPsdCompositeOnly(file: File): Promise<PsdSliceResult> {
+export async function readPsdCompositeOnly(file: FileSource): Promise<PsdSliceResult> {
   // 1) header + color mode + image resources (+ layer section length) — small, read up front
   const headLen = Math.min(file.size, 1 << 20);
-  let head = new DataView(await file.slice(0, headLen).arrayBuffer());
+  let head = new DataView(await file.read(0, headLen));
   if (head.getUint32(0) !== 0x38425053) throw new Error("PSD ではありません（シグネチャ不一致）"); // '8BPS'
   const version = head.getUint16(4);
   const isPsb = version === 2;
@@ -27,7 +28,7 @@ export async function readPsdCompositeOnly(file: File): Promise<PsdSliceResult> 
   const resourcesLenPos = pos + 4 + colorModeLen;
   const ensure = async (need: number) => {
     if (need <= head.byteLength) return;
-    head = new DataView(await file.slice(0, Math.min(file.size, need + (1 << 20))).arrayBuffer());
+    head = new DataView(await file.read(0, Math.min(file.size, need + (1 << 20))));
   };
   await ensure(resourcesLenPos + 4);
   const resourcesLen = readU32(head, resourcesLenPos);
@@ -45,7 +46,7 @@ export async function readPsdCompositeOnly(file: File): Promise<PsdSliceResult> 
   if (imageDataPos > file.size) throw new Error("PSD のセクション長が不正です");
 
   // 2) composite image data: from imageDataPos to end of file
-  const imageData = await file.slice(imageDataPos, file.size).arrayBuffer();
+  const imageData = await file.read(imageDataPos, file.size - imageDataPos);
 
   // 3) rebuild: [0, layerLenPos) + zero-length layer section + image data
   const prefix = new Uint8Array(head.buffer, 0, layerLenPos);

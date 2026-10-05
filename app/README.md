@@ -1,6 +1,6 @@
-# OptImageEditor app（フェーズ 0: 最小ビューワー）
+# OptImageEditor app
 
-Tauri 2 + Vite + TypeScript。PSD / PSB / PNG / JPG / WebP を開き、WebGL2 で表示する。読み込み時間とメモリ使用量を画面右下に表示する。
+Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1-a（ビューワーの骨組み）。
 
 ## 前提（Windows）
 
@@ -16,34 +16,45 @@ Tauri 2 + Vite + TypeScript。PSD / PSB / PNG / JPG / WebP を開き、WebGL2 �
 ```powershell
 cd D:\google\github\OptImageEditor\app
 npm install          # postinstall で patches/ の ag-psd 改修が自動で当たる
-npm run tauri dev    # 初回は Rust の依存関係のビルドで数分かかる
+npm run tauri dev    # 開発用に起動する
+npm run tauri build  # 配布用にビルドする（src-tauri/target/release/ に exe と NSIS インストーラ）
 ```
 
-- 配布用のビルド: `npm run tauri build`（`src-tauri/target/release/` に exe、NSIS インストーラも生成）
-- ブラウザだけで確認する場合: `npm run dev` を実行し、http://localhost:1420 を開く（Tauri なし）
+- ブラウザだけで UI を確認する場合: `npm run dev` を実行して http://localhost:1420 を開く（ファイルパスに関わる機能は無効）
+- 型チェック: `npm run check`
 
 ## 操作
 
 | 操作 | 内容 |
 |---|---|
 | ドラッグ＆ドロップ / 「開く」/ Ctrl+O | ファイルを開く |
+| → / PageDown、← / PageUp | 同じフォルダの次 / 前の画像（端まで行くと反対側へ戻る） |
+| Home / End | フォルダ内の最初 / 最後の画像 |
 | ホイール | カーソル位置を中心に拡大・縮小 |
 | 左ドラッグ / 中ドラッグ / Space+ドラッグ | 移動（パン） |
 | Ctrl+0 / Ctrl+1 / Ctrl+＋ / Ctrl+－ | 全体表示 / 100% / 拡大 / 縮小 |
-| 「計測をコピー」 | 計測結果をクリップボードへコピーする |
+| Ctrl+W | 画像を閉じる（GPU のテクスチャを解放する） |
+| F11 | 全画面 |
+| F2 | 計測パネルの表示 / 非表示（「コピー」で計測結果をクリップボードへ） |
+| 起動時の引数 | `optimageeditor.exe <画像のパス>` で、その画像を開いて起動する（「プログラムから開く」の土台） |
 
 ## 構成
 
 | ファイル | 役割 |
 |---|---|
-| `src/decoder.worker.ts` | Web Worker でデコードする。PSD は ag-psd で統合画像だけを読む（レイヤーの画素とスマートオブジェクトの中身は読み飛ばす）。PNG / JPG は `createImageBitmap` で読む |
-| `src/psdSlice.ts` | PSD / PSB のレイヤー部分を読み飛ばし、ヘッダー・リソース・統合画像だけを `File.slice()` で読む（数百 MB の PSD でもディスクから読む量を数十 MB に抑える） |
-| `src/renderer.ts` | WebGL2 の描画。`MAX_TEXTURE_SIZE`（上限 8192）を超える画像はタイルに分割する。縮小時はミップマップ、200% 以上ではニアレストネイバー。透明部分は市松模様で表示 |
-| `src/main.ts` | ファイルを開く処理、ズーム・パン、計測値の表示 |
+| `src/App.svelte` | 画面全体（ツールバー / ビュー / ステータスバー）、キー操作、フォルダ内の移動 |
+| `src/lib/Viewer.svelte` | キャンバスと、ズーム・パンの操作 |
+| `src/lib/renderer.ts` | WebGL2 の描画。`MAX_TEXTURE_SIZE`（上限 8192）を超える画像はタイルに分割する。縮小時はミップマップ、200% 以上はニアレストネイバー。透明部分は市松模様 |
+| `src/lib/loader.ts` | ファイルの読み込みからデコードまで（デコード処理は Web Worker） |
+| `src/lib/decoder.worker.ts` | PSD は ag-psd で統合画像だけを読む。PNG / JPG は `createImageBitmap` |
+| `src/lib/psdSlice.ts` | PSD / PSB のレイヤー部分を読み飛ばし、必要な範囲だけを読む |
+| `src/lib/source.ts` | ファイルの範囲読み込みの共通部分（Tauri: Rust の `read_range` / ブラウザ: `File.slice`） |
+| `src/lib/desktop.ts` | Tauri 連携（ネイティブのドラッグ＆ドロップ、ファイルダイアログ、フォルダ一覧、起動時の引数、ウィンドウタイトル、全画面） |
+| `src-tauri/src/lib.rs` | Rust コマンド: `file_info` / `read_range`（バイト列をそのまま返す）/ `list_images`（自然順ソート）/ `startup_paths` |
 | `patches/ag-psd+31.0.2.patch` | 未知ブロックを保持する改修（`spike/ag-psd-roundtrip` を参照）。patch-package で自動適用 |
 
-## 制約（フェーズ 0）
+## 制約（現時点）
 
 - PSD は統合画像だけを表示する。統合画像が無い PSD（PS の「互換性を優先」がオフで保存されたもの）はエラーになる。
 - 16 / 32bit の PSD は、表示用に 8bit へ変換する。
-- Tauri 側のドラッグ＆ドロップ（ファイルパスの取得）は無効にし、HTML5 のドロップを使っている。ファイルパスが要る機能（同じフォルダの前後の画像へ送る、上書き保存）はフェーズ 1 で実装する。
+- 未実装: タブ、最近使ったファイル、「プログラムから開く」への登録、二重起動の防止、EXR、比較表示、ナビゲーター、ガイド / グリッド

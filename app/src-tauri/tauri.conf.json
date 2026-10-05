@@ -16,8 +16,7 @@
         "label": "main",
         "title": "OptImageEditor",
         "width": 1400,
-        "height": 900,
-        "dragDropEnabled": false
+        "height": 900
       }
     ],
     "security": {
