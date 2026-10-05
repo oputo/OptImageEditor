@@ -21,15 +21,17 @@ for (const f of process.argv.slice(2)) {
     psd = readPsd(readFileSync(f), { useImageData: true, logMissingFeatures: true, logDevFeatures: false });
   } finally { console.log = origLog; }
   const tRead = performance.now() - t0;
+  const rssRead = process.memoryUsage().rss;
   t0 = performance.now();
   const buf = writePsd(psd, { generateThumbnail: false, trimImageData: false, noBackground: false });
   const tWrite = performance.now() - t0;
+  const rssWrite = process.memoryUsage().rss;
   writeFileSync(`out/${name}.rt.psd`, Buffer.from(buf));
   const walk = (ls, d = 0) => (ls || []).flatMap(l => [
     `${'  '.repeat(d)}${l.children ? '[group]' : l.text ? '[type]' : l.adjustment ? '[adj:' + l.adjustment.type + ']' : l.placedLayer ? '[smart]' : '[pixel]'} ${l.name}`
       + (l.effects ? ' fx' : '') + (l.mask ? ' mask' : '') + (l.clipping ? ' clip' : ''),
     ...walk(l.children, d + 1)]);
-  console.log(`== ${name}: ${psd.width}x${psd.height} bpc=${psd.bitsPerChannel} mode=${psd.colorMode} read=${tRead.toFixed(0)}ms write=${tWrite.toFixed(0)}ms`);
+  console.log(`== ${name}: ${psd.width}x${psd.height} bpc=${psd.bitsPerChannel} mode=${psd.colorMode} read=${tRead.toFixed(0)}ms write=${tWrite.toFixed(0)}ms rss(read)=${(rssRead/2**20).toFixed(0)}MB rss(write)=${(rssWrite/2**20).toFixed(0)}MB`);
   console.log(walk(psd.children).join('\n'));
   if (missing.length) console.log('  missing features:', [...new Set(missing)].slice(0, 20));
 }

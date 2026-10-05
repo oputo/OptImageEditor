@@ -14,6 +14,7 @@ node roundtrip.mjs <a.psd> [b.psd ...]   # 無変更で読み書き → out/<nam
 node edit_test.mjs <a.psd>               # テキスト変更 + レイヤー非表示 → out/<name>.edit.psd
 python apply_passthrough_patch.py        # 改修: 未知ブロックの保持（npm install の後に 1 回）
 python compare.py <orig.psd> out/<name>.rt.psd   # 差分レポート（pip install psd-tools）
+python compare_extra.py <orig.psd> out/<name>.rt.psd   # スマートオブジェクト / 調整レイヤー / 文書全体の付加情報の照合
 ```
 
 ## 結果（既存サンプル 3 本）
@@ -111,6 +112,43 @@ python compare.py <orig.psd> out/<name>.rt.psd   # 差分レポート（pip inst
 - ag-psd の README には「16bit 非対応」とあるが、v30.0.1 の CHANGELOG に「Fixed handling files with 16bit color format」があり、ソースにも 16 / 32bit 用の画素バッファを作る処理がある。**16bit の読み込みは README の記述より進んでいる可能性がある**（推測）。16bit のサンプルで確認したい。
 - `useRawData` オプション（v30〜）を使うと、レイヤーの画素を必要になるまで展開しないでおける。大きな PSD のメモリ対策に使える見込み。
 - 透明のある文書では、統合画像の半透明画素の RGB に差が出る（最大 42）。アプリが保存時に統合画像を再生成するので、実害はないと判断。
+
+## 実案件サンプルでの検証（2026-10-05）
+
+対象は `_tmp/test_AdjustmentLayer_1.psd` と `_tmp/test_smartObjectLayer_1.psd`。改修版 ag-psd で往復し、`compare.py` と `compare_extra.py` で照合した。
+
+### サンプルの構成
+
+| ファイル | サイズ | 構成 |
+|---|---|---|
+| test_AdjustmentLayer_1（64MB） | 1920×1080 / 8bit | ピクセル 2、テキスト 1（不透明度 38%）、グループ 2（非表示）、色相・彩度の調整レイヤー（マスク付き）、ベタ塗りレイヤー（マスク付き）、オーバーレイ描画、埋め込みスマートオブジェクト 4 |
+| test_smartObjectLayer_1（175MB） | 4096×4096 / 8bit | 埋め込みスマートオブジェクト 4（中身の PSB は 1.9〜37.7MB） |
+
+### 結果（事実）
+
+| 項目 | 結果 |
+|---|---|
+| レイヤー構成と属性（グループ、表示状態、描画モード、不透明度、マスク） | すべて一致 |
+| 統合画像 | 2 本とも完全一致 |
+| 色相・彩度の調整レイヤー / ベタ塗りレイヤーのデータ | 一致。ag-psd はパラメーターを解釈済みの値として渡してくれる（例: master saturation = -100、塗り色 RGB 44,44,44） |
+| スマートオブジェクト | 埋め込み PSB 8 個はすべてバイト単位で一致。UUID・変形・描画済みの画素も一致 |
+| 埋め込み PSB を ag-psd で直接開けるか | 開けた（2048×2048 / 2 レイヤーを 82ms）。将来の「スマートオブジェクトの中身を開いて編集する」機能の土台になる |
+| 失われたもの | `Patt` と `lnkE`（どちらも中身は空）、サムネイル（テストで生成を無効にしているため） |
+| テキスト | 未使用フォント（MyriadPro-Regular、KozGoPr6N-Regular）が FontSet から外れる。使用中のフォントは保持 |
+
+### 速度とメモリ（クラウド環境の Node 22）
+
+| ファイル | 読み込み | 書き込み | RSS（読み込み後） | RSS（書き込み後） |
+|---|---|---|---|---|
+| test_AdjustmentLayer_1（64MB） | 0.17 秒 | 0.35 秒 | 162MB | 306MB |
+| test_smartObjectLayer_1（175MB） | 0.47 秒 | 0.88 秒 | 356MB | 942MB |
+
+- 書き込み時のメモリはファイルサイズの約 5 倍に達する。数百 MB 級の PSD では WebView のメモリ上限が問題になる可能性がある（推測）。
+- 対策の候補: `useRawData`（レイヤーの画素を必要になるまで展開しない）、書き込み処理を Rust 側に移す。
+
+### PS 27.10 での確認（依頼中）
+
+`_tmp/roundtrip/test_AdjustmentLayer_1.passthrough.psd` と `test_smartObjectLayer_1.passthrough.psd`
 
 ## 暫定的な評価（推測を含む）
 
