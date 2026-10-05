@@ -37,6 +37,7 @@ npm run tauri dev    # 初回は Rust の依存関係のビルドで数分かか
 | ファイル | 役割 |
 |---|---|
 | `src/decoder.worker.ts` | Web Worker でデコードする。PSD は ag-psd で統合画像だけを読む（レイヤーの画素とスマートオブジェクトの中身は読み飛ばす）。PNG / JPG は `createImageBitmap` で読む |
+| `src/psdSlice.ts` | PSD / PSB のレイヤー部分を読み飛ばし、ヘッダー・リソース・統合画像だけを `File.slice()` で読む（数百 MB の PSD でもディスクから読む量を数十 MB に抑える） |
 | `src/renderer.ts` | WebGL2 の描画。`MAX_TEXTURE_SIZE`（上限 8192）を超える画像はタイルに分割する。縮小時はミップマップ、200% 以上ではニアレストネイバー。透明部分は市松模様で表示 |
 | `src/main.ts` | ファイルを開く処理、ズーム・パン、計測値の表示 |
 | `patches/ag-psd+31.0.2.patch` | 未知ブロックを保持する改修（`spike/ag-psd-roundtrip` を参照）。patch-package で自動適用 |

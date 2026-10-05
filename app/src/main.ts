@@ -1,6 +1,7 @@
 // OptImageEditor — phase 0 viewer spike.
 // Opens PSD / PNG / JPG, shows the image with WebGL2 (zoom / pan) and reports timing and memory.
 import { Renderer } from "./renderer";
+import { readPsdCompositeOnly } from "./psdSlice";
 import type { DecodeRequest, DecodeResult } from "./decoder.worker";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -47,7 +48,23 @@ async function openFile(file: File) {
   await new Promise((r) => requestAnimationFrame(() => r(null))); // let the busy label paint
   const t0 = performance.now();
   try {
-    const buffer = await file.arrayBuffer();
+    // PSD/PSB: read only header + resources + composite (skip the layer section). Fallback: whole file.
+    let buffer: ArrayBuffer;
+    let layerRecords: number | null = null;
+    let readNote = "whole file";
+    if (/\.(psd|psb)$/i.test(file.name)) {
+      try {
+        const r = await readPsdCompositeOnly(file);
+        buffer = r.buffer;
+        layerRecords = r.layerRecords;
+        readNote = `composite only: ${mb(r.bytesRead)} of ${mb(file.size)}`;
+      } catch (e) {
+        console.warn("partial read failed, reading whole file", e);
+        buffer = await file.arrayBuffer();
+      }
+    } else {
+      buffer = await file.arrayBuffer();
+    }
     const tRead = performance.now() - t0;
     const t1 = performance.now();
     const res = await decode(file.name, buffer);
@@ -66,8 +83,8 @@ async function openFile(file: File) {
     lastStats = [
       `file        ${file.name}`,
       `file size   ${mb(file.size)}`,
-      `image       ${res.width} x ${res.height}  ${res.bitsPerChannel}bit${res.layerCount !== null ? `  layers ${res.layerCount}` : ""}${res.note ? `  (${res.note})` : ""}`,
-      `read file   ${ms(tRead)}`,
+      `image       ${res.width} x ${res.height}  ${res.bitsPerChannel}bit${layerRecords !== null ? `  layer records ${layerRecords}` : res.layerCount !== null ? `  layers ${res.layerCount}` : ""}${res.note ? `  (${res.note})` : ""}`,
+      `read file   ${ms(tRead)}  (${readNote})`,
       `decode      ${ms(res.decodeMs)}  (worker round-trip ${ms(tWorker)})`,
       `GPU upload  ${ms(tUpload)}  tiles ${tiles}  max tex ${renderer.maxTextureSize}`,
       `TOTAL       ${ms(total)}`,
