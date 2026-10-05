@@ -54,6 +54,17 @@ python compare.py <orig.psd> out/<name>.rt.psd   # 差分レポート（pip inst
 2. `test_text_1.rt.psd` のテキストレイヤーを、そのまま編集できるか（フォントが ErasITC-Demi のままか）
 3. `test_text_1.edit.psd` を開いたとき、`<A>` の文字が新しい文字列で再描画されるか。警告が出るかどうか
 
+### PS 27.10 での確認結果（2026-10-05、オーナーが確認）
+
+| 確認項目 | 結果 |
+|---|---|
+| 1. `*.rt.psd` が開け、元と同じか | OK |
+| 2. `test_text_1.rt.psd` のテキストをそのまま編集できるか | OK |
+| 3. `test_text_1.edit.psd` を開いたとき | 開いた時点で「Some text layers might need to be updated before they can be used for vector based output. Do you want to update these layers now?」という確認が出る。ダイアログの背後では `<A>` が古い描画のまま。`Layer 1` の非表示は反映されている。解像度（168ppi）とフォント（Eras Demi ITC / 60px）は保持されている |
+
+- 3 の確認は、`invalidateTextLayers` を指定したときの想定どおりの挙動（PS に再描画を依頼する印）。
+- 「Update」を押すと新しい文字列で再描画されると推測しているが、未確認。
+
 ## 暫定的な評価（推測を含む）
 
 - 単純な構成の PSD なら、ag-psd で十分に往復できる。
