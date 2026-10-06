@@ -17,11 +17,12 @@ Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1-a（ビュー�
 cd D:\google\github\OptImageEditor\app
 npm install          # postinstall で patches/ の ag-psd 改修が自動で当たる
 npm run tauri dev    # 開発用に起動する
-npm run tauri build  # 配布用にビルドする（src-tauri/target/release/ に exe と NSIS インストーラ）
+npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEditor\release\ に exe、bundle\nsis\ にインストーラ）
 ```
 
 - ブラウザだけで UI を確認する場合: `npm run dev` を実行して http://localhost:1420 を開く（ファイルパスに関わる機能は無効）
 - 型チェック: `npm run check`
+- Cargo のビルド生成物は Google ドライブの同期を避けるため `D:\build-cache\OptImageEditor` に出力する（`src-tauri/.cargo/config.toml`。経緯は `docs/build_env.md`）
 
 ## 操作
 

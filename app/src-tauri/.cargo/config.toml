@@ -1,0 +1,6 @@
+# Cargo のビルド生成物（target/）を Google ドライブの同期対象外に置く。
+# D:\google 配下は Drive と同期されるため、ビルド中に書き換わる数 GB の生成物が同期競合を起こしていた
+# （liboptimageeditor_lib.rlib の「一部のファイルをダウンロードできません」エラー。docs/build_env.md を参照）。
+# 別の PC でビルドする場合は、このパスをその PC の同期対象外の場所に変えるか、環境変数 CARGO_TARGET_DIR で上書きする。
+[build]
+target-dir = "D:/build-cache/OptImageEditor"
