@@ -29,6 +29,11 @@ rayon = "1"
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
 windows-core = "0.62"
+winreg = "0.56"
+
+# desktop only: a second launch hands its files to the running window
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"
 
 # Keep `tauri dev` representative for performance: optimize our own crate (image decoding hot loops) in dev builds too
 [profile.dev.package.optimageeditor]

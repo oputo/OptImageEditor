@@ -1,5 +1,6 @@
 // WebGL2 image renderer: tiled textures (images larger than MAX_TEXTURE_SIZE are split),
 // mipmapped minification, nearest-neighbour when zoomed in >= 200%, checkerboard behind transparency.
+// Several images can live on the GPU at once (TextureSet); one of them is shown.
 
 const VS = `#version 300 es
 in vec2 a_unit;                 // 0..1 quad
@@ -30,6 +31,13 @@ void main() {
 
 type Tile = { tex: WebGLTexture; x: number; y: number; w: number; h: number };
 
+/** One image uploaded to the GPU (one or more tiles). */
+export type TextureSet = { readonly id: number; tiles: Tile[]; width: number; height: number; bytes: number };
+
+export type ViewState = { scale: number; offsetX: number; offsetY: number };
+
+let setSeq = 0;
+
 export type ImageSource =
   | { kind: "rgba"; width: number; height: number; data: Uint8ClampedArray; premultiplied?: boolean }
   | { kind: "bitmap"; width: number; height: number; bitmap: ImageBitmap };
@@ -42,10 +50,8 @@ export class Renderer {
   private loc: Record<string, WebGLUniformLocation | null> = {};
   private smoothSampler: WebGLSampler;
   private nearestSampler: WebGLSampler;
-  private tiles: Tile[] = [];
-  imageWidth = 0;
-  imageHeight = 0;
-  textureBytes = 0;
+  private active: TextureSet | null = null;
+  private live = new Set<TextureSet>();
   // view: css px per image px, and image origin position in css px
   scale = 1;
   offsetX = 0;
@@ -94,23 +100,41 @@ export class Renderer {
     this.nearestSampler = mkSampler(gl.LINEAR_MIPMAP_LINEAR, gl.NEAREST);
   }
 
-  get hasImage() { return this.tiles.length > 0; }
+  get hasImage() { return this.active !== null; }
+  get imageWidth() { return this.active?.width ?? 0; }
+  get imageHeight() { return this.active?.height ?? 0; }
+  /** GPU memory of all images currently uploaded (approximate, incl. mipmaps) */
+  get textureBytes() { let b = 0; for (const s of this.live) b += s.bytes; return b; }
+  get textureCount() { return this.live.size; }
+  get activeSet() { return this.active; }
 
-  clear() {
-    for (const t of this.tiles) this.gl.deleteTexture(t.tex);
-    this.tiles = [];
-    this.textureBytes = 0;
-    this.imageWidth = this.imageHeight = 0;
+  /** Shows `set` (or nothing). Does not free anything. */
+  show(set: TextureSet | null) {
+    this.active = set;
+    this.requestDraw();
   }
 
-  /** Uploads the image as one or more tiles. Returns upload time in ms (GPU-synchronised). */
-  async setImage(src: ImageSource): Promise<number> {
+  /** Stops showing the current image (textures stay alive). */
+  clear() { this.show(null); }
+
+  /** Frees the GPU textures of `set`. */
+  dispose(set: TextureSet) {
+    if (!this.live.delete(set)) return;
+    for (const t of set.tiles) this.gl.deleteTexture(t.tex);
+    set.tiles = [];
+    if (this.active === set) this.show(null);
+  }
+
+  getView(): ViewState { return { scale: this.scale, offsetX: this.offsetX, offsetY: this.offsetY }; }
+  setView(v: ViewState) { this.scale = v.scale; this.offsetX = v.offsetX; this.offsetY = v.offsetY; this.requestDraw(); }
+
+  /** Uploads the image as one or more tiles (not shown yet). Returns the set and the upload time in ms (GPU-synchronised). */
+  async upload(src: ImageSource): Promise<{ set: TextureSet; ms: number }> {
     const gl = this.gl;
-    this.clear();
     const t0 = performance.now();
     const T = Math.min(this.maxTextureSize, 8192);
-    this.imageWidth = src.width;
-    this.imageHeight = src.height;
+    const set: TextureSet = { id: ++setSeq, tiles: [], width: src.width, height: src.height, bytes: 0 };
+    this.live.add(set);
 
     for (let y = 0; y < src.height; y += T) {
       for (let x = 0; x < src.width; x += T) {
@@ -135,19 +159,20 @@ export class Renderer {
           const part = (x === 0 && y === 0 && w === src.width && h === src.height)
             ? src.bitmap
             : await createImageBitmap(src.bitmap, x, y, w, h, { premultiplyAlpha: "premultiply" });
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
           gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, part);
           if (part !== src.bitmap) part.close();
         }
         gl.generateMipmap(gl.TEXTURE_2D);
-        this.tiles.push({ tex, x, y, w, h });
-        this.textureBytes += Math.round(w * h * 4 * 4 / 3);
+        set.tiles.push({ tex, x, y, w, h });
+        set.bytes += Math.round(w * h * 4 * 4 / 3);
       }
     }
     if (src.kind === "bitmap") src.bitmap.close();
     // force GPU sync so the measured time includes the upload
     const px = new Uint8Array(4);
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
-    return performance.now() - t0;
+    return { set, ms: performance.now() - t0 };
   }
 
   resize() {
@@ -215,7 +240,7 @@ export class Renderer {
     gl.uniform1i(this.loc.u_tex, 0);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindSampler(0, this.scale >= 2 ? this.nearestSampler : this.smoothSampler);
-    for (const t of this.tiles) {
+    for (const t of this.active!.tiles) {
       gl.bindTexture(gl.TEXTURE_2D, t.tex);
       gl.uniform4f(this.loc.u_rect, t.x, t.y, t.w, t.h);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);

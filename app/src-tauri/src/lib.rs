@@ -314,14 +314,132 @@ fn list_images(path: String, extensions: Vec<String>) -> Result<Vec<String>, Str
 /// Existing files passed on the command line ("Open with", double-click on an associated file).
 #[tauri::command]
 fn startup_paths() -> Vec<String> {
-    std::env::args().skip(1).filter(|a| !a.starts_with('-') && Path::new(a).is_file()).collect()
+    let cwd = std::env::current_dir().unwrap_or_default();
+    file_args(std::env::args().skip(1), &cwd)
+}
+
+/// Command-line arguments that are existing files, resolved against `cwd`.
+fn file_args(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<String> {
+    args.into_iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| {
+            let p = Path::new(&a);
+            if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+        })
+        .filter(|p| p.is_file())
+        .filter_map(|p| p.to_str().map(str::to_owned))
+        .collect()
+}
+
+/// Registers / unregisters the app in Explorer's "Open with" list for `extensions` (HKCU only, no admin rights).
+/// Returns the registered exe path.
+#[tauri::command]
+fn register_open_with(register: bool, extensions: Vec<String>) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        openwith::apply(register, &extensions)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (register, extensions);
+        Err("Windows のみ対応".into())
+    }
+}
+
+/// Opens Windows Settings > Default apps.
+#[tauri::command]
+fn open_default_apps_settings() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer.exe").arg("ms-settings:defaultapps").spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+mod openwith {
+    use std::borrow::Cow;
+    use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_SET_VALUE};
+    use winreg::{RegKey, RegValue};
+
+    const PROG_ID: &str = "OptImageEditor.Image";
+    const APP_KEY: &str = r"Software\Classes\Applications\optimageeditor.exe";
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHChangeNotify(event_id: i32, flags: u32, item1: *const core::ffi::c_void, item2: *const core::ffi::c_void);
+    }
+    const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
+
+    pub fn apply(register: bool, exts: &[String]) -> Result<String, String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe = exe.to_string_lossy().to_string();
+        let exe = exe.strip_prefix(r"\\?\").unwrap_or(&exe).to_string();
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let err = |e: std::io::Error| e.to_string();
+        let command = format!("\"{exe}\" \"%1\"");
+        if register {
+            // ProgID with icon and open command
+            let (k, _) = hkcu.create_subkey(format!(r"Software\Classes\{PROG_ID}")).map_err(err)?;
+            k.set_value("", &"画像 (OptImageEditor)").map_err(err)?;
+            let (icon, _) = k.create_subkey("DefaultIcon").map_err(err)?;
+            icon.set_value("", &format!("\"{exe}\",0")).map_err(err)?;
+            let (cmd, _) = k.create_subkey(r"shell\open\command").map_err(err)?;
+            cmd.set_value("", &command).map_err(err)?;
+            // .ext\OpenWithProgids -> ProgID (REG_NONE, like Explorer itself writes)
+            for e in exts {
+                let (ow, _) = hkcu.create_subkey(format!(r"Software\Classes\.{e}\OpenWithProgids")).map_err(err)?;
+                ow.set_raw_value(PROG_ID, &RegValue { bytes: Cow::Borrowed(&[]), vtype: RegType::REG_NONE }).map_err(err)?;
+            }
+            // Applications\optimageeditor.exe: friendly name + supported types for the "Open with" dialog
+            let (app, _) = hkcu.create_subkey(APP_KEY).map_err(err)?;
+            app.set_value("FriendlyAppName", &"OptImageEditor").map_err(err)?;
+            let (st, _) = app.create_subkey("SupportedTypes").map_err(err)?;
+            for e in exts {
+                st.set_value(format!(".{e}"), &"").map_err(err)?;
+            }
+            let (cmd, _) = app.create_subkey(r"shell\open\command").map_err(err)?;
+            cmd.set_value("", &command).map_err(err)?;
+        } else {
+            let _ = hkcu.delete_subkey_all(format!(r"Software\Classes\{PROG_ID}"));
+            let _ = hkcu.delete_subkey_all(APP_KEY);
+            for e in exts {
+                if let Ok(ow) = hkcu.open_subkey_with_flags(format!(r"Software\Classes\.{e}\OpenWithProgids"), KEY_SET_VALUE) {
+                    let _ = ow.delete_value(PROG_ID);
+                }
+            }
+        }
+        unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, 0, std::ptr::null(), std::ptr::null()) };
+        Ok(exe)
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri::{Emitter, Manager};
     tauri::Builder::default()
+        // must be the first plugin: a second launch forwards its files to this window (opened as tabs) and exits
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            let paths = file_args(args.into_iter().skip(1), Path::new(&cwd));
+            if !paths.is_empty() {
+                let _ = app.emit("oie://open-paths", paths);
+            }
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![file_info, read_range, read_range_shared, load_composite_shared, list_images, startup_paths])
+        .invoke_handler(tauri::generate_handler![
+            file_info,
+            read_range,
+            read_range_shared,
+            load_composite_shared,
+            list_images,
+            startup_paths,
+            register_open_with,
+            open_default_apps_settings
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
