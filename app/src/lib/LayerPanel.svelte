@@ -261,6 +261,7 @@
     </div>
 
     <footer>
+      {#if L.saving}<span class="savedinfo">保存中: {L.savePhase ?? "準備"}…</span>{/if}
       {#if L.saved}<span class="savedinfo" title={L.saved.path}>保存 {L.saved.ms.toFixed(0)} ms / {kb(L.saved.bytes)}</span>{/if}
       <button onclick={() => tab && vs.diffComposite(tab)} title="レイヤー合成と、ファイルに保存されている PS の統合画像を画素単位で比べる">PS との差を計測</button>
       {#if L.diff}

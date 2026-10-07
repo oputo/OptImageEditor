@@ -66,6 +66,8 @@ export type LayersState = {
   undoCount: number;
   redoCount: number;
   saving: boolean;
+  /** what the running save is doing (shown in the panel; also logged to the console with timings) */
+  savePhase: string | null;
   /** last save: time and size */
   saved: { ms: number; bytes: number; path: string } | null;
 };
@@ -434,7 +436,7 @@ export class ViewerState {
     const token = tab.token;
     tab.layers = {
       status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, stats: null, diff: null,
-      dirty: false, undoCount: 0, redoCount: 0, saving: false, saved: null,
+      dirty: false, undoCount: 0, redoCount: 0, saving: false, savePhase: null, saved: null,
     };
     try {
       const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
@@ -711,6 +713,14 @@ export class ViewerState {
     const l = tab.layers;
     const doc = this.docs.get(tab.id);
     if (!l || l.status !== "ready" || !doc || !this.renderer) throw new Error("レイヤーが読み込まれていません");
+    let t = performance.now();
+    const phase = (name: string) => {
+      const now = performance.now();
+      console.info(`[save] ${l.savePhase ?? "start"}: ${(now - t).toFixed(0)} ms`);
+      t = now;
+      l.savePhase = name;
+    };
+    phase("統合画像");
     // composite (premultiplied on the GPU) -> straight RGBA for the file
     const set = this.compositor!.render(doc, l.tree);
     const px = this.renderer.readSet(set);
@@ -723,11 +733,14 @@ export class ViewerState {
       composite[i + 2] = (px[i + 2] * 255) / a + 0.5;
       composite[i + 3] = a;
     }
+    phase("元ファイルの読み込み");
     const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
     const original = await src.readAll();
+    phase("PSD の組み立て");
     const { buffer } = await buildPsd(original, tab.name, {
       plan: toPlan(l.tree), composite, width: doc.data.width, height: doc.data.height, psb,
     });
+    phase("書き込み");
     return buffer;
   }
 
@@ -768,7 +781,9 @@ export class ViewerState {
       }
       const sameFile = keyOf(target) === keyOf(tab.path!);
       const backup = sameFile && !this.backedUp.has(keyOf(target));
+      const tw = performance.now();
       await writeFile(target, buffer, backup);
+      console.info(`[save] 書き込み: ${(performance.now() - tw).toFixed(0)} ms (${(buffer.byteLength / 2 ** 20).toFixed(0)} MB)`);
       if (backup) this.backedUp.add(keyOf(target));
       // the file now holds exactly this tree: renumber the source ids the way the worker reads them (post-order)
       let n = 0;
@@ -793,6 +808,7 @@ export class ViewerState {
       return true;
     } finally {
       l.saving = false;
+      l.savePhase = null;
     }
   }
 

@@ -234,7 +234,9 @@ fn percent_decode(s: &str) -> Result<String, String> {
 /// Written to `<path>.tmp` first and then moved over the target, so a failed save never leaves a broken file.
 /// With header `x-backup: 1` the existing file is kept as `<path>.bak` (an older .bak is replaced).
 #[tauri::command]
-fn write_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+// async: a sync command runs on the main (window) thread, and writing hundreds of MB there froze the window
+async fn write_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
     let header = |k: &str| request.headers().get(k).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let path = percent_decode(&header("x-path").ok_or("x-path header missing")?)?;
     let backup = header("x-backup").as_deref() == Some("1");
@@ -257,6 +259,7 @@ fn write_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
         std::fs::rename(&target, &bak).map_err(|e| format!("{}: {e}", bak.display()))?;
     }
     std::fs::rename(&tmp, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+    eprintln!("write_file {} ({} MB) in {} ms", target.display(), data.len() >> 20, t0.elapsed().as_millis());
     Ok(())
 }
 
@@ -528,6 +531,28 @@ mod openwith {
     }
 }
 
+// ---------------------------------------------------------------- window close guard
+//
+// Unsaved edits: closing the window asks the page first. The page must acknowledge the request within
+// CLOSE_ACK_TIMEOUT; if it does not (the WebView hung or crashed), the window is closed anyway so that it
+// can never get stuck (a JS-only onCloseRequested handler leaves the window unclosable when the page is dead).
+static CLOSE_GUARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CLOSE_REQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLOSE_ACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const CLOSE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The page has unsaved edits (closing the window asks first).
+#[tauri::command]
+fn set_close_guard(on: bool) {
+    CLOSE_GUARD.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The page received close request `seq` and is asking the user.
+#[tauri::command]
+fn close_ack(seq: u64) {
+    CLOSE_ACK.fetch_max(seq, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::{Emitter, Manager};
@@ -544,6 +569,25 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            use std::sync::atomic::Ordering::SeqCst;
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if !CLOSE_GUARD.load(SeqCst) {
+                    return;
+                }
+                api.prevent_close();
+                let seq = CLOSE_REQ.fetch_add(1, SeqCst) + 1;
+                let _ = window.emit("oie://close-requested", seq);
+                let w = window.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(CLOSE_ACK_TIMEOUT);
+                    if CLOSE_ACK.load(SeqCst) < seq {
+                        eprintln!("close request {seq} not acknowledged by the page: closing anyway");
+                        let _ = w.destroy();
+                    }
+                });
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             file_info,
             read_range,
@@ -552,6 +596,8 @@ pub fn run() {
             load_hdr,
             take_buffer,
             write_file,
+            set_close_guard,
+            close_ack,
             list_images,
             startup_paths,
             register_open_with,

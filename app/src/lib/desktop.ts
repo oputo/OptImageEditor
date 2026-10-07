@@ -93,8 +93,19 @@ export async function writeFile(path: string, data: ArrayBuffer, backup: boolean
   await invoke("write_file", new Uint8Array(data), { headers: { "x-path": encodeURIComponent(path), "x-backup": backup ? "1" : "0" } });
 }
 
-/** Window close: `handler` returns true to let the window close. */
+/** Unsaved edits: closing the window asks `handler` first (true = close). The Rust side closes the window
+ *  anyway if the page does not acknowledge within 3 s (hung / crashed WebView). */
+export async function setCloseGuard(on: boolean) {
+  if (isTauri()) await invoke("set_close_guard", { on });
+}
+
 export async function onCloseRequested(handler: () => Promise<boolean>) {
   if (!isTauri()) return () => {};
-  return getCurrentWindow().onCloseRequested(async (e) => { if (!(await handler())) e.preventDefault(); });
+  return listen<number>("oie://close-requested", async (e) => {
+    await invoke("close_ack", { seq: e.payload });
+    if (await handler()) {
+      await setCloseGuard(false);
+      await getCurrentWindow().destroy();
+    }
+  });
 }

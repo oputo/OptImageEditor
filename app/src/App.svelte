@@ -12,7 +12,7 @@
   import { SUPPORTED_EXT, isPsd } from "./lib/loader";
   import { baseName, isTauri, readTuning, READ_MODES, READ_MODE_LABEL } from "./lib/source";
   import {
-    confirmDialog, infoDialog, onCloseRequested, onNativeDrop, onOpenPaths, openDefaultAppsSettings, pickFile,
+    confirmDialog, infoDialog, onCloseRequested, onNativeDrop, setCloseGuard, onOpenPaths, openDefaultAppsSettings, pickFile,
     setOpenWithRegistration, startupPaths, toggleFullscreen,
   } from "./lib/desktop";
   import { ViewerState } from "./lib/viewerState.svelte";
@@ -60,6 +60,9 @@
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
   const active = $derived(vs.active);
+  // closing the window asks first while any tab has unsaved layer edits
+  const unsaved = $derived(vs.tabs.some((t) => t.layers?.dirty));
+  $effect(() => { void setCloseGuard(unsaved); });
   const meta = $derived(active?.meta ?? null);
   // layers panel: load the PSD's layers when the panel is open (after 0.4 s on the same image, so that
   // stepping through a folder with ← / → does not decode every file's layers)
@@ -238,7 +241,7 @@
     onNativeDrop({ over: (on) => (dragOver = on), drop: (paths) => openPaths(paths) }).then((u) => unlisten.push(u));
     onOpenPaths((paths) => openPaths(paths)).then((u) => unlisten.push(u));
     startupPaths().then((paths) => openPaths(paths));
-    onCloseRequested(async () => !vs.hasUnsaved() || confirmDialog("保存されていないレイヤーの変更があります。破棄して終了しますか？")).then((u) => unlisten.push(u));
+    onCloseRequested(async () => confirmDialog("保存されていないレイヤーの変更があります。破棄して終了しますか？")).then((u) => unlisten.push(u));
     // browser build / reload of the webview
     const beforeUnload = (e: BeforeUnloadEvent) => { if (vs.hasUnsaved()) e.preventDefault(); };
     window.addEventListener("beforeunload", beforeUnload);
