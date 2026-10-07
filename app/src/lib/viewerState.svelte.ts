@@ -36,6 +36,8 @@ export type Tab = {
   orient: Orientation | null;
   /** guides in image px (vertical guides at x, horizontal guides at y); kept while stepping through the folder */
   guides: Guides;
+  /** EXR layer (channel group) shown; reset to 0 when stepping to another file */
+  layer: number;
   loading: boolean;
   error: string | null;
   token: number;
@@ -52,6 +54,8 @@ const PREFETCH_DELAY_MS = 150;
 
 const isSupported = (p: string) => SUPPORTED_EXT.includes(p.split(".").pop()?.toLowerCase() ?? "");
 const keyOf = (path: string) => path.toLowerCase();
+/** GPU cache key of what a tab shows (EXR layers other than the first are cached separately) */
+const cacheKey = (t: Tab) => (t.layer ? `${t.key}#${t.layer}` : t.key);
 
 export class ViewerState {
   tabs = $state<Tab[]>([]);
@@ -100,7 +104,7 @@ export class ViewerState {
       const id = ++this.seq;
       this.tabs.push({
         id, key: keyOf(path), path, file: null, name: baseName(path),
-        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, loading: false, error: null, token: 0,
+        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, loading: false, error: null, token: 0,
       });
       lastId = id;
       // folder listing in the background (needed for ← / →)
@@ -121,7 +125,7 @@ export class ViewerState {
     const id = ++this.seq;
     this.tabs.push({
       id, key: `file:${id}`, path: null, file, name: file.name,
-      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, loading: false, error: null, token: 0,
+      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, loading: false, error: null, token: 0,
     });
     this.activate(id);
   }
@@ -142,7 +146,7 @@ export class ViewerState {
     if (this.compare && prev && id === this.compare.bId && prev.id !== id) this.compare.bId = prev.id;
     this.activeId = id;
     this.mru = [id, ...this.mru.filter((x) => x !== id)];
-    const entry = this.cache.get(tab.key);
+    const entry = this.cache.get(cacheKey(tab));
     if (entry) {
       this.present(tab, entry, true);
     } else {
@@ -207,9 +211,10 @@ export class ViewerState {
     tab.key = keyOf(path);
     tab.name = baseName(path);
     tab.folderIndex = i;
+    tab.layer = 0;
     if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
     tab.view = null;
-    const entry = this.cache.get(tab.key);
+    const entry = this.cache.get(cacheKey(tab));
     if (entry) {
       tab.token++; // supersede a slower load still running for the previous image
       tab.loading = false;
@@ -224,12 +229,22 @@ export class ViewerState {
     this.schedulePrefetch();
   }
 
+  /** Shows another layer (channel group) of the active EXR: decodes it again. */
+  setLayer(index: number) {
+    const tab = this.active;
+    if (!tab || tab.layer === index) return;
+    tab.layer = index;
+    const view = this.renderer?.hasImage ? this.renderer.getView() : null;
+    this.reload();
+    tab.view = view; // keep zoom / position (same image size)
+  }
+
   /** Reloads the active image from disk (drops its cached texture). */
   reload() {
     const tab = this.active;
     if (!tab) return;
-    const e = this.cache.get(tab.key);
-    if (e) { this.cache.delete(tab.key); this.renderer?.dispose(e.set); this.cacheVersion++; }
+    const e = this.cache.get(cacheKey(tab));
+    if (e) { this.cache.delete(cacheKey(tab)); this.renderer?.dispose(e.set); this.cacheVersion++; }
     if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
     tab.view = null;
     this.loadTab(tab);
@@ -239,12 +254,12 @@ export class ViewerState {
 
   private async loadTab(tab: Tab) {
     const token = ++tab.token;
-    const key = tab.key;
+    const key = cacheKey(tab);
     tab.loading = true;
     tab.error = null;
     try {
       const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
-      const entry = await this.decodeAndUpload(src, key);
+      const entry = await this.decodeAndUpload(src, key, tab.layer);
       if (token !== tab.token) return; // superseded (navigated away / closed)
       this.present(tab, entry, false);
       if (tab.path) recent.add(tab.path);
@@ -263,14 +278,14 @@ export class ViewerState {
   }
 
   /** Decodes + uploads, de-duplicating concurrent requests for the same key, and stores the result in the cache. */
-  private decodeAndUpload(src: FileSource, key: string): Promise<CacheEntry> {
+  private decodeAndUpload(src: FileSource, key: string, layer = 0): Promise<CacheEntry> {
     const cached = this.cache.get(key);
     if (cached) return Promise.resolve(cached);
     const running = this.inflight.get(key);
     if (running) return running;
     const p = (async () => {
       const t0 = performance.now();
-      const img = await loadImage(src);
+      const img = await loadImage(src, { layer });
       let up: { set: TextureSet; ms: number };
       try {
         up = await this.renderer!.upload(img.image);
@@ -316,13 +331,13 @@ export class ViewerState {
     const active = this.active;
     // priority order: active > next > previous > recently used tabs
     const keep: string[] = [];
-    if (active) keep.push(active.key);
+    if (active) keep.push(cacheKey(active));
     const b = this.compareTab;
-    if (b) keep.push(b.key);
+    if (b) keep.push(cacheKey(b));
     for (const p of this.neighbourPaths(active)) keep.push(keyOf(p));
     for (const id of this.mru.slice(0, KEEP_OTHER_TABS + 1)) {
       const t = this.tab(id);
-      if (t && t.id !== active?.id) keep.push(t.key);
+      if (t && t.id !== active?.id) keep.push(cacheKey(t));
     }
     const kept = new Set<string>();
     let bytes = 0;
@@ -410,7 +425,7 @@ export class ViewerState {
     if (!c || !r) return;
     const b = this.tab(c.bId);
     if (!b) { this.stopCompare(); return; }
-    const entry = this.cache.get(b.key);
+    const entry = this.cache.get(cacheKey(b));
     if (entry && r.hasImage) {
       r.setCompare({ set: entry.set, mode: c.mode, linked: c.linked, fitB: c.fitB, split: c.split, showB: c.showB });
     } else {

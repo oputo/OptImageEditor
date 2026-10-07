@@ -1,5 +1,6 @@
 // OptImageEditor — Rust side.
 mod composite;
+mod hdr;
 // File access is done here so the WebView can read byte ranges of large files (PSD composite-only reads)
 // and list sibling images for folder navigation.
 
@@ -144,6 +145,71 @@ async fn load_composite_shared(webview: tauri::Webview, path: String, id: u32) -
         }
         Err(e) => Err(e),
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HdrLoad {
+    /// pixels were posted as a shared buffer; otherwise fetch them with `take_buffer(id)`
+    posted: bool,
+    info: hdr::HdrInfo,
+    layer: usize,
+    width: u32,
+    height: u32,
+    decode_ms: f64,
+}
+
+/// Decoded pixels waiting for `take_buffer` (IPC fallback when shared buffers are not available).
+fn stash() -> &'static std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// EXR / Radiance HDR: decodes `layer` to half-float RGBA (8 bytes / pixel) into shared memory,
+/// or into the stash for `take_buffer` when shared memory is not available.
+#[tauri::command]
+async fn load_hdr(webview: tauri::Webview, path: String, layer: usize, id: u32) -> Result<HdrLoad, String> {
+    let p = PathBuf::from(&path);
+    let p2 = p.clone();
+    let info = tauri::async_runtime::spawn_blocking(move || hdr::probe(&p2))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{path}: {e}"))?;
+    let layer = layer.min(info.layers.len() - 1);
+    let (w, h) = (info.layers[layer].width, info.layers[layer].height);
+    let len = w as u64 * h as u64 * 8;
+    let (p3, i3) = (p.clone(), info.clone());
+    let shared = shared::post_shared(&webview, len, id, move |dst| -> Result<f64, String> {
+        let t = std::time::Instant::now();
+        hdr::decode(&p3, &i3, layer, dst).map_err(|e| e.to_string())?;
+        Ok(t.elapsed().as_secs_f64() * 1000.0)
+    })
+    .await?;
+    let (posted, decode_ms) = match shared {
+        Some(ms) => (true, ms),
+        None => {
+            let (p4, i4) = (p.clone(), info.clone());
+            let (buf, ms) = tauri::async_runtime::spawn_blocking(move || -> Result<(Vec<u8>, f64), String> {
+                let t = std::time::Instant::now();
+                let mut v = vec![0u8; len as usize];
+                hdr::decode(&p4, &i4, layer, &mut v).map_err(|e| e.to_string())?;
+                Ok((v, t.elapsed().as_secs_f64() * 1000.0))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            stash().lock().map_err(|e| e.to_string())?.insert(id, buf);
+            (false, ms)
+        }
+    };
+    #[cfg(debug_assertions)]
+    eprintln!("[load_hdr] {w}x{h} layer {layer} ({})  decode {decode_ms:>6.1} ms  {}", info.layers[layer].name, if posted { "shared" } else { "ipc" });
+    Ok(HdrLoad { posted, info, layer, width: w, height: h, decode_ms })
+}
+
+/// Pixels left by `load_hdr` when they could not be posted as a shared buffer (raw bytes, no JSON).
+#[tauri::command]
+fn take_buffer(id: u32) -> Result<Response, String> {
+    stash().lock().map_err(|e| e.to_string())?.remove(&id).map(Response::new).ok_or_else(|| format!("buffer {id} not found"))
 }
 
 /// WebView2 SharedBuffer helper. `post_shared` returns Ok(None) when shared buffers are not available.
@@ -435,6 +501,8 @@ pub fn run() {
             read_range,
             read_range_shared,
             load_composite_shared,
+            load_hdr,
+            take_buffer,
             list_images,
             startup_paths,
             register_open_with,

@@ -2,10 +2,11 @@
 import type { DecodeRequest, DecodeResult } from "./decoder.worker";
 import type { ImageSource } from "./renderer";
 import { readPsdCompositeOnly } from "./psdSlice";
-import { loadCompositeShared, readTuning, type FileSource } from "./source";
+import { loadCompositeShared, loadHdr, readTuning, type FileSource, type HdrInfo } from "./source";
 
-export const SUPPORTED_EXT = ["psd", "psb", "png", "jpg", "jpeg", "webp"];
+export const SUPPORTED_EXT = ["psd", "psb", "png", "jpg", "jpeg", "webp", "exr", "hdr"];
 export const isPsd = (name: string) => /\.(psd|psb)$/i.test(name);
+export const isHdr = (name: string) => /\.(exr|hdr)$/i.test(name);
 
 export type LoadStats = {
   fileSize: number;
@@ -29,7 +30,11 @@ export type LoadedImage = {
   release?: () => void;
   /** how the bytes / pixels got here */
   via: string;
+  /** set for EXR / HDR images (float data, shown with exposure) */
+  hdr?: { info: HdrInfo; layer: number; float32: boolean };
 };
+
+export type LoadOptions = { /** EXR layer (channel group) index */ layer?: number };
 
 const worker = new Worker(new URL("./decoder.worker.ts", import.meta.url), { type: "module" });
 let requestId = 0;
@@ -48,9 +53,31 @@ function decode(name: string, buffer: ArrayBuffer): Promise<DecodeResult> {
   });
 }
 
-export async function loadImage(src: FileSource): Promise<LoadedImage> {
+export async function loadImage(src: FileSource, opts: LoadOptions = {}): Promise<LoadedImage> {
   const t0 = performance.now();
   let fallbackNote: string | undefined;
+
+  // EXR / Radiance HDR: decoded by Rust to half floats (desktop only)
+  if (isHdr(src.name)) {
+    if (!src.path) throw new Error("EXR / HDR はデスクトップ版でのみ表示できます");
+    const { load, buffer, release, via } = await loadHdr(src.path, opts.layer ?? 0);
+    const l = load.info.layers[load.layer];
+    const float32 = l.channels.some((c) => c.endsWith(":f32") || c.endsWith(":u32"));
+    return {
+      name: src.name,
+      path: src.path,
+      width: load.width,
+      height: load.height,
+      bitsPerChannel: float32 ? 32 : 16,
+      layerInfo: `${load.info.format} ${load.info.compression}${load.info.layers.length > 1 ? ` / ${l.name}（${load.layer + 1}/${load.info.layers.length}）` : ""}`,
+      note: float32 ? "表示用に 16bit float へ変換" : undefined,
+      image: { kind: "half", width: load.width, height: load.height, data: new Uint16Array(buffer) },
+      stats: { fileSize: src.size, bytesRead: src.size, readMs: 0, decodeMs: load.decodeMs, workerMs: performance.now() - t0 },
+      release,
+      via,
+      hdr: { info: load.info, layer: load.layer, float32 },
+    };
+  }
 
   // Fast path (desktop, Windows): Rust decodes the PSD composite in parallel into shared memory
   if (src.path && isPsd(src.name) && readTuning.mode === "shared") {

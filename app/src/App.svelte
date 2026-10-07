@@ -6,7 +6,7 @@
   import TabBar from "./lib/TabBar.svelte";
   import Navigator from "./lib/Navigator.svelte";
   import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
-  import type { CompareMode } from "./lib/renderer";
+  import type { ChannelView, CompareMode } from "./lib/renderer";
   import type { Renderer } from "./lib/renderer";
   import { SUPPORTED_EXT } from "./lib/loader";
   import { baseName, isTauri, readTuning, READ_MODES, READ_MODE_LABEL } from "./lib/source";
@@ -24,6 +24,26 @@
   let rotation = $state(0);
   let flipX = $state(false);
   let cursor = $state<[number, number] | null>(null);
+  // display: exposure (EV) for EXR / HDR, channel view (Ctrl+2 = RGB, Ctrl+3..5 = R/G/B, Ctrl+6 = alpha)
+  let exposure = $state(0);
+  let channel = $state<ChannelView>(0);
+  $effect(() => { renderer?.setDisplay({ exposure, channel }); });
+  const CHANNEL_LABEL = ["RGB", "R", "G", "B", "A"] as const;
+  // stored value of the pixel under the mouse (read back from the GPU, at most once per frame)
+  let pixel = $state<{ values: number[]; float: boolean } | null>(null);
+  let pixelPending = false;
+  function onCursor(p: [number, number] | null) {
+    cursor = p;
+    if (pixelPending) return;
+    pixelPending = true;
+    requestAnimationFrame(() => {
+      pixelPending = false;
+      const set = renderer?.activeSet;
+      pixel = cursor && set ? renderer!.readPixel(set, cursor[0], cursor[1]) : null;
+    });
+  }
+  const fmtPixel = (p: { values: number[]; float: boolean }) =>
+    p.values.map((v, i) => `${"RGBA"[i]} ${p.float ? (Math.abs(v) >= 1000 ? v.toExponential(2) : v.toFixed(3)) : v}`).join("  ");
   $effect(() => {
     const r = renderer;
     if (!r) return;
@@ -40,6 +60,7 @@
 
   const active = $derived(vs.active);
   const meta = $derived(active?.meta ?? null);
+  const showExposure = $derived(!!(meta?.hdr || (vs.compare && vs.compareTab?.meta?.hdr)));
   const mb = (n: number) => (n / 2 ** 20).toFixed(1) + " MB";
   const ms = (n: number) => n.toFixed(0) + " ms";
   const shortPath = (p: string) => (p.length > 70 ? "…" + p.slice(-69) : p);
@@ -120,6 +141,7 @@
     else if (ctrl && e.shiftKey && kk === "t") vs.reopenClosed();
     else if (ctrl && kk === "o") openDialog();
     else if (ctrl && kk === "w") vs.closeActive();
+    else if (ctrl && !e.shiftKey && ["2", "3", "4", "5", "6"].includes(kk)) channel = (Number(kk) - 2) as ChannelView;
     else if (ctrl && kk === "0") fit();
     else if (ctrl && kk === "1") zoomTo(1);
     else if (ctrl && (k === "+" || k === "=" || k === ";")) zoomTo((renderer?.scale ?? 1) * 1.25);
@@ -250,6 +272,15 @@
           onclick={() => { if (active) { active.guides.v = []; active.guides.h = []; } }}>このタブのガイドをすべて消去</button>
         <div class="menu-sep"></div>
         <div class="row">
+          <span class="lbl">チャンネル<kbd>Ctrl+2〜6</kbd></span>
+          <div class="seg">
+            {#each CHANNEL_LABEL as c, i (c)}
+              <button class:on={channel === i} onclick={() => (channel = i as ChannelView)}>{c}</button>
+            {/each}
+          </div>
+        </div>
+        <div class="menu-sep"></div>
+        <div class="row">
           <span class="lbl">回転 {rotation.toFixed(1).replace(/\.0$/, "")}°</span>
           <button class="mini" disabled={!active?.meta} onclick={() => renderer?.rotateTo(rotation - 90)}>⟲ 90°</button>
           <button class="mini" disabled={!active?.meta} onclick={() => renderer?.rotateTo(rotation + 90)}>⟳ 90°</button>
@@ -313,7 +344,7 @@
   ondragleave={() => { if (!isTauri()) dragOver = false; }}
   ondrop={onHtmlDrop}
 >
-  <Viewer bind:renderer guides={active?.guides ?? null} oncursor={(p) => (cursor = p)}
+  <Viewer bind:renderer guides={active?.guides ?? null} oncursor={onCursor}
     labels={vs.compare && active ? { a: active.name, b: vs.compareTab?.name ?? "" } : null}
     onsplit={(v) => vs.updateCompare({ split: v })} />
   {#if vs.compare && vs.compareTab?.loading}<div class="busy">B を読み込み中…</div>{/if}
@@ -350,12 +381,26 @@
   {#if active && meta}
     <span class="name" title={meta.path ?? meta.name}>{meta.name}</span>
     <span>{meta.width} × {meta.height}</span>
-    <span>{meta.bitsPerChannel}bit</span>
-    {#if meta.layerInfo}<span>{meta.layerInfo}</span>{/if}
+    <span>{meta.bitsPerChannel}bit{meta.hdr ? " float" : ""}</span>
+    {#if meta.hdr && meta.hdr.info.layers.length > 1}
+      <select class="layer-sel" value={meta.hdr.layer} title="EXR のレイヤー（チャンネルのまとまり）"
+        onchange={(e) => { vs.setLayer(Number((e.currentTarget as HTMLSelectElement).value)); (e.currentTarget as HTMLSelectElement).blur(); }}>
+        {#each meta.hdr.info.layers as l, i (i)}<option value={i}>{l.name}</option>{/each}
+      </select>
+      <span>{meta.hdr.info.format} {meta.hdr.info.compression}</span>
+    {:else if meta.layerInfo}<span>{meta.layerInfo}</span>{/if}
     {#if active.folder.length && active.folderIndex >= 0}<span>{active.folderIndex + 1} / {active.folder.length}</span>{/if}
     <span class="spacer"></span>
+    {#if showExposure}
+      <span class="ev" title="露出（EXR / HDR の表示のみ。ダブルクリックで 0 に戻す）">
+        露出 <input type="range" min="-10" max="10" step="0.1" bind:value={exposure} ondblclick={() => (exposure = 0)} />
+        <span class="evv">{exposure > 0 ? "+" : ""}{Number(exposure).toFixed(1)} EV</span>
+      </span>
+    {/if}
+    {#if channel !== 0}<button class="chip" title="クリックで RGB 表示に戻す (Ctrl+2)" onclick={() => (channel = 0)}>{CHANNEL_LABEL[channel]} チャンネル</button>{/if}
     {#if cursor && cursor[0] >= 0 && cursor[1] >= 0 && cursor[0] < meta.width && cursor[1] < meta.height}
       <span class="coord">x {Math.floor(cursor[0])}  y {Math.floor(cursor[1])}</span>
+      {#if pixel}<span class="coord px">{fmtPixel(pixel)}</span>{/if}
     {/if}
     {#if rotation !== 0}<button class="chip" title="クリックで 0° に戻す (Esc)" onclick={() => renderer?.rotateTo(0)}>回転 {rotation.toFixed(1).replace(/\.0$/, "")}°</button>{/if}
     {#if flipX}<button class="chip" title="クリックで反転を解除 (Shift+H)" onclick={toggleFlip}>左右反転</button>{/if}
@@ -448,6 +493,11 @@
   .mini { padding: 2px 8px; display: flex; gap: 6px; align-items: center; white-space: nowrap; }
   .mini kbd { margin-left: 0; }
   .statusbar .coord { color: var(--text); white-space: pre; }
+  .statusbar .coord.px { font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px; color: #cfe3ff; }
+  .ev { display: flex; align-items: center; gap: 6px; }
+  .ev input { width: 120px; accent-color: var(--accent); }
+  .evv { width: 56px; font-variant-numeric: tabular-nums; color: var(--text); }
+  .layer-sel { background: #1e1e1e; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; font: inherit; font-size: 12px; padding: 0 4px; max-width: 220px; }
   .chip { background: #2f4f73; border: 1px solid var(--accent); color: #fff; border-radius: 9px; padding: 0 8px; font-size: 11px; line-height: 16px; }
   .stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
   .stage.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }

@@ -1,6 +1,6 @@
 # OptImageEditor app
 
-Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1-d（比較表示）まで実装済み。1-c でナビゲーター、表示の回転・左右反転、定規、ガイド、グリッド、ピクセルグリッドを追加。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
+Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1 を実装済み（1-e で EXR / HDR 表示、1-d で比較表示）。1-c でナビゲーター、表示の回転・左右反転、定規、ガイド、グリッド、ピクセルグリッドを追加。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
 
 ## 前提（Windows）
 
@@ -51,6 +51,9 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | C / ツールバーの「比較」 | 比較表示の開始 / 終了（Esc でも終了）。A = 表示中のタブ、B = 直前に見ていたタブ（比較バーのドロップダウンで変更。「同じ画像」も選べる）。B のタブをクリックすると A と B が入れ替わる |
 | 比較中の 1 / 2 / 3 | 並べる（左右）/ スワイプ（境界線をドラッグ）/ A/B 切替（X で切り替え） |
 | 比較バー | 「連動」（並べる時。オフで左右を別々にズーム・移動・回転）、B の大きさ「A に合わせる」（縦横比を保って拡大縮小し中央揃え）/「実ピクセル」（左上揃え）。比較中の ← → は A だけを送る（B は固定） |
+| EXR / HDR を開く | ステータスバーの「露出」スライダー（−10〜+10 EV、ダブルクリックで 0）。複数のレイヤー（AOV）がある EXR はステータスバーのドロップダウンで切り替え |
+| Ctrl+2 / Ctrl+3〜5 / Ctrl+6 | チャンネル表示: RGB / R・G・B / アルファ（PS と同じ割り当て。ステータスバーのチップをクリックで RGB に戻る） |
+| マウスを画像の上に置く | ステータスバーに座標と画素値（8bit は 0〜255、EXR / HDR は保存されている浮動小数点の値） |
 | 「表示」メニュー | 上記の表示設定（設定は localStorage の `oie.view` に保存）、ピクセルグリッド（800% 以上で表示）、ガイドの一括消去 |
 | ≡ メニュー | 最近使ったファイル（20 件、起動画面にも 10 件表示）/ 履歴を消去 /「プログラムから開く」に登録・登録を解除 |
 | 起動時の引数 | `optimageeditor.exe <画像のパス>...` で、その画像を開いて起動する。既に起動している場合は、そのウィンドウに新しいタブで開く（二重起動の防止） |
@@ -74,6 +77,7 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | `src/lib/source.ts` | ファイルの範囲読み込みの共通部分（Tauri: Rust の `read_range` / ブラウザ: `File.slice`） |
 | `src/lib/desktop.ts` | Tauri 連携（ネイティブのドラッグ＆ドロップ、ファイルダイアログ、フォルダ一覧、起動時の引数、ウィンドウタイトル、全画面、二重起動時のファイル受け取り、「プログラムから開く」の登録、確認ダイアログ） |
 | `src-tauri/src/lib.rs` | Rust コマンド: `load_composite_shared`（統合画像を Rust でデコードし、WebView2 の共有メモリで渡す）/ `read_range_shared`（共有メモリでの範囲読み込み）/ `read_range`（IPC、フォールバック用）/ `file_info` / `list_images`（自然順ソート）/ `startup_paths` / `register_open_with`（HKCU に ProgID `OptImageEditor.Image` と各拡張子の `OpenWithProgids` を登録・解除。管理者権限は不要）/ `open_default_apps_settings`。二重起動の防止は `tauri-plugin-single-instance`（2 回目の起動の引数を `oie://open-paths` イベントで送る） |
+| `src-tauri/src/hdr.rs` | EXR（`exr` クレート。読み込みは DWAA / DWAB を含む全圧縮方式、スキャンライン / タイル、マルチパート、f16 / f32 / u32）と Radiance .hdr のデコーダ。半精度浮動小数点の RGBA（リニア、乗算済み）で共有メモリへ渡す（使えない時は IPC で 1 回転送）。EXR のチャンネルは「.」の前の接頭辞でレイヤーにまとめる。テスト: `cargo test --lib hdr` |
 | `patches/ag-psd+31.0.2.patch` | 未知ブロックを保持する改修（`spike/ag-psd-roundtrip` を参照）。patch-package で自動適用 |
 
 ## 制約（現時点）
@@ -83,4 +87,6 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 - `.svelte.ts` のモジュール名は、同じフォルダの `.svelte` コンポーネントと大文字小文字違いで重ねない（Windows ではファイル名の大文字小文字を区別しないため、`./lib/viewer.svelte` が `Viewer.svelte` に解決されてしまう）。
 - 「プログラムから開く」の登録は exe の場所を書き込むので、dev ビルドで登録すると `D:\build-cache\OptImageEditor\debug\optimageeditor.exe` が登録される。配布用ビルドに切り替えたら登録し直す。
 - 比較の「並べる」表示中は定規を隠す。差分表示（|A−B|）は未実装
-- 未実装: EXR
+- EXR / HDR は GPU 上で RGBA16F（1 画素 8 バイト）として持つ。32bit float は表示用に 16bit float へ変換する（約 65504 を超える値は無限大になる）。表示はリニア → 露出 → sRGB（トーンマップなし）。deep データの EXR は非対応
+- EXR / HDR はデスクトップ版のみ（ブラウザ版はデコーダが無い）
+- `[profile.dev.package.exr]` などで EXR の依存クレートも dev ビルドで最適化している（初回の `tauri dev` はビルドが少し長い）

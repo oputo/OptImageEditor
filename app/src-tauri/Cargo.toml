@@ -23,6 +23,9 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1"
+# OpenEXR (all compressions incl. DWAA/DWAB for reading) and half floats for the GPU upload
+exr = "1.74"
+half = "2"
 
 
 # Windows only: WebView2 SharedBuffer (zero-copy file reads). Versions must match the ones used by tauri/wry.
@@ -37,6 +40,18 @@ tauri-plugin-single-instance = "2"
 
 # Keep `tauri dev` representative for performance: optimize our own crate (image decoding hot loops) in dev builds too
 [profile.dev.package.optimageeditor]
+opt-level = 3
+
+# ...and the EXR decoder with its decompressors (unoptimized they are ~10x slower)
+[profile.dev.package.exr]
+opt-level = 3
+[profile.dev.package.zune-inflate]
+opt-level = 3
+[profile.dev.package.half]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.lebe]
 opt-level = 3
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

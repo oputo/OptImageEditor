@@ -66,7 +66,7 @@ function listenShared(wv: ChromeWebview) {
 
 /** Registers a waiter for shared buffer `id`, runs `post` (which asks Rust to post it) and waits for the buffer.
  *  `pixels` is null when `post` reports that nothing was posted. */
-async function receiveShared<T>(post: (id: number) => Promise<T>, posted: (r: T) => boolean): Promise<{ result: T; pixels: SharedPixels | null }> {
+async function receiveShared<T>(post: (id: number) => Promise<T>, posted: (r: T) => boolean): Promise<{ result: T; pixels: SharedPixels | null; id: number }> {
   const wv = chromeWebview()!;
   listenShared(wv);
   const id = ++sharedSeq;
@@ -81,8 +81,8 @@ async function receiveShared<T>(post: (id: number) => Promise<T>, posted: (r: T)
     sharedWaiters.delete(id);
     throw e;
   }
-  if (!posted(result)) { sharedWaiters.delete(id); return { result, pixels: null }; }
-  return { result, pixels: await arrived };
+  if (!posted(result)) { sharedWaiters.delete(id); arrived.catch(() => {}); return { result, pixels: null, id }; }
+  return { result, pixels: await arrived, id };
 }
 
 /** Returns null when shared buffers are not available (not Windows / old WebView2), so the caller can fall back. */
@@ -154,4 +154,22 @@ export class TauriFileSource implements FileSource {
   }
 
   readAll() { return this.read(0, this.size); }
+}
+
+// ---- HDR images (OpenEXR / Radiance): Rust decodes to half-float RGBA (premultiplied, linear)
+
+export type HdrLayer = { name: string; width: number; height: number; mapping: (string | null)[]; channels: string[] };
+export type HdrInfo = { format: "EXR" | "HDR"; compression: string; layers: HdrLayer[] };
+export type HdrLoad = { posted: boolean; info: HdrInfo; layer: number; width: number; height: number; decodeMs: number };
+
+/** Decodes `layer` of an EXR / HDR file. Uses shared memory when available, otherwise one raw IPC transfer. */
+export async function loadHdr(path: string, layer: number): Promise<{ load: HdrLoad; buffer: ArrayBuffer; release?: () => void; via: string }> {
+  if (chromeWebview()) {
+    const { result, pixels, id } = await receiveShared((id) => invoke<HdrLoad>("load_hdr", { path, layer, id }), (r) => r.posted);
+    if (pixels) return { load: result, buffer: pixels.buffer, release: pixels.release, via: "shared + Rust decode" };
+    return { load: result, buffer: await invoke<ArrayBuffer>("take_buffer", { id }), via: "IPC + Rust decode" };
+  }
+  const id = ++sharedSeq;
+  const load = await invoke<HdrLoad>("load_hdr", { path, layer, id });
+  return { load, buffer: await invoke<ArrayBuffer>("take_buffer", { id }), via: "IPC + Rust decode" };
 }

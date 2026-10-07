@@ -25,23 +25,49 @@ void main() {
   v_uv = a_unit;
 }`;
 
+// Pixels are premultiplied. 8-bit textures hold display-ready (sRGB) values; half-float (HDR) textures hold
+// linear light: they are scaled by the exposure, composited in linear and then encoded to sRGB.
 const FS = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_tex;
 uniform float u_dpr;
+uniform bool u_hdr;
+uniform float u_exposure;   // linear multiplier (2^EV), HDR only
+uniform int u_channel;      // 0 = RGB, 1..3 = R/G/B, 4 = alpha (shown as grey, unpremultiplied)
 out vec4 o;
+vec3 toSrgb(vec3 x) {
+  x = max(x, 0.0);
+  return mix(x * 12.92, 1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, x));
+}
 void main() {
-  vec4 c = texture(u_tex, v_uv);                       // premultiplied alpha
+  vec4 c = texture(u_tex, v_uv);
+  if (u_channel > 0) {
+    float v = u_channel == 4 ? c.a : (c.a > 0.0 ? c[u_channel - 1] / c.a : 0.0);
+    vec3 g = vec3(v);
+    o = vec4(u_hdr && u_channel != 4 ? toSrgb(g * u_exposure) : clamp(g, 0.0, 1.0), 1.0);
+    return;
+  }
   vec2 cell = floor(gl_FragCoord.xy / (8.0 * u_dpr));
   float k = mod(cell.x + cell.y, 2.0) < 1.0 ? 0.42 : 0.32;
-  o = vec4(c.rgb + vec3(k) * (1.0 - c.a), 1.0);
+  if (u_hdr) o = vec4(toSrgb(c.rgb * u_exposure + vec3(pow(k, 2.2)) * (1.0 - c.a)), 1.0);
+  else o = vec4(c.rgb + vec3(k) * (1.0 - c.a), 1.0);
 }`;
 
 type Tile = { tex: WebGLTexture; x: number; y: number; w: number; h: number };
 
 /** One image uploaded to the GPU (one or more tiles). `thumb` is made on demand for the navigator. */
-export type TextureSet = { readonly id: number; tiles: Tile[]; width: number; height: number; bytes: number; thumb?: HTMLCanvasElement };
+export type TextureSet = {
+  readonly id: number; tiles: Tile[]; width: number; height: number; bytes: number; thumb?: HTMLCanvasElement;
+  /** half-float linear data (EXR / HDR) */
+  hdr: boolean;
+  /** has a mipmap chain (half-float textures need EXT_color_buffer_float for it) */
+  mips: boolean;
+};
+
+/** How pixels are shown: exposure in EV (HDR images only) and the channel view. */
+export type ChannelView = 0 | 1 | 2 | 3 | 4;
+export type DisplayState = { exposure: number; channel: ChannelView };
 
 /** rotation in degrees (clockwise on screen), flipX = mirrored left-right (view only, the image is not changed) */
 export type ViewState = { scale: number; offsetX: number; offsetY: number; rotation: number; flipX: boolean };
@@ -54,7 +80,9 @@ let setSeq = 0;
 
 export type ImageSource =
   | { kind: "rgba"; width: number; height: number; data: Uint8ClampedArray; premultiplied?: boolean }
-  | { kind: "bitmap"; width: number; height: number; bitmap: ImageBitmap };
+  | { kind: "bitmap"; width: number; height: number; bitmap: ImageBitmap }
+  /** RGBA half floats (raw u16 bits), premultiplied, linear */
+  | { kind: "half"; width: number; height: number; data: Uint16Array };
 
 /** One view transform (zoom / pan / rotation / flip) for a viewport of vw x vh css px. */
 export class View {
@@ -202,6 +230,12 @@ export class Renderer {
   private loc: Record<string, WebGLUniformLocation | null> = {};
   private smoothSampler: WebGLSampler;
   private nearestSampler: WebGLSampler;
+  private smoothNoMip: WebGLSampler;
+  private nearestNoMip: WebGLSampler;
+  /** half-float textures can be rendered to (mipmaps, pixel read-back) */
+  readonly floatRenderable: boolean;
+  /** exposure (EV) for HDR images and the channel view; shared by all panes */
+  readonly display: DisplayState = { exposure: 0, channel: 0 };
   private active: TextureSet | null = null;
   private live = new Set<TextureSet>();
   /** view of image A (the active tab) */
@@ -231,7 +265,7 @@ export class Renderer {
     gl.linkProgram(p);
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) ?? "link error");
     this.prog = p;
-    for (const n of ["u_rect", "u_mx", "u_my", "u_canvas", "u_tex", "u_dpr"]) this.loc[n] = gl.getUniformLocation(p, n);
+    for (const n of ["u_rect", "u_mx", "u_my", "u_canvas", "u_tex", "u_dpr", "u_hdr", "u_exposure", "u_channel"]) this.loc[n] = gl.getUniformLocation(p, n);
 
     this.vao = gl.createVertexArray()!;
     gl.bindVertexArray(this.vao);
@@ -252,6 +286,9 @@ export class Renderer {
     };
     this.smoothSampler = mkSampler(gl.LINEAR_MIPMAP_LINEAR, gl.LINEAR);
     this.nearestSampler = mkSampler(gl.LINEAR_MIPMAP_LINEAR, gl.NEAREST);
+    this.smoothNoMip = mkSampler(gl.LINEAR, gl.LINEAR);
+    this.nearestNoMip = mkSampler(gl.LINEAR, gl.NEAREST);
+    this.floatRenderable = !!gl.getExtension("EXT_color_buffer_float");
   }
 
   get hasImage() { return this.active !== null; }
@@ -396,7 +433,9 @@ export class Renderer {
     const gl = this.gl;
     const t0 = performance.now();
     const T = Math.min(this.maxTextureSize, 8192);
-    const set: TextureSet = { id: ++setSeq, tiles: [], width: src.width, height: src.height, bytes: 0 };
+    const hdr = src.kind === "half";
+    const mips = !hdr || this.floatRenderable;
+    const set: TextureSet = { id: ++setSeq, tiles: [], width: src.width, height: src.height, bytes: 0, hdr, mips };
     this.live.add(set);
 
     for (let y = 0; y < src.height; y += T) {
@@ -405,9 +444,18 @@ export class Renderer {
         const h = Math.min(T, src.height - y);
         const tex = gl.createTexture()!;
         gl.bindTexture(gl.TEXTURE_2D, tex);
-        const levels = Math.floor(Math.log2(Math.max(w, h))) + 1;
-        gl.texStorage2D(gl.TEXTURE_2D, levels, gl.RGBA8, w, h);
-        if (src.kind === "rgba") {
+        const levels = mips ? Math.floor(Math.log2(Math.max(w, h))) + 1 : 1;
+        gl.texStorage2D(gl.TEXTURE_2D, levels, hdr ? gl.RGBA16F : gl.RGBA8, w, h);
+        if (src.kind === "half") {
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+          gl.pixelStorei(gl.UNPACK_ROW_LENGTH, src.width);
+          gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, x);
+          gl.pixelStorei(gl.UNPACK_SKIP_ROWS, y);
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.HALF_FLOAT, src.data);
+          gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
+          gl.pixelStorei(gl.UNPACK_SKIP_PIXELS, 0);
+          gl.pixelStorei(gl.UNPACK_SKIP_ROWS, 0);
+        } else if (src.kind === "rgba") {
           // already-premultiplied data takes the fast upload path (no per-pixel conversion in the browser)
           gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !src.premultiplied);
           gl.pixelStorei(gl.UNPACK_ROW_LENGTH, src.width);
@@ -426,9 +474,9 @@ export class Renderer {
           gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, part);
           if (part !== src.bitmap) part.close();
         }
-        gl.generateMipmap(gl.TEXTURE_2D);
+        if (mips) gl.generateMipmap(gl.TEXTURE_2D);
         set.tiles.push({ tex, x, y, w, h });
-        set.bytes += Math.round(w * h * 4 * 4 / 3);
+        set.bytes += Math.round(w * h * (hdr ? 8 : 4) * (mips ? 4 / 3 : 1));
       }
     }
     if (src.kind === "bitmap") src.bitmap.close();
@@ -483,7 +531,7 @@ export class Renderer {
     for (const fn of this.frameListeners) fn();
   }
 
-  private drawSet(set: TextureSet, m: Affine, cssW: number, cssH: number, dpr: number, nearest: boolean) {
+  private drawSet(set: TextureSet, m: Affine, cssW: number, cssH: number, dpr: number, nearest: boolean, display: DisplayState = this.display) {
     const gl = this.gl;
     gl.useProgram(this.prog);
     gl.bindVertexArray(this.vao);
@@ -493,12 +541,51 @@ export class Renderer {
     gl.uniform1f(this.loc.u_dpr, dpr);
     gl.uniform1i(this.loc.u_tex, 0);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindSampler(0, nearest ? this.nearestSampler : this.smoothSampler);
+    gl.bindSampler(0, set.mips ? (nearest ? this.nearestSampler : this.smoothSampler) : (nearest ? this.nearestNoMip : this.smoothNoMip));
+    gl.uniform1i(this.loc.u_hdr, set.hdr ? 1 : 0);
+    gl.uniform1f(this.loc.u_exposure, 2 ** display.exposure);
+    gl.uniform1i(this.loc.u_channel, display.channel);
     for (const t of set.tiles) {
       gl.bindTexture(gl.TEXTURE_2D, t.tex);
       gl.uniform4f(this.loc.u_rect, t.x, t.y, t.w, t.h);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
+  }
+
+  /** Exposure (EV, HDR images) and channel view. */
+  setDisplay(d: Partial<DisplayState>) {
+    Object.assign(this.display, d);
+    this.requestDraw();
+  }
+
+  /** Stored value of pixel (x, y) of `set`: 0..255 (unpremultiplied) for 8-bit images, raw floats for HDR.
+   *  Null outside the image, or when the GPU cannot read half floats back. */
+  readPixel(set: TextureSet, x: number, y: number): { values: [number, number, number, number]; float: boolean } | null {
+    x = Math.floor(x); y = Math.floor(y);
+    if (x < 0 || y < 0 || x >= set.width || y >= set.height) return null;
+    const t = set.tiles.find((t) => x >= t.x && x < t.x + t.w && y >= t.y && y < t.y + t.h);
+    if (!t || (set.hdr && !this.floatRenderable)) return null;
+    const gl = this.gl;
+    const fb = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t.tex, 0);
+    let values: [number, number, number, number] | null = null;
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) {
+      if (set.hdr) {
+        const px = new Float32Array(4);
+        gl.readPixels(x - t.x, y - t.y, 1, 1, gl.RGBA, gl.FLOAT, px);
+        values = [px[0], px[1], px[2], px[3]];
+      } else {
+        const px = new Uint8Array(4);
+        gl.readPixels(x - t.x, y - t.y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        const a = px[3];
+        const un = (v: number) => (a > 0 ? Math.min(255, Math.round((v * 255) / a)) : 0);
+        values = [un(px[0]), un(px[1]), un(px[2]), a];
+      }
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb);
+    return values ? { values, float: set.hdr } : null;
   }
 
   /** Small image of `set` (longest side `size` px, transparency on a checkerboard) for the navigator. Cached on the set. */
@@ -517,7 +604,7 @@ export class Renderer {
     gl.viewport(0, 0, w, h);
     gl.clearColor(0.118, 0.118, 0.118, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    this.drawSet(set, [w / set.width, 0, 0, 0, h / set.height, 0], w, h, 0.5, false);
+    this.drawSet(set, [w / set.width, 0, 0, 0, h / set.height, 0], w, h, 0.5, false, { exposure: 0, channel: 0 });
     const px = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
