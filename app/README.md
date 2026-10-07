@@ -49,7 +49,7 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | ファイル | 役割 |
 |---|---|
 | `src/App.svelte` | 画面全体（ツールバー / タブバー / ビュー / ステータスバー / ≡ メニュー / 起動画面）、キー操作 |
-| `src/lib/viewer.svelte.ts` | タブの状態管理（`ViewerState`）。タブごとの表示位置、フォルダ内の移動、GPU キャッシュ（表示中 > 次 > 前 > 直近 2 タブ、上限 2GB）、前後の先読み、閉じたタブの履歴 |
+| `src/lib/viewerState.svelte.ts` | タブの状態管理（`ViewerState`）。タブごとの表示位置、フォルダ内の移動、GPU キャッシュ（表示中 > 次 > 前 > 直近 2 タブ、上限 2GB）、前後の先読み、閉じたタブの履歴 |
 | `src/lib/TabBar.svelte` | タブバー |
 | `src/lib/recent.svelte.ts` | 最近使ったファイル（localStorage の `oie.recent`、最大 20 件） |
 | `src/lib/Viewer.svelte` | キャンバスと、ズーム・パンの操作 |
@@ -67,5 +67,6 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 
 - PSD は統合画像だけを表示する。統合画像が無い PSD（PS の「互換性を優先」がオフで保存されたもの）はエラーになる。
 - 16 / 32bit の PSD は、表示用に 8bit へ変換する。
+- `.svelte.ts` のモジュール名は、同じフォルダの `.svelte` コンポーネントと大文字小文字違いで重ねない（Windows ではファイル名の大文字小文字を区別しないため、`./lib/viewer.svelte` が `Viewer.svelte` に解決されてしまう）。
 - 「プログラムから開く」の登録は exe の場所を書き込むので、dev ビルドで登録すると `D:\build-cache\OptImageEditor\debug\optimageeditor.exe` が登録される。配布用ビルドに切り替えたら登録し直す。
 - 未実装: EXR、比較表示、ナビゲーター、ガイド / グリッド

@@ -10,7 +10,7 @@
     confirmDialog, infoDialog, onNativeDrop, onOpenPaths, openDefaultAppsSettings, pickFile,
     setOpenWithRegistration, startupPaths, toggleFullscreen,
   } from "./lib/desktop";
-  import { ViewerState } from "./lib/viewer.svelte";
+  import { ViewerState } from "./lib/viewerState.svelte";
   import { recent } from "./lib/recent.svelte";
 
   const vs = new ViewerState();

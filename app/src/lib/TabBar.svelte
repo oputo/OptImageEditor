@@ -1,6 +1,6 @@
 <script lang="ts">
   // Tab strip: click = activate, × / middle click = close, double click on empty space = open.
-  import type { Tab } from "./viewer.svelte";
+  import type { Tab } from "./viewerState.svelte";
 
   let { tabs, activeId, onactivate, onclose, onopen }: {
     tabs: Tab[];
