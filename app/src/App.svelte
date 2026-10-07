@@ -1,8 +1,11 @@
 <script lang="ts">
-  // OptImageEditor — phase 1-b: viewer with tabs, prefetch, recent files, single instance, "Open with" registration.
+  // OptImageEditor — phase 1-c: viewer with tabs, prefetch, recent files, single instance, "Open with" registration,
+  // navigator, view rotation / flip, rulers, guides, grid, pixel grid.
   import { onMount } from "svelte";
   import Viewer from "./lib/Viewer.svelte";
   import TabBar from "./lib/TabBar.svelte";
+  import Navigator from "./lib/Navigator.svelte";
+  import { viewOptions as opt, GRID_LABEL, type GridMode } from "./lib/viewOptions.svelte";
   import type { Renderer } from "./lib/renderer";
   import { SUPPORTED_EXT } from "./lib/loader";
   import { baseName, isTauri, readTuning, READ_MODES, READ_MODE_LABEL } from "./lib/source";
@@ -16,11 +19,20 @@
   const vs = new ViewerState();
   let renderer = $state<Renderer | undefined>();
   $effect(() => { vs.renderer = renderer; });
+  // mirror the view state for the UI (zoom %, rotation, flip)
+  let rotation = $state(0);
+  let flipX = $state(false);
+  let cursor = $state<[number, number] | null>(null);
+  $effect(() => {
+    const r = renderer;
+    if (!r) return;
+    return r.onFrame(() => { vs.zoom = r.scale; rotation = r.rotation; flipX = r.flipX; });
+  });
 
   let dragOver = $state(false);
   let showStats = $state(false);
   let readMode = $state(readTuning.mode);
-  let menuOpen = $state(false);
+  let openMenu = $state<"main" | "view" | null>(null);
   let toast = $state<string | null>(null);
   let fileInput: HTMLInputElement;
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -52,6 +64,8 @@
     }
   }
 
+  function toggleFlip() { if (renderer?.hasImage) renderer.setFlip(!renderer.flipX); }
+
   function fit() { renderer?.fit(); vs.zoom = renderer?.scale ?? 0; }
   function zoomTo(scale: number) {
     if (!renderer?.hasImage) return;
@@ -60,7 +74,7 @@
   }
 
   async function registerOpenWith(register: boolean) {
-    menuOpen = false;
+    openMenu = null;
     try {
       const exe = await setOpenWithRegistration(register);
       if (register) {
@@ -82,8 +96,18 @@
   function onKey(e: KeyboardEvent) {
     const ctrl = e.ctrlKey || e.metaKey;
     const k = e.key;
+    // typing in a text / number field: only Ctrl shortcuts and function keys
+    const t = e.target as HTMLElement;
+    if (t.tagName === "INPUT" && (t as HTMLInputElement).type !== "checkbox" && !ctrl && !/^F\d+$/.test(k)) return;
     let handled = true;
-    if (k === "Escape" && menuOpen) menuOpen = false;
+    if (k === "Escape" && openMenu) openMenu = null;
+    else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
+    else if (ctrl && k.toLowerCase() === "r") opt.rulers = !opt.rulers;
+    else if (ctrl && k.toLowerCase() === "h") opt.extras = !opt.extras;
+    else if (!ctrl && !e.altKey && k.toLowerCase() === "n") opt.navigator = !opt.navigator;
+    else if (!ctrl && !e.altKey && !e.shiftKey && k.toLowerCase() === "g") opt.toggleGrid();
+    else if (!ctrl && e.shiftKey && k.toLowerCase() === "h") toggleFlip();
+    else if (!ctrl && (k === "r" || k === "R")) handled = false; // R + drag rotates (handled by the viewer)
     else if (ctrl && k === "Tab") vs.cycle(e.shiftKey ? -1 : 1);
     else if (ctrl && e.shiftKey && k.toLowerCase() === "t") vs.reopenClosed();
     else if (ctrl && k.toLowerCase() === "o") openDialog();
@@ -139,7 +163,7 @@
     onNativeDrop({ over: (on) => (dragOver = on), drop: (paths) => openPaths(paths) }).then((u) => unlisten.push(u));
     onOpenPaths((paths) => openPaths(paths)).then((u) => unlisten.push(u));
     startupPaths().then((paths) => openPaths(paths));
-    const closeMenu = (e: MouseEvent) => { if (!(e.target as HTMLElement).closest(".menu-wrap")) menuOpen = false; };
+    const closeMenu = (e: MouseEvent) => { if (!(e.target as HTMLElement).closest(".menu-wrap")) openMenu = null; };
     window.addEventListener("mousedown", closeMenu);
     // test hook for automated checks (browser build)
     (window as unknown as { __oie: unknown }).__oie = {
@@ -159,12 +183,12 @@
 
 <header class="toolbar">
   <div class="menu-wrap">
-    <button class="menu-btn" class:active={menuOpen} onclick={() => (menuOpen = !menuOpen)} title="メニュー">≡</button>
-    {#if menuOpen}
+    <button class="menu-btn" class:active={openMenu === "main"} onclick={() => (openMenu = openMenu === "main" ? null : "main")} title="メニュー">≡</button>
+    {#if openMenu === "main"}
       <div class="menu" role="menu">
         <div class="menu-head">最近使ったファイル</div>
         {#each recent.list as p (p)}
-          <button class="item" role="menuitem" title={p} onclick={() => { menuOpen = false; openPaths([p]); }}>
+          <button class="item" role="menuitem" title={p} onclick={() => { openMenu = null; openPaths([p]); }}>
             <span class="fname">{baseName(p)}</span><span class="fdir">{shortPath(p)}</span>
           </button>
         {:else}
@@ -190,6 +214,43 @@
   <span class="sep"></span>
   <button onclick={fit} title="全体表示 (Ctrl+0)">全体</button>
   <button onclick={() => zoomTo(1)} title="100% (Ctrl+1)">100%</button>
+  <span class="sep"></span>
+  <div class="menu-wrap">
+    <button class:active={openMenu === "view"} onclick={() => (openMenu = openMenu === "view" ? null : "view")} title="表示（ナビゲーター / 定規 / ガイド / グリッド / 回転）">表示 ▾</button>
+    {#if openMenu === "view"}
+      <div class="menu view-menu" role="menu">
+        <label class="check"><input type="checkbox" bind:checked={opt.navigator} />ナビゲーター<kbd>N</kbd></label>
+        <label class="check"><input type="checkbox" bind:checked={opt.rulers} />定規<kbd>Ctrl+R</kbd></label>
+        <div class="menu-sep"></div>
+        <label class="check"><input type="checkbox" bind:checked={opt.extras} />ガイド・グリッドを表示<kbd>Ctrl+H</kbd></label>
+        <label class="check sub"><input type="checkbox" bind:checked={opt.guides} disabled={!opt.extras} />ガイド<span class="note">定規からドラッグで作成、定規へ戻すと削除</span></label>
+        <div class="row sub">
+          <span class="lbl">グリッド<kbd>G</kbd></span>
+          <div class="seg">
+            {#each Object.keys(GRID_LABEL) as g (g)}
+              <button class:on={opt.grid === g} disabled={!opt.extras} onclick={() => (opt.grid = g as GridMode)}>{GRID_LABEL[g as GridMode]}</button>
+            {/each}
+          </div>
+        </div>
+        <div class="row sub">
+          <span class="lbl">格子の間隔</span>
+          <input class="num" type="number" min="1" max="100000" bind:value={opt.gridPx} disabled={!opt.extras} /> px
+        </div>
+        <label class="check sub"><input type="checkbox" bind:checked={opt.pixelGrid} disabled={!opt.extras} />ピクセルグリッド<span class="note">800% 以上で表示</span></label>
+        <button class="item small" disabled={!active || (!active.guides.v.length && !active.guides.h.length)}
+          onclick={() => { if (active) { active.guides.v = []; active.guides.h = []; } }}>このタブのガイドをすべて消去</button>
+        <div class="menu-sep"></div>
+        <div class="row">
+          <span class="lbl">回転 {rotation.toFixed(1).replace(/\.0$/, "")}°</span>
+          <button class="mini" disabled={!active?.meta} onclick={() => renderer?.rotateTo(rotation - 90)}>⟲ 90°</button>
+          <button class="mini" disabled={!active?.meta} onclick={() => renderer?.rotateTo(rotation + 90)}>⟳ 90°</button>
+          <button class="mini" disabled={!active?.meta || rotation === 0} onclick={() => renderer?.rotateTo(0)}>0° に戻す<kbd>Esc</kbd></button>
+        </div>
+        <div class="note-line">R を押しながらドラッグで回転（Shift で 15° 刻み）</div>
+        <label class="check"><input type="checkbox" checked={flipX} disabled={!active?.meta} onchange={toggleFlip} />左右反転して表示<kbd>Shift+H</kbd></label>
+      </div>
+    {/if}
+  </div>
   <span class="spacer"></span>
   <button class:active={showStats} onclick={() => (showStats = !showStats)} title="計測を表示 (F2)">計測</button>
 </header>
@@ -205,7 +266,8 @@
   ondragleave={() => { if (!isTauri()) dragOver = false; }}
   ondrop={onHtmlDrop}
 >
-  <Viewer bind:renderer onzoom={(s) => (vs.zoom = s)} />
+  <Viewer bind:renderer guides={active?.guides ?? null} oncursor={(p) => (cursor = p)} />
+  {#if opt.navigator && active?.meta}<Navigator {renderer} zoom={vs.zoom} />{/if}
   {#if !active}
     <div class="start">
       <div class="hint">PSD / PSB / PNG / JPG / WebP をドロップ、または「開く」（Ctrl+O）</div>
@@ -242,6 +304,11 @@
     {#if meta.layerInfo}<span>{meta.layerInfo}</span>{/if}
     {#if active.folder.length && active.folderIndex >= 0}<span>{active.folderIndex + 1} / {active.folder.length}</span>{/if}
     <span class="spacer"></span>
+    {#if cursor && cursor[0] >= 0 && cursor[1] >= 0 && cursor[0] < meta.width && cursor[1] < meta.height}
+      <span class="coord">x {Math.floor(cursor[0])}  y {Math.floor(cursor[1])}</span>
+    {/if}
+    {#if rotation !== 0}<button class="chip" title="クリックで 0° に戻す (Esc)" onclick={() => renderer?.rotateTo(0)}>回転 {rotation.toFixed(1).replace(/\.0$/, "")}°</button>{/if}
+    {#if flipX}<button class="chip" title="クリックで反転を解除 (Shift+H)" onclick={toggleFlip}>左右反転</button>{/if}
     <span>{(vs.zoom * 100).toFixed(vs.zoom < 0.1 ? 1 : 0)}%</span>
     <span>{meta.fromCache ? "cache" : `${meta.totalMs.toFixed(0)} ms`}</span>
   {:else}
@@ -297,6 +364,26 @@
   .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   .fdir { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 
+  .view-menu { min-width: 430px; max-width: 480px; gap: 2px; }
+  .check { display: flex; align-items: center; gap: 8px; white-space: nowrap; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+  .check:hover { background: #3a3a3a; }
+  .check input { margin: 0; accent-color: var(--accent); }
+  .sub { padding-left: 26px; }
+  kbd { margin-left: auto; color: var(--muted); font: 11px Consolas, "Cascadia Mono", monospace; }
+  .note { color: var(--muted); font-size: 11px; margin-left: 4px; }
+  .note-line { color: var(--muted); font-size: 11px; padding: 0 8px 4px; }
+  .row { display: flex; align-items: center; gap: 6px; padding: 4px 8px; }
+  .row .lbl { display: flex; gap: 8px; min-width: 96px; white-space: nowrap; }
+  .seg { display: flex; }
+  .seg button { border-radius: 0; padding: 2px 8px; margin-left: -1px; }
+  .seg button:first-child { border-radius: 4px 0 0 4px; }
+  .seg button:last-child { border-radius: 0 4px 4px 0; }
+  .seg button.on { background: #2f4f73; border-color: var(--accent); color: #fff; position: relative; }
+  .num { width: 72px; background: #1e1e1e; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; padding: 2px 4px; font: inherit; }
+  .mini { padding: 2px 8px; display: flex; gap: 6px; align-items: center; white-space: nowrap; }
+  .mini kbd { margin-left: 0; }
+  .statusbar .coord { color: var(--text); white-space: pre; }
+  .chip { background: #2f4f73; border: 1px solid var(--accent); color: #fff; border-radius: 9px; padding: 0 8px; font-size: 11px; line-height: 16px; }
   .stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
   .stage.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }
   .start {

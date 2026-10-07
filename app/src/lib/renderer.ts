@@ -1,16 +1,20 @@
 // WebGL2 image renderer: tiled textures (images larger than MAX_TEXTURE_SIZE are split),
 // mipmapped minification, nearest-neighbour when zoomed in >= 200%, checkerboard behind transparency.
 // Several images can live on the GPU at once (TextureSet); one of them is shown.
+//
+// View transform (image px -> css px): mirror x about the image centre when flipX, rotate by `rotation`
+// degrees (clockwise on screen), scale by `scale`, then translate by (offsetX, offsetY).
 
 const VS = `#version 300 es
 in vec2 a_unit;                 // 0..1 quad
 uniform vec4 u_rect;            // tile rect in image px (x, y, w, h)
-uniform vec3 u_view;            // scale (css px per image px), offsetX, offsetY (css px)
+uniform vec3 u_mx;              // view transform rows: css = (dot(u_mx, (img, 1)), dot(u_my, (img, 1)))
+uniform vec3 u_my;
 uniform vec2 u_canvas;          // canvas size in css px
 out vec2 v_uv;
 void main() {
-  vec2 img = u_rect.xy + a_unit * u_rect.zw;
-  vec2 css = img * u_view.x + u_view.yz;
+  vec3 img = vec3(u_rect.xy + a_unit * u_rect.zw, 1.0);
+  vec2 css = vec2(dot(u_mx, img), dot(u_my, img));
   vec2 clip = css / u_canvas * 2.0 - 1.0;
   gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
   v_uv = a_unit;
@@ -31,10 +35,15 @@ void main() {
 
 type Tile = { tex: WebGLTexture; x: number; y: number; w: number; h: number };
 
-/** One image uploaded to the GPU (one or more tiles). */
-export type TextureSet = { readonly id: number; tiles: Tile[]; width: number; height: number; bytes: number };
+/** One image uploaded to the GPU (one or more tiles). `thumb` is made on demand for the navigator. */
+export type TextureSet = { readonly id: number; tiles: Tile[]; width: number; height: number; bytes: number; thumb?: HTMLCanvasElement };
 
-export type ViewState = { scale: number; offsetX: number; offsetY: number };
+/** rotation in degrees (clockwise on screen), flipX = mirrored left-right (view only, the image is not changed) */
+export type ViewState = { scale: number; offsetX: number; offsetY: number; rotation: number; flipX: boolean };
+export type Orientation = { rotation: number; flipX: boolean };
+
+/** 2x3 affine transform rows: x' = a*x + b*y + c, y' = d*x + e*y + f */
+export type Affine = [number, number, number, number, number, number];
 
 let setSeq = 0;
 
@@ -56,7 +65,10 @@ export class Renderer {
   scale = 1;
   offsetX = 0;
   offsetY = 0;
+  rotation = 0;
+  flipX = false;
   private rafPending = false;
+  private frameListeners = new Set<() => void>();
 
   constructor(private canvas: HTMLCanvasElement) {
     const gl = canvas.getContext("webgl2", { alpha: false, antialias: false, premultipliedAlpha: true, powerPreference: "high-performance" });
@@ -77,7 +89,7 @@ export class Renderer {
     gl.linkProgram(p);
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p) ?? "link error");
     this.prog = p;
-    for (const n of ["u_rect", "u_view", "u_canvas", "u_tex", "u_dpr"]) this.loc[n] = gl.getUniformLocation(p, n);
+    for (const n of ["u_rect", "u_mx", "u_my", "u_canvas", "u_tex", "u_dpr"]) this.loc[n] = gl.getUniformLocation(p, n);
 
     this.vao = gl.createVertexArray()!;
     gl.bindVertexArray(this.vao);
@@ -125,8 +137,47 @@ export class Renderer {
     if (this.active === set) this.show(null);
   }
 
-  getView(): ViewState { return { scale: this.scale, offsetX: this.offsetX, offsetY: this.offsetY }; }
-  setView(v: ViewState) { this.scale = v.scale; this.offsetX = v.offsetX; this.offsetY = v.offsetY; this.requestDraw(); }
+  getView(): ViewState {
+    return { scale: this.scale, offsetX: this.offsetX, offsetY: this.offsetY, rotation: this.rotation, flipX: this.flipX };
+  }
+  setView(v: ViewState) {
+    this.scale = v.scale; this.offsetX = v.offsetX; this.offsetY = v.offsetY;
+    this.rotation = v.rotation ?? 0; this.flipX = v.flipX ?? false;
+    this.requestDraw();
+  }
+  setOrientation(o: Orientation) { this.rotation = o.rotation; this.flipX = o.flipX; this.requestDraw(); }
+
+  /** Called after every frame (also when nothing is shown) — overlays redraw in sync with the image. */
+  onFrame(fn: () => void) { this.frameListeners.add(fn); return () => { this.frameListeners.delete(fn); }; }
+
+  // ---------------------------------------------------------------- view transform
+
+  /** image px -> css px */
+  get matrix(): Affine {
+    const r = (this.rotation * Math.PI) / 180;
+    const c = Math.cos(r) * this.scale, s = Math.sin(r) * this.scale;
+    const fx = this.flipX ? -1 : 1, tx = this.flipX ? this.imageWidth : 0;
+    return [c * fx, -s, this.offsetX + c * tx, s * fx, c, this.offsetY + s * tx];
+  }
+
+  imageToView(x: number, y: number): [number, number] {
+    const m = this.matrix;
+    return [m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5]];
+  }
+
+  viewToImage(cx: number, cy: number): [number, number] {
+    const [a, b, c, d, e, f] = this.matrix;
+    const det = a * e - b * d;
+    const x = cx - c, y = cy - f;
+    return [(e * x - b * y) / det, (a * y - d * x) / det];
+  }
+
+  /** Puts image point (ix, iy) at css point (cx, cy) with the current scale / rotation / flip. */
+  private pin(ix: number, iy: number, cx: number, cy: number) {
+    this.offsetX = 0; this.offsetY = 0;
+    const [px, py] = this.imageToView(ix, iy);
+    this.offsetX = cx - px; this.offsetY = cy - py;
+  }
 
   /** Uploads the image as one or more tiles (not shown yet). Returns the set and the upload time in ms (GPU-synchronised). */
   async upload(src: ImageSource): Promise<{ set: TextureSet; ms: number }> {
@@ -190,23 +241,49 @@ export class Renderer {
   get viewWidth() { return this.canvas.getBoundingClientRect().width; }
   get viewHeight() { return this.canvas.getBoundingClientRect().height; }
 
+  /** Whole image in view (keeps rotation / flip; the rotated bounding box is fitted). */
   fit() {
     if (!this.hasImage) return;
-    const vw = this.viewWidth, vh = this.viewHeight;
-    this.scale = Math.min(vw / this.imageWidth, vh / this.imageHeight, 1) * 0.98;
-    this.offsetX = (vw - this.imageWidth * this.scale) / 2;
-    this.offsetY = (vh - this.imageHeight * this.scale) / 2;
+    const vw = this.viewWidth, vh = this.viewHeight, w = this.imageWidth, h = this.imageHeight;
+    const r = (this.rotation * Math.PI) / 180;
+    const c = Math.abs(Math.cos(r)), s = Math.abs(Math.sin(r));
+    this.scale = Math.min(vw / (w * c + h * s), vh / (w * s + h * c), 1) * 0.98;
+    this.pin(w / 2, h / 2, vw / 2, vh / 2);
     this.requestDraw();
   }
 
   /** Zoom keeping the image point under (cx, cy) fixed. */
   zoomAt(newScale: number, cx: number, cy: number) {
     newScale = Math.min(64, Math.max(0.01, newScale));
-    const ix = (cx - this.offsetX) / this.scale;
-    const iy = (cy - this.offsetY) / this.scale;
+    const [ix, iy] = this.viewToImage(cx, cy);
     this.scale = newScale;
-    this.offsetX = cx - ix * newScale;
-    this.offsetY = cy - iy * newScale;
+    this.pin(ix, iy, cx, cy);
+    this.requestDraw();
+  }
+
+  /** Rotates the view around the centre of the canvas. */
+  rotateTo(deg: number) {
+    deg = ((deg % 360) + 540) % 360 - 180; // -180 < deg <= 180
+    if (Math.abs(deg) < 1e-9) deg = 0;
+    const cx = this.viewWidth / 2, cy = this.viewHeight / 2;
+    const [ix, iy] = this.viewToImage(cx, cy);
+    this.rotation = deg;
+    this.pin(ix, iy, cx, cy);
+    this.requestDraw();
+  }
+
+  /** Mirrors the view left-right around the centre of the canvas. */
+  setFlip(flip: boolean) {
+    const cx = this.viewWidth / 2, cy = this.viewHeight / 2;
+    const [ix, iy] = this.viewToImage(cx, cy);
+    this.flipX = flip;
+    this.pin(ix, iy, cx, cy);
+    this.requestDraw();
+  }
+
+  /** Moves the view so that image point (ix, iy) is in the centre of the canvas. */
+  centerOn(ix: number, iy: number) {
+    this.pin(ix, iy, this.viewWidth / 2, this.viewHeight / 2);
     this.requestDraw();
   }
 
@@ -231,20 +308,62 @@ export class Renderer {
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0.118, 0.118, 0.118, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    if (!this.hasImage) return;
+    if (this.hasImage) {
+      this.drawSet(this.active!, this.matrix, this.viewWidth, this.viewHeight, window.devicePixelRatio || 1, this.scale >= 2);
+    }
+    this.lastDrawMs = performance.now() - t0;
+    for (const fn of this.frameListeners) fn();
+  }
+
+  private drawSet(set: TextureSet, m: Affine, cssW: number, cssH: number, dpr: number, nearest: boolean) {
+    const gl = this.gl;
     gl.useProgram(this.prog);
     gl.bindVertexArray(this.vao);
-    gl.uniform3f(this.loc.u_view, this.scale, this.offsetX, this.offsetY);
-    gl.uniform2f(this.loc.u_canvas, this.viewWidth, this.viewHeight);
-    gl.uniform1f(this.loc.u_dpr, window.devicePixelRatio || 1);
+    gl.uniform3f(this.loc.u_mx, m[0], m[1], m[2]);
+    gl.uniform3f(this.loc.u_my, m[3], m[4], m[5]);
+    gl.uniform2f(this.loc.u_canvas, cssW, cssH);
+    gl.uniform1f(this.loc.u_dpr, dpr);
     gl.uniform1i(this.loc.u_tex, 0);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindSampler(0, this.scale >= 2 ? this.nearestSampler : this.smoothSampler);
-    for (const t of this.active!.tiles) {
+    gl.bindSampler(0, nearest ? this.nearestSampler : this.smoothSampler);
+    for (const t of set.tiles) {
       gl.bindTexture(gl.TEXTURE_2D, t.tex);
       gl.uniform4f(this.loc.u_rect, t.x, t.y, t.w, t.h);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
-    this.lastDrawMs = performance.now() - t0;
+  }
+
+  /** Small image of `set` (longest side `size` px, transparency on a checkerboard) for the navigator. Cached on the set. */
+  thumbnail(set: TextureSet, size = 256): HTMLCanvasElement | null {
+    if (set.thumb) return set.thumb;
+    if (!set.tiles.length) return null;
+    const gl = this.gl;
+    const k = Math.min(1, size / Math.max(set.width, set.height));
+    const w = Math.max(1, Math.round(set.width * k)), h = Math.max(1, Math.round(set.height * k));
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
+    const fb = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0.118, 0.118, 0.118, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    this.drawSet(set, [w / set.width, 0, 0, 0, h / set.height, 0], w, h, 0.5, false);
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb);
+    gl.deleteTexture(tex);
+    // readPixels starts at the bottom row (the image's bottom edge): flip rows
+    const out = new Uint8ClampedArray(w * h * 4);
+    for (let y = 0; y < h; y++) out.set(px.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext("2d")!.putImageData(new ImageData(out, w, h), 0, 0);
+    set.thumb = canvas;
+    this.requestDraw();
+    return canvas;
   }
 }

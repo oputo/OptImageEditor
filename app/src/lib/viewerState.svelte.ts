@@ -5,7 +5,7 @@
 //   3. the two most recently used other tabs.
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
 import { loadImage, SUPPORTED_EXT, type LoadedImage } from "./loader";
-import type { Renderer, TextureSet, ViewState } from "./renderer";
+import type { Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
 import { listFolderImages, setWindowTitle } from "./desktop";
 import { recent } from "./recent.svelte";
@@ -30,10 +30,16 @@ export type Tab = {
   folderIndex: number;
   meta: ImageMeta | null;
   view: ViewState | null;
+  /** rotation / flip kept while stepping through the folder (the zoom is reset to fit) */
+  orient: Orientation | null;
+  /** guides in image px (vertical guides at x, horizontal guides at y); kept while stepping through the folder */
+  guides: Guides;
   loading: boolean;
   error: string | null;
   token: number;
 };
+
+export type Guides = { v: number[]; h: number[] };
 
 const GPU_BUDGET = 2 * 1024 ** 3; // bytes, incl. mipmaps
 const KEEP_OTHER_TABS = 2;
@@ -84,7 +90,7 @@ export class ViewerState {
       const id = ++this.seq;
       this.tabs.push({
         id, key: keyOf(path), path, file: null, name: baseName(path),
-        folder: [], folderIndex: -1, meta: null, view: null, loading: false, error: null, token: 0,
+        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, loading: false, error: null, token: 0,
       });
       lastId = id;
       // folder listing in the background (needed for ← / →)
@@ -105,7 +111,7 @@ export class ViewerState {
     const id = ++this.seq;
     this.tabs.push({
       id, key: `file:${id}`, path: null, file, name: file.name,
-      folder: [], folderIndex: -1, meta: null, view: null, loading: false, error: null, token: 0,
+      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, loading: false, error: null, token: 0,
     });
     this.activate(id);
   }
@@ -187,6 +193,7 @@ export class ViewerState {
     tab.key = keyOf(path);
     tab.name = baseName(path);
     tab.folderIndex = i;
+    if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
     tab.view = null;
     const entry = this.cache.get(tab.key);
     if (entry) {
@@ -209,6 +216,7 @@ export class ViewerState {
     if (!tab) return;
     const e = this.cache.get(tab.key);
     if (e) { this.cache.delete(tab.key); this.renderer?.dispose(e.set); this.cacheVersion++; }
+    if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
     tab.view = null;
     this.loadTab(tab);
   }
@@ -272,7 +280,7 @@ export class ViewerState {
     if (this.activeId !== tab.id || !this.renderer) return;
     this.renderer.show(entry.set);
     if (tab.view) this.renderer.setView(tab.view);
-    else this.renderer.fit();
+    else { this.renderer.setOrientation(tab.orient ?? { rotation: 0, flipX: false }); this.renderer.fit(); }
     this.zoom = this.renderer.scale;
     this.updateTitle();
   }
