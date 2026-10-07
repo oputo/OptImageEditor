@@ -35,6 +35,10 @@ export type MaskData = {
 
 export type DocLayer = {
   id: number;
+  /** id of the layer in the file this one comes from (a duplicate keeps its source's); null = created here */
+  origId: number | null;
+  /** created by duplicating `origId` (the saved file gets a copy of that layer) */
+  dup: boolean;
   name: string;
   kind: LayerKind;
   hidden: boolean;
@@ -75,4 +79,41 @@ export function* walkLayers(layers: DocLayer[]): Generator<DocLayer> {
     yield l;
     if (l.children) yield* walkLayers(l.children);
   }
+}
+
+/** Serializable description of the layer tree for saving (no pixels; the worker takes them from the file). */
+export type PlanNode = {
+  origId: number | null;
+  dup: boolean;
+  group: boolean;
+  name: string;
+  hidden: boolean;
+  opacity: number;
+  fill: number;
+  blendMode: LayerBlendMode;
+  clipping: boolean;
+  maskDisabled: boolean | null;
+  open: boolean;
+  children: PlanNode[] | null;
+};
+
+export function toPlan(layers: DocLayer[]): PlanNode[] {
+  return layers.map((l) => ({
+    origId: l.origId, dup: l.dup, group: !!l.children, name: l.name, hidden: l.hidden,
+    opacity: l.opacity, fill: l.fill, blendMode: l.blendMode, clipping: l.clipping,
+    maskDisabled: l.mask ? l.mask.disabled : null, open: l.open,
+    children: l.children ? toPlan(l.children) : null,
+  }));
+}
+
+/** Copy of a layer tree for the undo history. Pixel data (thumbnails, mask pixels) is never edited in place,
+ *  so it is shared instead of copied ($state.snapshot would clone every typed array). */
+export function cloneTree(layers: DocLayer[]): DocLayer[] {
+  return layers.map((l) => ({
+    ...l,
+    warnings: [...l.warnings],
+    mask: l.mask ? { ...l.mask } : null,
+    thumb: l.thumb ? { ...l.thumb } : null,
+    children: l.children ? cloneTree(l.children) : null,
+  }));
 }

@@ -33,6 +33,7 @@
       onkeydown={(e) => { if (e.key === "Enter") onactivate(t.id); }}
     >
       {#if t.loading}<span class="spin" aria-label="読み込み中"></span>{/if}
+      {#if t.layers?.dirty}<span class="dirty" title="未保存の変更があります">●</span>{/if}
       <span class="name">{t.name}</span>
       <button class="x" title="閉じる (Ctrl+W)" onmousedown={(e) => e.stopPropagation()} onclick={() => onclose(t.id)}>×</button>
     </div>
@@ -40,6 +41,7 @@
 </div>
 
 <style>
+  .dirty { color: #f0c040; font-size: 10px; flex: none; }
   .tabbar {
     display: flex;
     align-items: flex-end;

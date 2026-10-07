@@ -5,13 +5,13 @@
 //   3. the two most recently used other tabs.
 //   (while comparing, image B is kept right after the active image)
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
-import { isPsd, loadImage, loadLayers, SUPPORTED_EXT, type LoadedImage } from "./loader";
+import { buildPsd, isPsd, loadImage, loadLayers, SUPPORTED_EXT, type LoadedImage } from "./loader";
 import { Compositor, type LayerDoc } from "./compositor";
-import type { DocLayer } from "./psdDoc";
+import { cloneTree, toPlan, type DocLayer } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
-import { listFolderImages, setWindowTitle } from "./desktop";
+import { confirmDialog, listFolderImages, saveDialog, setWindowTitle, writeFile } from "./desktop";
 import { recent } from "./recent.svelte";
 
 export type ImageMeta = Omit<LoadedImage, "image" | "release"> & {
@@ -61,7 +61,18 @@ export type LayersState = {
   stats: { readMs: number; decodeMs: number; uploadMs: number; compositeMs: number; passes: number } | null;
   /** difference to the stored composite (computed on request) */
   diff: { max: number; mean: number; over2: number; over8: number } | null;
+  /** edited since loaded / saved */
+  dirty: boolean;
+  undoCount: number;
+  redoCount: number;
+  saving: boolean;
+  /** last save: time and size */
+  saved: { ms: number; bytes: number; path: string } | null;
 };
+
+/** Undo history of a tab's layer tree (snapshots of the tree; pixels are not edited in 2-b). */
+type History = { undo: DocLayer[][]; redo: DocLayer[][]; lastKey: string | null; lastTime: number };
+const HISTORY_MAX = 100;
 
 /** Comparison of the active tab (A) with tab `bId` (B; may be the same tab). */
 export type Compare = { bId: number; mode: CompareMode; linked: boolean; fitB: boolean; split: number; showB: boolean };
@@ -88,6 +99,11 @@ export class ViewerState {
   /** GPU side of the loaded layer trees, per tab id */
   private docs = new Map<number, LayerDoc>();
   private compositePending = new Set<number>();
+  private histories = new Map<number, History>();
+  /** paths whose original was already kept as .bak in this session */
+  private backedUp = new Set<string>();
+  /** tabs whose "not rendered" warning was already confirmed (asked once per tab) */
+  private warnedUnrendered = new Set<number>();
   private cache = new Map<string, CacheEntry>();
   private inflight = new Map<string, Promise<CacheEntry>>();
   private mru: number[] = [];
@@ -187,7 +203,8 @@ export class ViewerState {
     this.activate(this.tabs[(i + delta + this.tabs.length) % this.tabs.length].id);
   }
 
-  close(id: number) {
+  async close(id: number, force = false) {
+    if (!force && !(await this.confirmDiscard(this.tab(id)))) return;
     const i = this.tabs.findIndex((t) => t.id === id);
     if (i < 0) return;
     const [tab] = this.tabs.splice(i, 1);
@@ -225,9 +242,10 @@ export class ViewerState {
     this.goTo((base + delta + n) % n);
   }
 
-  goTo(index: number) {
+  async goTo(index: number) {
     const tab = this.active;
     if (!tab?.path || tab.folder.length === 0) return;
+    if (!(await this.confirmDiscard(tab)) || this.active !== tab) return;
     const i = Math.max(0, Math.min(tab.folder.length - 1, index));
     const path = tab.folder[i];
     tab.path = path;
@@ -259,18 +277,18 @@ export class ViewerState {
     if (!tab || tab.layer === index) return;
     tab.layer = index;
     const view = this.renderer?.hasImage ? this.renderer.getView() : null;
-    this.reload();
-    tab.view = view; // keep zoom / position (same image size)
+    void this.reload(view); // keep zoom / position (same image size)
   }
 
-  /** Reloads the active image from disk (drops its cached texture). */
-  reload() {
+  /** Reloads the active image from disk (drops its cached texture). `keepView`: view to restore instead of fitting. */
+  async reload(keepView: ViewState | null = null) {
     const tab = this.active;
     if (!tab) return;
+    if (!(await this.confirmDiscard(tab)) || this.active !== tab) return;
     const e = this.cache.get(cacheKey(tab));
     if (e) { this.cache.delete(cacheKey(tab)); this.renderer?.dispose(e.set); this.cacheVersion++; }
     if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
-    tab.view = null;
+    tab.view = keepView;
     this.dropLayers(tab);
     this.loadTab(tab);
   }
@@ -414,7 +432,10 @@ export class ViewerState {
   async loadLayers(tab: Tab) {
     if (tab.layers || !this.renderer || !isPsd(tab.name)) return;
     const token = tab.token;
-    tab.layers = { status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, stats: null, diff: null };
+    tab.layers = {
+      status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, stats: null, diff: null,
+      dirty: false, undoCount: 0, redoCount: 0, saving: false, saved: null,
+    };
     try {
       const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
       const data = await loadLayers(src);
@@ -440,6 +461,7 @@ export class ViewerState {
     const doc = this.docs.get(tab.id);
     const wasShown = !!doc?.output && this.renderer?.activeSet === doc.output;
     if (doc) { this.compositor?.dispose(doc); this.docs.delete(tab.id); }
+    this.histories.delete(tab.id);
     tab.layers = null;
     if (wasShown && this.activeId === tab.id) {
       const e = this.cache.get(cacheKey(tab));
@@ -497,6 +519,281 @@ export class ViewerState {
       if (m > 8) over8++;
     }
     l.diff = { max, mean: sum / (px * 4), over2: over2 / px, over8: over8 / px };
+  }
+
+  // ---------------------------------------------------------------- layer editing (phase 2-b)
+
+  private hist(tab: Tab): History {
+    let h = this.histories.get(tab.id);
+    if (!h) { h = { undo: [], redo: [], lastKey: null, lastTime: 0 }; this.histories.set(tab.id, h); }
+    return h;
+  }
+
+  /** Applies `mutate` to the layer tree as one undoable step. Steps with the same `key` within 1 s are merged
+   *  (dragging a slider is one step). */
+  edit(tab: Tab, key: string | null, mutate: (tree: DocLayer[]) => void) {
+    const l = tab.layers;
+    if (!l || l.status !== "ready") return;
+    const h = this.hist(tab);
+    const now = performance.now();
+    if (!(key && h.lastKey === key && now - h.lastTime < 1000)) {
+      h.undo.push(cloneTree(l.tree));
+      if (h.undo.length > HISTORY_MAX) h.undo.shift();
+      h.redo = [];
+    }
+    h.lastKey = key;
+    h.lastTime = now;
+    mutate(l.tree);
+    l.dirty = true;
+    l.undoCount = h.undo.length;
+    l.redoCount = h.redo.length;
+    this.layersChanged(tab);
+    if (this.activeId === tab.id) this.updateTitle();
+  }
+
+  undo(tab: Tab) { this.travel(tab, true); }
+  redo(tab: Tab) { this.travel(tab, false); }
+  private travel(tab: Tab, back: boolean) {
+    const l = tab.layers;
+    if (!l || l.status !== "ready") return;
+    const h = this.hist(tab);
+    const from = back ? h.undo : h.redo, to = back ? h.redo : h.undo;
+    const snap = from.pop();
+    if (!snap) return;
+    to.push(cloneTree(l.tree));
+    l.tree = snap;
+    h.lastKey = null;
+    l.dirty = true;
+    l.undoCount = h.undo.length;
+    l.redoCount = h.redo.length;
+    this.layersChanged(tab);
+    if (this.activeId === tab.id) this.updateTitle();
+  }
+
+  /** where `id` sits: the array that holds it and its index */
+  private locate(tree: DocLayer[], id: number | null): { list: DocLayer[]; index: number; node: DocLayer; parent: DocLayer | null } | null {
+    if (id === null) return null;
+    const visit = (list: DocLayer[], parent: DocLayer | null): ReturnType<ViewerState["locate"]> => {
+      for (let i = 0; i < list.length; i++) {
+        if (list[i].id === id) return { list, index: i, node: list[i], parent };
+        const r = list[i].children ? visit(list[i].children!, list[i]) : null;
+        if (r) return r;
+      }
+      return null;
+    };
+    return visit(tree, null);
+  }
+
+  private newLayerData(doc: LayerDoc, name: string, group: boolean): DocLayer {
+    return {
+      id: doc.nextId++, origId: null, dup: false, name, kind: group ? "group" : "pixel", hidden: false, opacity: 1, fill: 1,
+      blendMode: group ? "pass through" : "normal", clipping: false, x: 0, y: 0, w: 0, h: 0, pixels: null, mask: null,
+      thumb: null, children: group ? [] : null, open: true, warnings: [],
+    };
+  }
+
+  private countLayers(tree: DocLayer[]) {
+    let n = 0;
+    const walk = (ls: DocLayer[]) => { for (const l of ls) { n++; if (l.children) walk(l.children); } };
+    walk(tree);
+    return n;
+  }
+
+  /** inserts `node` above the selected layer (or at the top) and selects it */
+  private insert(tab: Tab, node: DocLayer, label: string) {
+    this.edit(tab, null, (tree) => {
+      const at = this.locate(tree, tab.layers!.selectedId);
+      if (at) at.list.splice(at.index + 1, 0, node); else tree.push(node);
+    });
+    tab.layers!.selectedId = node.id;
+    void label;
+  }
+
+  newLayer(tab: Tab) {
+    const doc = this.docs.get(tab.id);
+    if (!doc || !tab.layers) return;
+    this.insert(tab, this.newLayerData(doc, `レイヤー ${this.countLayers(tab.layers.tree) + 1}`, false), "新規レイヤー");
+  }
+
+  newGroup(tab: Tab) {
+    const doc = this.docs.get(tab.id);
+    if (!doc || !tab.layers) return;
+    this.insert(tab, this.newLayerData(doc, `グループ ${this.countLayers(tab.layers.tree) + 1}`, true), "新規グループ");
+  }
+
+  /** Ctrl+J: copy of the selected layer (or group) above it */
+  duplicate(tab: Tab) {
+    const doc = this.docs.get(tab.id);
+    const l = tab.layers;
+    const at = l && this.locate(l.tree, l.selectedId);
+    if (!doc || !l || !at) return;
+    const copy = (src: DocLayer): DocLayer => {
+      const c = { ...cloneTree([src])[0], id: doc.nextId++, dup: src.origId !== null, children: null as DocLayer[] | null };
+      const g = doc.gpu.get(src.id);
+      if (g) doc.gpu.set(c.id, g); // share the textures (pixels are not edited yet)
+      c.children = src.children ? src.children.map(copy) : null;
+      return c;
+    };
+    const c = copy(at.node);
+    c.name = `${at.node.name} のコピー`;
+    this.insert(tab, c, "複製");
+  }
+
+  deleteSelected(tab: Tab) {
+    const l = tab.layers;
+    const at = l && this.locate(l.tree, l.selectedId);
+    if (!l || !at) return;
+    const next = at.list[at.index - 1] ?? at.list[at.index + 1] ?? at.parent;
+    this.edit(tab, null, () => { at.list.splice(at.index, 1); });
+    l.selectedId = next?.id ?? null;
+  }
+
+  /** Ctrl+G: puts the selected layer into a new group */
+  groupSelected(tab: Tab) {
+    const doc = this.docs.get(tab.id);
+    const l = tab.layers;
+    if (!doc || !l || l.selectedId === null) return;
+    const g = this.newLayerData(doc, `グループ ${this.countLayers(l.tree) + 1}`, true);
+    this.edit(tab, null, (tree) => {
+      const at = this.locate(tree, l.selectedId)!;
+      const [node] = at.list.splice(at.index, 1, g);
+      node.clipping = false;
+      g.children = [node];
+    });
+    l.selectedId = g.id;
+  }
+
+  /** Moves layer `id` above / below / into (top of) layer `target`. */
+  move(tab: Tab, id: number, target: number, where: "above" | "below" | "inside") {
+    const l = tab.layers;
+    if (!l || id === target) return;
+    const src = this.locate(l.tree, id);
+    if (!src) return;
+    // not into itself or its own descendants
+    if (src.node.children && this.locate(src.node.children, target)) return;
+    this.edit(tab, null, (tree) => {
+      const s = this.locate(tree, id)!;
+      const [node] = s.list.splice(s.index, 1);
+      const t = this.locate(tree, target)!;
+      if (where === "inside" && t.node.children) t.node.children.push(node);
+      else t.list.splice(where === "above" ? t.index + 1 : t.index, 0, node);
+    });
+  }
+
+  /** Changes properties of layer `id` (same `key` within 1 s = one undo step, e.g. while dragging a slider). */
+  updateLayer(tab: Tab, id: number, patch: Partial<Pick<DocLayer, "name" | "hidden" | "opacity" | "fill" | "blendMode" | "clipping" | "open">> & { maskDisabled?: boolean }, key: string | null = null) {
+    this.edit(tab, key, (tree) => {
+      const at = this.locate(tree, id);
+      if (!at) return;
+      const { maskDisabled, ...rest } = patch;
+      Object.assign(at.node, rest);
+      if (maskDisabled !== undefined && at.node.mask) at.node.mask.disabled = maskDisabled;
+    });
+  }
+
+  /** Ctrl+Alt+G: clipping mask on / off for the selected layer */
+  toggleClipping(tab: Tab) {
+    const l = tab.layers;
+    const at = l && this.locate(l.tree, l.selectedId);
+    if (at) this.updateLayer(tab, at.node.id, { clipping: !at.node.clipping });
+  }
+
+  hasUnsaved(): boolean { return this.tabs.some((t) => t.layers?.dirty); }
+
+  /** Asks before discarding unsaved layer edits of `tab`. */
+  async confirmDiscard(tab: Tab | null): Promise<boolean> {
+    if (!tab?.layers?.dirty) return true;
+    return confirmDialog(`「${tab.name}」のレイヤーの変更は保存されていません。破棄しますか？`);
+  }
+
+  /** Encodes the layer tree as a PSD / PSB: layers come from the original file (re-read), the composite from the GPU. */
+  async encode(tab: Tab, psb = false): Promise<ArrayBuffer> {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc || !this.renderer) throw new Error("レイヤーが読み込まれていません");
+    // composite (premultiplied on the GPU) -> straight RGBA for the file
+    const set = this.compositor!.render(doc, l.tree);
+    const px = this.renderer.readSet(set);
+    const composite = new Uint8ClampedArray(px.length);
+    for (let i = 0; i < px.length; i += 4) {
+      const a = px[i + 3];
+      if (a === 0) continue;
+      composite[i] = (px[i] * 255) / a + 0.5;
+      composite[i + 1] = (px[i + 1] * 255) / a + 0.5;
+      composite[i + 2] = (px[i + 2] * 255) / a + 0.5;
+      composite[i + 3] = a;
+    }
+    const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
+    const original = await src.readAll();
+    const { buffer } = await buildPsd(original, tab.name, {
+      plan: toPlan(l.tree), composite, width: doc.data.width, height: doc.data.height, psb,
+    });
+    return buffer;
+  }
+
+  /** things the compositor does not draw (they are missing from the composite written to the file) */
+  private unrendered(tree: DocLayer[]): string[] {
+    const out = new Set<string>();
+    const walk = (ls: DocLayer[]) => { for (const x of ls) { if (!x.hidden) x.warnings.forEach((w) => out.add(w.replace(/（.*$/, ""))); if (x.children) walk(x.children); } };
+    walk(tree);
+    return [...out];
+  }
+
+  /** Saves the edited layer tree as PSD (Ctrl+S) or under a new name (saveAs).
+   *  Browser build: downloads the file instead. */
+  async save(tab: Tab, saveAs = false): Promise<boolean> {
+    const l = tab.layers;
+    if (!l || l.status !== "ready" || !this.renderer || l.saving) return false;
+    let target: string | null = tab.path;
+    if (tab.path && saveAs) target = await saveDialog(tab.path);
+    if (tab.path && !target) return false;
+    const missing = this.unrendered(l.tree);
+    if (missing.length && !this.warnedUnrendered.has(tab.id) && !(await confirmDialog(
+      `次の要素は統合画像に反映されません（レイヤー自体はそのまま保存され、Photoshop で開けば正しく表示されます）:\n\n・${missing.join("\n・")}\n\n保存しますか？`,
+    ))) return false;
+    this.warnedUnrendered.add(tab.id);
+    l.saving = true;
+    try {
+      const t0 = performance.now();
+      const buffer = await this.encode(tab, /\.psb$/i.test(target ?? tab.name));
+      if (!target) {
+        // browser build: download
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob([buffer]));
+        a.download = tab.name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+        l.saved = { ms: performance.now() - t0, bytes: buffer.byteLength, path: tab.name };
+        return true;
+      }
+      const sameFile = keyOf(target) === keyOf(tab.path!);
+      const backup = sameFile && !this.backedUp.has(keyOf(target));
+      await writeFile(target, buffer, backup);
+      if (backup) this.backedUp.add(keyOf(target));
+      // the file now holds exactly this tree: renumber the source ids the way the worker reads them (post-order)
+      let n = 0;
+      const renumber = (ls: DocLayer[]) => { for (const x of ls) { if (x.children) renumber(x.children); x.origId = ++n; x.dup = false; } };
+      renumber(l.tree);
+      l.dirty = false;
+      l.saved = { ms: performance.now() - t0, bytes: buffer.byteLength, path: target };
+      if (!sameFile) {
+        tab.path = target;
+        tab.key = keyOf(target);
+        tab.name = baseName(target);
+        recent.add(target);
+      }
+      if (!l.useLayers) this.setUseLayers(tab, true);
+      const old = this.cache.get(cacheKey(tab));
+      if (old && this.renderer.activeSet !== old.set) { this.cache.delete(cacheKey(tab)); this.renderer.dispose(old.set); this.cacheVersion++; }
+      // read the new file's composite in the background (for "PS の統合画像" / compare / tab switching)
+      void TauriFileSource.open(target).then((src) => this.decodeAndUpload(src, cacheKey(tab)))
+        .then((e) => { tab.meta = { ...e.meta, fromCache: true, totalMs: 0 }; this.enforceCache(); })
+        .catch((e) => console.warn("re-reading the saved composite failed", e));
+      this.updateTitle();
+      return true;
+    } finally {
+      l.saving = false;
+    }
   }
 
   // ---------------------------------------------------------------- compare
@@ -558,6 +855,6 @@ export class ViewerState {
     const t = this.active;
     if (!t) { setWindowTitle("OptImageEditor"); return; }
     const pos = t.folder.length && t.folderIndex >= 0 ? ` (${t.folderIndex + 1}/${t.folder.length})` : "";
-    setWindowTitle(`${t.name}${pos} — OptImageEditor`);
+    setWindowTitle(`${t.layers?.dirty ? "● " : ""}${t.name}${pos} — OptImageEditor`);
   }
 }

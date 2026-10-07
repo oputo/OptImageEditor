@@ -1,8 +1,8 @@
 // Decodes image files off the UI thread.
 // PSD/PSB: ag-psd reads only the stored composite image (layer pixels are skipped -> fast, low memory).
 // PNG/JPG/WebP: decoded by the browser engine via createImageBitmap.
-import { initializeCanvas, readPsd, type Layer } from "ag-psd";
-import type { DocLayer, LayerBlendMode, LayerKind, PsdDocData } from "./psdDoc";
+import { initializeCanvas, readPsd, writePsd, type Layer } from "ag-psd";
+import type { DocLayer, LayerBlendMode, LayerKind, PlanNode, PsdDocData } from "./psdDoc";
 
 // Workers have no `document`: give ag-psd OffscreenCanvas / ImageData factories.
 initializeCanvas(
@@ -12,11 +12,16 @@ initializeCanvas(
 
 export type DecodeRequest = {
   id: number; name: string; buffer: ArrayBuffer;
-  /** "layers": read the layer tree with pixels (PSD only) */
-  mode?: "composite" | "layers";
+  /** "layers": read the layer tree with pixels (PSD only); "save": rebuild the PSD from `save` */
+  mode?: "composite" | "layers" | "save";
+  save?: SaveParams;
   /** PSD composite from a rebuilt file without layer section: remove the white matte here */
   unmatte?: boolean;
 };
+
+/** Rebuild of the original file (`buffer`) with the edited layer tree and a new composite (straight RGBA). */
+export type SaveParams = { plan: PlanNode[]; composite: Uint8ClampedArray; width: number; height: number; psb: boolean };
+export type SaveResult = { id: number; ok: true; buffer: ArrayBuffer; ms: number } | { id: number; ok: false; error: string };
 
 export type LayersResult = { id: number; ok: true; doc: PsdDocData } | { id: number; ok: false; error: string };
 
@@ -130,8 +135,11 @@ function convertLayers(layers: Layer[] | undefined, seq: { n: number }, transfer
     if (pixels) transfer.push(pixels.buffer as ArrayBuffer);
     if (thumb) transfer.push(thumb.data.buffer);
     const children = l.children ? convertLayers(l.children, seq, transfer) : null;
+    const id = ++seq.n; // post-order (children first): saveDoc() walks the file the same way
     return {
-      id: ++seq.n,
+      id,
+      origId: id,
+      dup: false,
       name: l.name ?? "",
       kind,
       hidden: !!l.hidden,
@@ -148,6 +156,57 @@ function convertLayers(layers: Layer[] | undefined, seq: { n: number }, transfer
       warnings,
     };
   });
+}
+
+// ---------------------------------------------------------------- save (phase 2-b)
+
+function saveDoc(id: number, buffer: ArrayBuffer, p: SaveParams) {
+  const t0 = performance.now();
+  // full read: layer pixels and embedded smart object files are written back unchanged
+  const psd = readPsd(buffer, { useImageData: true, useRawThumbnail: true, skipCompositeImageData: true });
+  const byId = new Map<number, Layer>();
+  let n = 0;
+  const walk = (ls: Layer[] | undefined) => { for (const l of ls ?? []) { walk(l.children); byId.set(++n, l); } };
+  walk(psd.children);
+
+  const clone = (l: Layer): Layer => {
+    const c = structuredClone(l) as Layer;
+    const strip = (x: Layer) => { delete x.id; x.children?.forEach(strip); }; // new layer ids are assigned on write
+    strip(c);
+    return c;
+  };
+  const build = (nodes: PlanNode[]): Layer[] => nodes.map((q) => {
+    let l: Layer;
+    if (q.origId !== null) {
+      const src = byId.get(q.origId);
+      if (!src) throw new Error(`layer ${q.origId} not found in the file`);
+      l = q.dup ? clone(src) : src;
+    } else {
+      l = q.group ? { children: [] } : { left: 0, top: 0, right: 0, bottom: 0 };
+    }
+    l.name = q.name;
+    l.hidden = q.hidden;
+    l.opacity = q.opacity;
+    if (q.fill !== 1 || l.fillOpacity !== undefined) l.fillOpacity = q.fill;
+    l.blendMode = q.blendMode;
+    l.clipping = q.clipping;
+    if (l.mask && q.maskDisabled !== null) l.mask.disabled = q.maskDisabled;
+    if (q.group) {
+      l.children = build(q.children ?? []);
+      l.opened = q.open;
+    }
+    return l;
+  });
+  psd.children = build(p.plan);
+  // resources that list the layers by index would no longer match: Photoshop rebuilds them
+  if (psd.imageResources) {
+    const r = psd.imageResources as Record<string, unknown>; // some of these are not in ag-psd's typings
+    for (const k of ["layerState", "layersGroup", "layerGroupsEnabledId", "layerSelectionIds"]) delete r[k];
+  }
+  psd.imageData = { width: p.width, height: p.height, data: p.composite };
+  const out = writePsd(psd, { generateThumbnail: false, trimImageData: false, psb: p.psb });
+  const res: SaveResult = { id, ok: true, buffer: out, ms: performance.now() - t0 };
+  (self as unknown as Worker).postMessage(res, [out]);
 }
 
 function readLayers(id: number, buffer: ArrayBuffer) {
@@ -184,6 +243,15 @@ function removeWhiteMatte(p: Uint8ClampedArray) {
 self.onmessage = async (ev: MessageEvent<DecodeRequest>) => {
   const { id, name, buffer } = ev.data;
   const t0 = performance.now();
+  if (ev.data.mode === "save") {
+    try {
+      saveDoc(id, buffer, ev.data.save!);
+    } catch (e) {
+      const res: SaveResult = { id, ok: false, error: e instanceof Error ? e.message : String(e) };
+      (self as unknown as Worker).postMessage(res);
+    }
+    return;
+  }
   if (ev.data.mode === "layers") {
     try {
       readLayers(id, buffer);

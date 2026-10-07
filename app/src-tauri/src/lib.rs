@@ -212,6 +212,54 @@ fn take_buffer(id: u32) -> Result<Response, String> {
     stash().lock().map_err(|e| e.to_string())?.remove(&id).map(Response::new).ok_or_else(|| format!("buffer {id} not found"))
 }
 
+/// Percent-decoding of a header value written with encodeURIComponent (UTF-8).
+fn percent_decode(s: &str) -> Result<String, String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = std::str::from_utf8(&b[i + 1..i + 3]).map_err(|e| e.to_string())?;
+            out.push(u8::from_str_radix(h, 16).map_err(|e| e.to_string())?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|e| e.to_string())
+}
+
+/// Saves raw bytes (request body) to the path in header `x-path` (percent-encoded).
+/// Written to `<path>.tmp` first and then moved over the target, so a failed save never leaves a broken file.
+/// With header `x-backup: 1` the existing file is kept as `<path>.bak` (an older .bak is replaced).
+#[tauri::command]
+fn write_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let header = |k: &str| request.headers().get(k).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let path = percent_decode(&header("x-path").ok_or("x-path header missing")?)?;
+    let backup = header("x-backup").as_deref() == Some("1");
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err("raw body expected".into());
+    };
+    let target = PathBuf::from(&path);
+    let tmp = PathBuf::from(format!("{path}.tmp"));
+    {
+        use std::io::Write;
+        let mut f = File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        f.write_all(data).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
+    if backup && target.exists() {
+        let bak = PathBuf::from(format!("{path}.bak"));
+        if bak.exists() {
+            std::fs::remove_file(&bak).map_err(|e| format!("{}: {e}", bak.display()))?;
+        }
+        std::fs::rename(&target, &bak).map_err(|e| format!("{}: {e}", bak.display()))?;
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+    Ok(())
+}
+
 /// WebView2 SharedBuffer helper. `post_shared` returns Ok(None) when shared buffers are not available.
 #[cfg(windows)]
 mod shared {
@@ -503,6 +551,7 @@ pub fn run() {
             load_composite_shared,
             load_hdr,
             take_buffer,
+            write_file,
             list_images,
             startup_paths,
             register_open_with,

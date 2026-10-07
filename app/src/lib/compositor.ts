@@ -192,7 +192,9 @@ export class LayerDoc {
   /** time of the last full composite (ms, GPU-synchronised) */
   lastMs = 0;
   passes = 0;
-  constructor(readonly data: PsdDocData) {}
+  /** next id for layers created in the app */
+  nextId: number;
+  constructor(readonly data: PsdDocData) { this.nextId = data.count + 1; }
 }
 
 export class Compositor {
@@ -286,9 +288,9 @@ export class Compositor {
 
   dispose(doc: LayerDoc) {
     const gl = this.gl;
+    const seen = new Set<WebGLTexture>(); // duplicated layers share their source's textures
     for (const g of doc.gpu.values()) {
-      if (g.tex) gl.deleteTexture(g.tex);
-      if (g.mask) gl.deleteTexture(g.mask);
+      for (const t of [g.tex, g.mask]) if (t && !seen.has(t)) { seen.add(t); gl.deleteTexture(t); }
     }
     doc.gpu.clear();
     if (doc.output) this.renderer.dispose(doc.output);

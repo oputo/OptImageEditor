@@ -1,5 +1,5 @@
 // Loads a file source into a renderer-ready image (decoding happens in a Web Worker).
-import type { DecodeRequest, DecodeResult, LayersResult } from "./decoder.worker";
+import type { DecodeRequest, DecodeResult, LayersResult, SaveParams, SaveResult } from "./decoder.worker";
 import type { PsdDocData } from "./psdDoc";
 import type { ImageSource } from "./renderer";
 import { readPsdCompositeOnly } from "./psdSlice";
@@ -72,6 +72,23 @@ export async function loadLayers(src: FileSource): Promise<PsdDocData & { readMs
   });
   if (!res.ok) throw new Error(res.error);
   return { ...res.doc, readMs };
+}
+
+/** Rebuilds the PSD in the worker: the original file + the edited layer tree + a new composite. */
+export async function buildPsd(original: ArrayBuffer, name: string, params: SaveParams): Promise<{ buffer: ArrayBuffer; ms: number }> {
+  const id = ++requestId;
+  const res = await new Promise<SaveResult>((resolve) => {
+    const onMsg = (ev: MessageEvent<SaveResult>) => {
+      if (ev.data.id !== id) return;
+      worker.removeEventListener("message", onMsg);
+      resolve(ev.data);
+    };
+    worker.addEventListener("message", onMsg);
+    const req: DecodeRequest = { id, name, buffer: original, mode: "save", save: params };
+    worker.postMessage(req, [original, params.composite.buffer as ArrayBuffer]);
+  });
+  if (!res.ok) throw new Error(res.error);
+  return { buffer: res.buffer, ms: res.ms };
 }
 
 export async function loadImage(src: FileSource, opts: LoadOptions = {}): Promise<LoadedImage> {

@@ -2,7 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ask, message, open } from "@tauri-apps/plugin-dialog";
+import { ask, message, open, save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { SUPPORTED_EXT } from "./loader";
 import { isTauri } from "./source";
@@ -79,4 +79,22 @@ export async function confirmDialog(text: string, title = "OptImageEditor"): Pro
 export async function infoDialog(text: string, title = "OptImageEditor") {
   if (!isTauri()) { window.alert(text); return; }
   await message(text, { title, kind: "info" });
+}
+
+/** "Save as" dialog; null when cancelled (or not in the desktop app). */
+export async function saveDialog(defaultPath: string): Promise<string | null> {
+  if (!isTauri()) return null;
+  const r = await save({ defaultPath, filters: [{ name: "Photoshop", extensions: ["psd", "psb"] }] });
+  return r ?? null;
+}
+
+/** Writes `data` to `path` (via a temporary file). `backup`: keep the old file as `<path>.bak`. */
+export async function writeFile(path: string, data: ArrayBuffer, backup: boolean) {
+  await invoke("write_file", new Uint8Array(data), { headers: { "x-path": encodeURIComponent(path), "x-backup": backup ? "1" : "0" } });
+}
+
+/** Window close: `handler` returns true to let the window close. */
+export async function onCloseRequested(handler: () => Promise<boolean>) {
+  if (!isTauri()) return () => {};
+  return getCurrentWindow().onCloseRequested(async (e) => { if (!(await handler())) e.preventDefault(); });
 }

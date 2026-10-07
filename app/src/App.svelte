@@ -12,7 +12,7 @@
   import { SUPPORTED_EXT, isPsd } from "./lib/loader";
   import { baseName, isTauri, readTuning, READ_MODES, READ_MODE_LABEL } from "./lib/source";
   import {
-    confirmDialog, infoDialog, onNativeDrop, onOpenPaths, openDefaultAppsSettings, pickFile,
+    confirmDialog, infoDialog, onCloseRequested, onNativeDrop, onOpenPaths, openDefaultAppsSettings, pickFile,
     setOpenWithRegistration, startupPaths, toggleFullscreen,
   } from "./lib/desktop";
   import { ViewerState } from "./lib/viewerState.svelte";
@@ -96,6 +96,27 @@
     }
   }
 
+  /** Ctrl+S / Ctrl+Shift+S: saves the active tab's layers as PSD. */
+  async function save(saveAs: boolean) {
+    const t = active;
+    const l = t?.layers;
+    if (!t || l?.status !== "ready") { showToast("保存できるのはレイヤーを読み込んだ PSD だけです（F7 でレイヤーパネルを開く）"); return; }
+    if (!saveAs && !l.dirty) { showToast("変更はありません"); return; }
+    try {
+      if (await vs.save(t, saveAs)) showToast(`保存しました: ${t.name}（${(l.saved!.ms / 1000).toFixed(1)} 秒）`);
+    } catch (e) {
+      console.error(e);
+      await infoDialog(`保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** layer editing shortcut on the active tab (needs the layers loaded) */
+  function layerKey(f: (t: NonNullable<typeof active>) => void) {
+    const t = active;
+    if (t?.layers?.status === "ready") f(t);
+    else if (t && isPsd(t.name)) showToast("レイヤーの編集はレイヤーパネル (F7) を開いてから");
+  }
+
   function toggleFlip() { if (renderer?.hasImage) renderer.setFlip(!renderer.flipX); }
 
   function fit() { renderer?.fit(); vs.zoom = renderer?.scale ?? 0; }
@@ -141,6 +162,14 @@
     else if (cmp && !ctrl && !e.altKey && (kk === "1" || kk === "2" || kk === "3")) vs.updateCompare({ mode: (["side", "swipe", "toggle"] as const)[Number(kk) - 1] });
     else if (cmp && !ctrl && !e.altKey && kk === "x") vs.updateCompare({ mode: "toggle", showB: cmp.mode === "toggle" ? !cmp.showB : true });
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
+    else if (ctrl && kk === "z") layerKey((t) => (e.shiftKey ? vs.redo(t) : vs.undo(t)));
+    else if (ctrl && kk === "y") layerKey((t) => vs.redo(t));
+    else if (ctrl && kk === "s") save(e.shiftKey);
+    else if (ctrl && !e.shiftKey && !e.altKey && kk === "j") layerKey((t) => vs.duplicate(t));
+    else if (ctrl && e.shiftKey && !e.altKey && kk === "n") layerKey((t) => vs.newLayer(t));
+    else if (ctrl && e.altKey && kk === "g") layerKey((t) => vs.toggleClipping(t));
+    else if (ctrl && !e.shiftKey && kk === "g") layerKey((t) => vs.groupSelected(t));
+    else if (!ctrl && k === "Delete") layerKey((t) => vs.deleteSelected(t));
     else if (ctrl && kk === "r") opt.rulers = !opt.rulers;
     else if (ctrl && kk === "h") opt.extras = !opt.extras;
     else if (!ctrl && !e.altKey && kk === "n") opt.navigator = !opt.navigator;
@@ -209,6 +238,11 @@
     onNativeDrop({ over: (on) => (dragOver = on), drop: (paths) => openPaths(paths) }).then((u) => unlisten.push(u));
     onOpenPaths((paths) => openPaths(paths)).then((u) => unlisten.push(u));
     startupPaths().then((paths) => openPaths(paths));
+    onCloseRequested(async () => !vs.hasUnsaved() || confirmDialog("保存されていないレイヤーの変更があります。破棄して終了しますか？")).then((u) => unlisten.push(u));
+    // browser build / reload of the webview
+    const beforeUnload = (e: BeforeUnloadEvent) => { if (vs.hasUnsaved()) e.preventDefault(); };
+    window.addEventListener("beforeunload", beforeUnload);
+    unlisten.push(() => window.removeEventListener("beforeunload", beforeUnload));
     const closeMenu = (e: MouseEvent) => { if (!(e.target as HTMLElement).closest(".menu-wrap")) openMenu = null; };
     window.addEventListener("mousedown", closeMenu);
     // test hook for automated checks (browser build)
@@ -394,7 +428,7 @@
     </div>
   {/if}
 </main>
-{#if opt.layersPanel}<LayerPanel {vs} tab={active} />{/if}
+{#if opt.layersPanel}<LayerPanel {vs} tab={active} onsave={save} />{/if}
 </div>
 
 <footer class="statusbar">
