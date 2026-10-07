@@ -1,6 +1,6 @@
 # OptImageEditor app
 
-Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1-c（ナビゲーター、表示の回転・左右反転、定規、ガイド、グリッド、ピクセルグリッド）まで実装済み。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
+Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1-d（比較表示）まで実装済み。1-c でナビゲーター、表示の回転・左右反転、定規、ガイド、グリッド、ピクセルグリッドを追加。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
 
 ## 前提（Windows）
 
@@ -48,6 +48,9 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | F11 | 全画面 |
 | F2 | 計測パネルの表示 / 非表示（「コピー」で計測結果をクリップボードへ） |
 | F3 / F5 | （計測用）読み込み方式の切り替え（共有メモリ / IPC 一括 / IPC 分割並列）/ 再読み込み |
+| C / ツールバーの「比較」 | 比較表示の開始 / 終了（Esc でも終了）。A = 表示中のタブ、B = 直前に見ていたタブ（比較バーのドロップダウンで変更。「同じ画像」も選べる）。B のタブをクリックすると A と B が入れ替わる |
+| 比較中の 1 / 2 / 3 | 並べる（左右）/ スワイプ（境界線をドラッグ）/ A/B 切替（X で切り替え） |
+| 比較バー | 「連動」（並べる時。オフで左右を別々にズーム・移動・回転）、B の大きさ「A に合わせる」（縦横比を保って拡大縮小し中央揃え）/「実ピクセル」（左上揃え）。比較中の ← → は A だけを送る（B は固定） |
 | 「表示」メニュー | 上記の表示設定（設定は localStorage の `oie.view` に保存）、ピクセルグリッド（800% 以上で表示）、ガイドの一括消去 |
 | ≡ メニュー | 最近使ったファイル（20 件、起動画面にも 10 件表示）/ 履歴を消去 /「プログラムから開く」に登録・登録を解除 |
 | 起動時の引数 | `optimageeditor.exe <画像のパス>...` で、その画像を開いて起動する。既に起動している場合は、そのウィンドウに新しいタブで開く（二重起動の防止） |
@@ -62,8 +65,8 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | `src/lib/recent.svelte.ts` | 最近使ったファイル（localStorage の `oie.recent`、最大 20 件） |
 | `src/lib/Viewer.svelte` | キャンバスと、ズーム・パン・回転の操作。2D のオーバーレイ（グリッド / ピクセルグリッド / ガイド）と定規。オーバーレイは renderer の `onFrame` で画像と同じフレームに描く |
 | `src/lib/Navigator.svelte` | ナビゲーター。縮小画像は renderer の `thumbnail()` が GPU 上で作る（TextureSet ごとに 1 回） |
-| `src/lib/viewOptions.svelte.ts` | 表示設定（ナビゲーター / 定規 / ガイド / グリッド）。localStorage の `oie.view` |
-| `src/lib/renderer.ts` | WebGL2 の描画。画像ごとのテクスチャ（`TextureSet`）を複数保持し、`show` で切り替える。表示の変換は 2×3 の行列（左右反転 → 回転 → 拡大縮小 → 移動）で、`viewToImage` / `imageToView` で座標を変換する。`MAX_TEXTURE_SIZE`（上限 8192）を超える画像はタイルに分割する。縮小時はミップマップ、200% 以上はニアレストネイバー。透明部分は市松模様 |
+| `src/lib/viewOptions.svelte.ts` | 表示設定（ナビゲーター / 定規 / ガイド / グリッド / 前回の比較設定）。localStorage の `oie.view` |
+| `src/lib/renderer.ts` | WebGL2 の描画。比較中は画面をペイン（scissor の矩形）に分け、B は A の画像座標系に写して描く（ガイド・グリッド・連動表示が両方に効く）。表示の変換は `View` クラス（A 用と、連動しない時の B 用）。画像ごとのテクスチャ（`TextureSet`）を複数保持し、`show` で切り替える。表示の変換は 2×3 の行列（左右反転 → 回転 → 拡大縮小 → 移動）で、`viewToImage` / `imageToView` で座標を変換する。`MAX_TEXTURE_SIZE`（上限 8192）を超える画像はタイルに分割する。縮小時はミップマップ、200% 以上はニアレストネイバー。透明部分は市松模様 |
 | `src/lib/loader.ts` | ファイルの読み込みからデコードまで（デコード処理は Web Worker） |
 | `src/lib/decoder.worker.ts` | PSD は ag-psd で統合画像だけを読む。PNG / JPG は `createImageBitmap` |
 | `src-tauri/src/composite.rs` | PSD / PSB の統合画像デコーダ（RGB / グレー、8 / 16bit、非圧縮 / RLE）。行単位で並列に RGBA へ展開し、透明がある場合は白マットを除去する。テスト: `python ../tools/composite_ref.py <dir>` の後、`OIE_SAMPLES=<dir> cargo test --release -- --nocapture samples` |
@@ -79,4 +82,5 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 - 16 / 32bit の PSD は、表示用に 8bit へ変換する。
 - `.svelte.ts` のモジュール名は、同じフォルダの `.svelte` コンポーネントと大文字小文字違いで重ねない（Windows ではファイル名の大文字小文字を区別しないため、`./lib/viewer.svelte` が `Viewer.svelte` に解決されてしまう）。
 - 「プログラムから開く」の登録は exe の場所を書き込むので、dev ビルドで登録すると `D:\build-cache\OptImageEditor\debug\optimageeditor.exe` が登録される。配布用ビルドに切り替えたら登録し直す。
-- 未実装: EXR、比較表示、ナビゲーター、ガイド / グリッド
+- 比較の「並べる」表示中は定規を隠す。差分表示（|A−B|）は未実装
+- 未実装: EXR

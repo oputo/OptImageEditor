@@ -4,6 +4,11 @@
 //
 // View transform (image px -> css px): mirror x about the image centre when flipX, rotate by `rotation`
 // degrees (clockwise on screen), scale by `scale`, then translate by (offsetX, offsetY).
+//
+// Compare mode (phase 1-d): a second image B is shown next to / over the active image A. The canvas is
+// split into panes (scissor rectangles). B is drawn in A's image space ("A-space"): when `fitB` is on,
+// B is scaled uniformly to fit A's size and centred, otherwise its pixels map 1:1 onto A's (top-left aligned). So guides, the
+// grid and a linked view apply to both images alike.
 
 const VS = `#version 300 es
 in vec2 a_unit;                 // 0..1 quad
@@ -51,6 +56,144 @@ export type ImageSource =
   | { kind: "rgba"; width: number; height: number; data: Uint8ClampedArray; premultiplied?: boolean }
   | { kind: "bitmap"; width: number; height: number; bitmap: ImageBitmap };
 
+/** One view transform (zoom / pan / rotation / flip) for a viewport of vw x vh css px. */
+export class View {
+  scale = 1;
+  offsetX = 0;
+  offsetY = 0;
+  rotation = 0;
+  flipX = false;
+  /** size of the image space (flip mirrors about its centre, fit uses it) */
+  imgW = 0;
+  imgH = 0;
+  /** viewport size in css px */
+  vw = 1;
+  vh = 1;
+
+  get state(): ViewState {
+    return { scale: this.scale, offsetX: this.offsetX, offsetY: this.offsetY, rotation: this.rotation, flipX: this.flipX };
+  }
+  set state(v: ViewState) {
+    this.scale = v.scale; this.offsetX = v.offsetX; this.offsetY = v.offsetY;
+    this.rotation = v.rotation ?? 0; this.flipX = v.flipX ?? false;
+  }
+
+  /** image px -> css px (relative to the viewport origin) */
+  get matrix(): Affine {
+    const r = (this.rotation * Math.PI) / 180;
+    const c = Math.cos(r) * this.scale, s = Math.sin(r) * this.scale;
+    const fx = this.flipX ? -1 : 1, tx = this.flipX ? this.imgW : 0;
+    return [c * fx, -s, this.offsetX + c * tx, s * fx, c, this.offsetY + s * tx];
+  }
+
+  imageToView(x: number, y: number): [number, number] { return apply(this.matrix, x, y); }
+  viewToImage(cx: number, cy: number): [number, number] { return applyInverse(this.matrix, cx, cy); }
+
+  /** Puts image point (ix, iy) at viewport point (cx, cy) with the current scale / rotation / flip. */
+  pin(ix: number, iy: number, cx: number, cy: number) {
+    this.offsetX = 0; this.offsetY = 0;
+    const [px, py] = this.imageToView(ix, iy);
+    this.offsetX = cx - px; this.offsetY = cy - py;
+  }
+
+  /** Whole image in view (keeps rotation / flip; the rotated bounding box is fitted). */
+  fit() {
+    if (!this.imgW || !this.imgH) return;
+    const r = (this.rotation * Math.PI) / 180;
+    const c = Math.abs(Math.cos(r)), s = Math.abs(Math.sin(r));
+    const w = this.imgW, h = this.imgH;
+    this.scale = Math.min(this.vw / (w * c + h * s), this.vh / (w * s + h * c), 1) * 0.98;
+    this.pin(w / 2, h / 2, this.vw / 2, this.vh / 2);
+  }
+
+  /** Zoom keeping the image point under viewport point (cx, cy) fixed. */
+  zoomAt(newScale: number, cx: number, cy: number) {
+    newScale = Math.min(64, Math.max(0.01, newScale));
+    const [ix, iy] = this.viewToImage(cx, cy);
+    this.scale = newScale;
+    this.pin(ix, iy, cx, cy);
+  }
+
+  /** Rotates around the centre of the viewport. */
+  rotateTo(deg: number) {
+    deg = ((deg % 360) + 540) % 360 - 180; // -180 < deg <= 180
+    if (Math.abs(deg) < 1e-9) deg = 0;
+    const [ix, iy] = this.viewToImage(this.vw / 2, this.vh / 2);
+    this.rotation = deg;
+    this.pin(ix, iy, this.vw / 2, this.vh / 2);
+  }
+
+  /** Mirrors left-right around the centre of the viewport. */
+  setFlip(flip: boolean) {
+    const [ix, iy] = this.viewToImage(this.vw / 2, this.vh / 2);
+    this.flipX = flip;
+    this.pin(ix, iy, this.vw / 2, this.vh / 2);
+  }
+
+  centerOn(ix: number, iy: number) { this.pin(ix, iy, this.vw / 2, this.vh / 2); }
+
+  panBy(dx: number, dy: number) { this.offsetX += dx; this.offsetY += dy; }
+
+  /** New viewport size: keeps the image point in the centre where it was. */
+  resizeTo(vw: number, vh: number) {
+    if (vw === this.vw && vh === this.vh) return;
+    const [ix, iy] = this.viewToImage(this.vw / 2, this.vh / 2);
+    this.vw = vw; this.vh = vh;
+    if (this.imgW) this.pin(ix, iy, vw / 2, vh / 2);
+  }
+
+  copyFrom(o: View) { this.state = o.state; this.imgW = o.imgW; this.imgH = o.imgH; this.vw = o.vw; this.vh = o.vh; }
+}
+
+export function apply(m: Affine, x: number, y: number): [number, number] {
+  return [m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5]];
+}
+
+export function applyInverse(m: Affine, cx: number, cy: number): [number, number] {
+  const [a, b, c, d, e, f] = m;
+  const det = a * e - b * d;
+  const x = cx - c, y = cy - f;
+  return [(e * x - b * y) / det, (a * y - d * x) / det];
+}
+
+/** m then translate by (tx, ty) */
+const translate = (m: Affine, tx: number, ty: number): Affine => [m[0], m[1], m[2] + tx, m[3], m[4], m[5] + ty];
+/** x -> k*x + (tx, ty), then m */
+const premap = (m: Affine, k: number, tx: number, ty: number): Affine =>
+  [m[0] * k, m[1] * k, m[0] * tx + m[1] * ty + m[2], m[3] * k, m[4] * k, m[3] * tx + m[4] * ty + m[5]];
+
+export type CompareMode = "side" | "swipe" | "toggle";
+export type CompareState = {
+  /** image B */
+  set: TextureSet;
+  mode: CompareMode;
+  /** side by side: both panes share A's view (otherwise B has its own view) */
+  linked: boolean;
+  /** B scaled uniformly to fit A's size, centred (otherwise pixel 1:1, top-left aligned) */
+  fitB: boolean;
+  /** swipe: divider position, 0..1 of the canvas width */
+  split: number;
+  /** toggle: B is shown instead of A */
+  showB: boolean;
+};
+
+/** A drawable area of the canvas. `matrix` maps A-space to canvas css px, `texMatrix` maps the set's own pixels. */
+export type Pane = {
+  which: "A" | "B";
+  /** clip rectangle in canvas css px */
+  x: number; y: number; w: number; h: number;
+  /** origin of the view's viewport in canvas css px */
+  ox: number; oy: number;
+  view: View;
+  set: TextureSet;
+  matrix: Affine;
+  texMatrix: Affine;
+  /** css px per texture px (for the sampler choice) */
+  texScale: number;
+};
+
+const SIDE_GAP = 2; // css px between the panes
+
 export class Renderer {
   readonly gl: WebGL2RenderingContext;
   readonly maxTextureSize: number;
@@ -61,12 +204,11 @@ export class Renderer {
   private nearestSampler: WebGLSampler;
   private active: TextureSet | null = null;
   private live = new Set<TextureSet>();
-  // view: css px per image px, and image origin position in css px
-  scale = 1;
-  offsetX = 0;
-  offsetY = 0;
-  rotation = 0;
-  flipX = false;
+  /** view of image A (the active tab) */
+  readonly view = new View();
+  /** view of the right pane when comparing side by side without linking */
+  readonly viewB = new View();
+  private cmp: CompareState | null = null;
   private rafPending = false;
   private frameListeners = new Set<() => void>();
 
@@ -119,10 +261,13 @@ export class Renderer {
   get textureBytes() { let b = 0; for (const s of this.live) b += s.bytes; return b; }
   get textureCount() { return this.live.size; }
   get activeSet() { return this.active; }
+  get compare() { return this.cmp; }
 
-  /** Shows `set` (or nothing). Does not free anything. */
+  /** Shows `set` as image A (or nothing). Does not free anything. */
   show(set: TextureSet | null) {
     this.active = set;
+    this.view.imgW = this.viewB.imgW = set?.width ?? 0;
+    this.view.imgH = this.viewB.imgH = set?.height ?? 0;
     this.requestDraw();
   }
 
@@ -135,48 +280,115 @@ export class Renderer {
     for (const t of set.tiles) this.gl.deleteTexture(t.tex);
     set.tiles = [];
     if (this.active === set) this.show(null);
+    if (this.cmp?.set === set) this.setCompare(null);
   }
 
-  getView(): ViewState {
-    return { scale: this.scale, offsetX: this.offsetX, offsetY: this.offsetY, rotation: this.rotation, flipX: this.flipX };
-  }
-  setView(v: ViewState) {
-    this.scale = v.scale; this.offsetX = v.offsetX; this.offsetY = v.offsetY;
-    this.rotation = v.rotation ?? 0; this.flipX = v.flipX ?? false;
+  /** Starts / updates / ends (null) the comparison with image B. Pane sizes change, so the views are re-laid out. */
+  setCompare(c: CompareState | null) {
+    const wasSide = this.cmp?.mode === "side", wasLinked = this.cmp?.linked ?? true;
+    this.cmp = c;
+    const side = c?.mode === "side";
+    if (side && (!wasSide || (wasLinked && !c!.linked))) {
+      // the right pane starts as a copy of the left one
+      this.layout();
+      this.viewB.copyFrom(this.view);
+    }
+    this.layout();
     this.requestDraw();
   }
-  setOrientation(o: Orientation) { this.rotation = o.rotation; this.flipX = o.flipX; this.requestDraw(); }
+
+  // ---------------------------------------------------------------- view of image A (pane 0, origin = canvas origin)
+
+  get scale() { return this.view.scale; }
+  get offsetX() { return this.view.offsetX; }
+  get offsetY() { return this.view.offsetY; }
+  get rotation() { return this.view.rotation; }
+  get flipX() { return this.view.flipX; }
+  /** A-space -> css px of pane 0 (= canvas css px, pane 0 starts at the canvas origin) */
+  get matrix(): Affine { return this.view.matrix; }
+  imageToView(x: number, y: number) { return this.view.imageToView(x, y); }
+  viewToImage(cx: number, cy: number) { return this.view.viewToImage(cx, cy); }
+  /** size of pane 0 (the whole canvas unless comparing side by side) */
+  get viewWidth() { return this.view.vw; }
+  get viewHeight() { return this.view.vh; }
+
+  getView(): ViewState { return this.view.state; }
+  setView(v: ViewState) { this.view.state = v; this.requestDraw(); }
+  setOrientation(o: Orientation) { this.view.rotation = o.rotation; this.view.flipX = o.flipX; this.requestDraw(); }
+
+  /** Fits A (and B's own view when it is not linked). */
+  fit() {
+    if (!this.hasImage) return;
+    this.view.fit();
+    if (this.unlinkedB) this.viewB.fit();
+    this.requestDraw();
+  }
+  zoomAt(s: number, cx: number, cy: number) { this.view.zoomAt(s, cx, cy); this.requestDraw(); }
+  rotateTo(deg: number) { this.view.rotateTo(deg); this.requestDraw(); }
+  setFlip(flip: boolean) { this.view.setFlip(flip); this.requestDraw(); }
+  centerOn(ix: number, iy: number) { this.view.centerOn(ix, iy); this.requestDraw(); }
+  panBy(dx: number, dy: number) { this.view.panBy(dx, dy); this.requestDraw(); }
 
   /** Called after every frame (also when nothing is shown) — overlays redraw in sync with the image. */
   onFrame(fn: () => void) { this.frameListeners.add(fn); return () => { this.frameListeners.delete(fn); }; }
 
-  // ---------------------------------------------------------------- view transform
+  // ---------------------------------------------------------------- panes
 
-  /** image px -> css px */
-  get matrix(): Affine {
-    const r = (this.rotation * Math.PI) / 180;
-    const c = Math.cos(r) * this.scale, s = Math.sin(r) * this.scale;
-    const fx = this.flipX ? -1 : 1, tx = this.flipX ? this.imageWidth : 0;
-    return [c * fx, -s, this.offsetX + c * tx, s * fx, c, this.offsetY + s * tx];
+  private get unlinkedB() { return this.cmp?.mode === "side" && !this.cmp.linked; }
+
+  private get cssSize() {
+    const r = this.canvas.getBoundingClientRect();
+    return { w: Math.max(1, r.width), h: Math.max(1, r.height) };
   }
 
-  imageToView(x: number, y: number): [number, number] {
-    const m = this.matrix;
-    return [m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5]];
+  /** Pane rectangles for the current mode; also sizes the views. */
+  private layout() {
+    const { w, h } = this.cssSize;
+    if (this.cmp?.mode === "side") {
+      const w0 = Math.floor((w - SIDE_GAP) / 2);
+      this.view.resizeTo(w0, h);
+      this.viewB.resizeTo(w - w0 - SIDE_GAP, h);
+    } else {
+      this.view.resizeTo(w, h);
+    }
   }
 
-  viewToImage(cx: number, cy: number): [number, number] {
-    const [a, b, c, d, e, f] = this.matrix;
-    const det = a * e - b * d;
-    const x = cx - c, y = cy - f;
-    return [(e * x - b * y) / det, (a * y - d * x) / det];
+  /** The panes to draw (in order). Empty when nothing is shown. */
+  panes(): Pane[] {
+    const a = this.active;
+    if (!a) return [];
+    const { w, h } = this.cssSize;
+    const paneA = (x: number, cw: number): Pane => ({
+      which: "A", x, y: 0, w: cw, h, ox: 0, oy: 0, view: this.view, set: a,
+      matrix: this.view.matrix, texMatrix: this.view.matrix, texScale: this.view.scale,
+    });
+    const c = this.cmp;
+    if (!c) return [paneA(0, w)];
+    const b = c.set;
+    // B pixel -> A-space: x * k + (tx, ty)
+    const k = c.fitB ? Math.min(a.width / b.width, a.height / b.height) : 1;
+    const tx = c.fitB ? (a.width - b.width * k) / 2 : 0, ty = c.fitB ? (a.height - b.height * k) / 2 : 0;
+    const paneB = (view: View, x: number, cw: number, ox: number): Pane => {
+      const m = translate(view.matrix, ox, 0);
+      return { which: "B", x, y: 0, w: cw, h, ox, oy: 0, view, set: b, matrix: m, texMatrix: premap(m, k, tx, ty), texScale: view.scale * k };
+    };
+    if (c.mode === "side") {
+      const x1 = this.view.vw + SIDE_GAP;
+      return [paneA(0, this.view.vw), paneB(c.linked ? this.view : this.viewB, x1, w - x1, x1)];
+    }
+    if (c.mode === "swipe") {
+      const sx0 = Math.round(Math.min(1, Math.max(0, c.split)) * w);
+      return [paneA(0, sx0), paneB(this.view, sx0, w - sx0, 0)];
+    }
+    return [c.showB ? paneB(this.view, 0, w, 0) : paneA(0, w)];
   }
 
-  /** Puts image point (ix, iy) at css point (cx, cy) with the current scale / rotation / flip. */
-  private pin(ix: number, iy: number, cx: number, cy: number) {
-    this.offsetX = 0; this.offsetY = 0;
-    const [px, py] = this.imageToView(ix, iy);
-    this.offsetX = cx - px; this.offsetY = cy - py;
+  /** The pane under canvas point (cx, cy) — the one whose view an interaction there should change. */
+  paneAt(cx: number, cy: number): Pane | null {
+    const ps = this.panes();
+    if (this.cmp?.mode === "side") return ps.find((p) => cx >= p.x - SIDE_GAP && cx < p.x + p.w) ?? ps[ps.length - 1] ?? null;
+    // swipe / toggle / single: one shared view; report the pane that is visible there
+    return ps.find((p) => cx >= p.x && cx < p.x + p.w && cy >= p.y && cy < p.y + p.h) ?? ps[0] ?? null;
   }
 
   /** Uploads the image as one or more tiles (not shown yet). Returns the set and the upload time in ms (GPU-synchronised). */
@@ -235,61 +447,7 @@ export class Renderer {
       this.canvas.width = w;
       this.canvas.height = h;
     }
-    this.requestDraw();
-  }
-
-  get viewWidth() { return this.canvas.getBoundingClientRect().width; }
-  get viewHeight() { return this.canvas.getBoundingClientRect().height; }
-
-  /** Whole image in view (keeps rotation / flip; the rotated bounding box is fitted). */
-  fit() {
-    if (!this.hasImage) return;
-    const vw = this.viewWidth, vh = this.viewHeight, w = this.imageWidth, h = this.imageHeight;
-    const r = (this.rotation * Math.PI) / 180;
-    const c = Math.abs(Math.cos(r)), s = Math.abs(Math.sin(r));
-    this.scale = Math.min(vw / (w * c + h * s), vh / (w * s + h * c), 1) * 0.98;
-    this.pin(w / 2, h / 2, vw / 2, vh / 2);
-    this.requestDraw();
-  }
-
-  /** Zoom keeping the image point under (cx, cy) fixed. */
-  zoomAt(newScale: number, cx: number, cy: number) {
-    newScale = Math.min(64, Math.max(0.01, newScale));
-    const [ix, iy] = this.viewToImage(cx, cy);
-    this.scale = newScale;
-    this.pin(ix, iy, cx, cy);
-    this.requestDraw();
-  }
-
-  /** Rotates the view around the centre of the canvas. */
-  rotateTo(deg: number) {
-    deg = ((deg % 360) + 540) % 360 - 180; // -180 < deg <= 180
-    if (Math.abs(deg) < 1e-9) deg = 0;
-    const cx = this.viewWidth / 2, cy = this.viewHeight / 2;
-    const [ix, iy] = this.viewToImage(cx, cy);
-    this.rotation = deg;
-    this.pin(ix, iy, cx, cy);
-    this.requestDraw();
-  }
-
-  /** Mirrors the view left-right around the centre of the canvas. */
-  setFlip(flip: boolean) {
-    const cx = this.viewWidth / 2, cy = this.viewHeight / 2;
-    const [ix, iy] = this.viewToImage(cx, cy);
-    this.flipX = flip;
-    this.pin(ix, iy, cx, cy);
-    this.requestDraw();
-  }
-
-  /** Moves the view so that image point (ix, iy) is in the centre of the canvas. */
-  centerOn(ix: number, iy: number) {
-    this.pin(ix, iy, this.viewWidth / 2, this.viewHeight / 2);
-    this.requestDraw();
-  }
-
-  panBy(dx: number, dy: number) {
-    this.offsetX += dx;
-    this.offsetY += dy;
+    this.layout();
     this.requestDraw();
   }
 
@@ -305,12 +463,22 @@ export class Renderer {
   draw() {
     const t0 = performance.now();
     const gl = this.gl;
+    this.layout();
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0.118, 0.118, 0.118, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    if (this.hasImage) {
-      this.drawSet(this.active!, this.matrix, this.viewWidth, this.viewHeight, window.devicePixelRatio || 1, this.scale >= 2);
+    const dpr = this.canvas.width / this.cssSize.w;
+    const { w, h } = this.cssSize;
+    gl.enable(gl.SCISSOR_TEST);
+    for (const p of this.panes()) {
+      // scissor in device px, origin bottom-left
+      const x0 = Math.round(p.x * dpr), x1 = Math.round((p.x + p.w) * dpr);
+      const y0 = Math.round((h - p.y - p.h) * dpr), y1 = Math.round((h - p.y) * dpr);
+      if (x1 <= x0 || y1 <= y0) continue;
+      gl.scissor(x0, y0, x1 - x0, y1 - y0);
+      this.drawSet(p.set, p.texMatrix, w, h, window.devicePixelRatio || 1, p.texScale >= 2);
     }
+    gl.disable(gl.SCISSOR_TEST);
     this.lastDrawMs = performance.now() - t0;
     for (const fn of this.frameListeners) fn();
   }

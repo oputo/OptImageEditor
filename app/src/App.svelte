@@ -1,11 +1,12 @@
 <script lang="ts">
   // OptImageEditor — phase 1-c: viewer with tabs, prefetch, recent files, single instance, "Open with" registration,
-  // navigator, view rotation / flip, rulers, guides, grid, pixel grid.
+  // navigator, view rotation / flip, rulers, guides, grid, pixel grid; phase 1-d: compare (side by side / swipe / A-B toggle).
   import { onMount } from "svelte";
   import Viewer from "./lib/Viewer.svelte";
   import TabBar from "./lib/TabBar.svelte";
   import Navigator from "./lib/Navigator.svelte";
-  import { viewOptions as opt, GRID_LABEL, type GridMode } from "./lib/viewOptions.svelte";
+  import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
+  import type { CompareMode } from "./lib/renderer";
   import type { Renderer } from "./lib/renderer";
   import { SUPPORTED_EXT } from "./lib/loader";
   import { baseName, isTauri, readTuning, READ_MODES, READ_MODE_LABEL } from "./lib/source";
@@ -98,9 +99,14 @@
     const k = e.key;
     // typing in a text / number field: only Ctrl shortcuts and function keys
     const t = e.target as HTMLElement;
-    if (t.tagName === "INPUT" && (t as HTMLInputElement).type !== "checkbox" && !ctrl && !/^F\d+$/.test(k)) return;
+    if (((t.tagName === "INPUT" && (t as HTMLInputElement).type !== "checkbox") || t.tagName === "SELECT") && !ctrl && !/^F\d+$/.test(k)) return;
     let handled = true;
+    const cmp = vs.compare;
     if (k === "Escape" && openMenu) openMenu = null;
+    else if (k === "Escape" && cmp) vs.stopCompare();
+    else if (!ctrl && !e.altKey && !e.shiftKey && k.toLowerCase() === "c") { if (active?.meta || cmp) vs.toggleCompare(); }
+    else if (cmp && !ctrl && !e.altKey && (k === "1" || k === "2" || k === "3")) vs.updateCompare({ mode: (["side", "swipe", "toggle"] as const)[Number(k) - 1] });
+    else if (cmp && !ctrl && !e.altKey && k.toLowerCase() === "x") vs.updateCompare({ mode: "toggle", showB: cmp.mode === "toggle" ? !cmp.showB : true });
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
     else if (ctrl && k.toLowerCase() === "r") opt.rulers = !opt.rulers;
     else if (ctrl && k.toLowerCase() === "h") opt.extras = !opt.extras;
@@ -215,6 +221,7 @@
   <button onclick={fit} title="全体表示 (Ctrl+0)">全体</button>
   <button onclick={() => zoomTo(1)} title="100% (Ctrl+1)">100%</button>
   <span class="sep"></span>
+  <button class:active={!!vs.compare} disabled={!active?.meta && !vs.compare} onclick={() => vs.toggleCompare()} title="比較表示 (C)">比較</button>
   <div class="menu-wrap">
     <button class:active={openMenu === "view"} onclick={() => (openMenu = openMenu === "view" ? null : "view")} title="表示（ナビゲーター / 定規 / ガイド / グリッド / 回転）">表示 ▾</button>
     {#if openMenu === "view"}
@@ -259,6 +266,44 @@
   <TabBar tabs={vs.tabs} activeId={vs.activeId} onactivate={(id) => vs.activate(id)} onclose={(id) => vs.close(id)} onopen={openDialog} />
 {/if}
 
+{#if vs.compare && active}
+  {@const c = vs.compare}
+  <div class="cmpbar">
+    <span class="tag a">A</span><span class="cname" title={active.path ?? active.name}>{active.name}</span>
+    <span class="vs">⇔</span>
+    <span class="tag b">B</span>
+    <select value={c.bId} onchange={(e) => vs.updateCompare({ bId: Number((e.currentTarget as HTMLSelectElement).value) })} title="比べる画像（タブ）。B のタブをクリックすると A と B が入れ替わる">
+      {#each vs.tabs as t (t.id)}
+        <option value={t.id}>{t.id === vs.activeId ? "（同じ画像）" : ""}{t.name}</option>
+      {/each}
+    </select>
+    <span class="sep"></span>
+    <div class="seg">
+      {#each Object.keys(COMPARE_LABEL) as m, i (m)}
+        <button class:on={c.mode === m} onclick={() => vs.updateCompare({ mode: m as CompareMode })} title="キー {i + 1}">{COMPARE_LABEL[m as CompareMode]}</button>
+      {/each}
+    </div>
+    {#if c.mode === "side"}
+      <label class="cchk" title="ズーム・位置・回転を左右で連動する（オフで左右を別々に操作）"><input type="checkbox" checked={c.linked} onchange={(e) => vs.updateCompare({ linked: (e.currentTarget as HTMLInputElement).checked })} />連動</label>
+    {:else if c.mode === "toggle"}
+      <button onclick={() => vs.updateCompare({ showB: !c.showB })} title="A と B を切り替える (X)">{c.showB ? "B を表示中" : "A を表示中"} ⇄ <kbd>X</kbd></button>
+    {:else}
+      <span class="hint-small">境界線をドラッグ</span>
+    {/if}
+    <span class="sep"></span>
+    <span class="lbl-small">B の大きさ</span>
+    <div class="seg">
+      <button class:on={c.fitB} onclick={() => vs.updateCompare({ fitB: true })} title="B を A の大きさに合わせて拡大縮小する（縦横比は保ち、中央に揃える。解像度違いの比較用）">A に合わせる</button>
+      <button class:on={!c.fitB} onclick={() => vs.updateCompare({ fitB: false })} title="実ピクセルで左上を揃える">実ピクセル</button>
+    </div>
+    {#if vs.compareTab?.meta && active.meta && (vs.compareTab.meta.width !== active.meta.width || vs.compareTab.meta.height !== active.meta.height)}
+      <span class="hint-small">A {active.meta.width}×{active.meta.height} / B {vs.compareTab.meta.width}×{vs.compareTab.meta.height}</span>
+    {/if}
+    <span class="spacer"></span>
+    <button onclick={() => vs.stopCompare()} title="比較を終了 (C / Esc)">終了 <kbd>Esc</kbd></button>
+  </div>
+{/if}
+
 <main
   class="stage"
   class:drag-over={dragOver}
@@ -266,7 +311,10 @@
   ondragleave={() => { if (!isTauri()) dragOver = false; }}
   ondrop={onHtmlDrop}
 >
-  <Viewer bind:renderer guides={active?.guides ?? null} oncursor={(p) => (cursor = p)} />
+  <Viewer bind:renderer guides={active?.guides ?? null} oncursor={(p) => (cursor = p)}
+    labels={vs.compare && active ? { a: active.name, b: vs.compareTab?.name ?? "" } : null}
+    onsplit={(v) => vs.updateCompare({ split: v })} />
+  {#if vs.compare && vs.compareTab?.loading}<div class="busy">B を読み込み中…</div>{/if}
   {#if opt.navigator && active?.meta}<Navigator {renderer} zoom={vs.zoom} />{/if}
   {#if !active}
     <div class="start">
@@ -364,6 +412,21 @@
   .fname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   .fdir { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 
+  .cmpbar {
+    display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 8px; flex: none;
+    background: #262a30; border-bottom: 1px solid var(--border); font-size: 12px; white-space: nowrap;
+  }
+  .cmpbar button { padding: 2px 8px; display: flex; gap: 6px; align-items: center; }
+  .cmpbar kbd { margin-left: 0; }
+  .cmpbar select { background: #1e1e1e; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; padding: 2px 4px; font: inherit; max-width: 280px; }
+  .tag { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 3px; color: #fff; font-weight: 600; font-size: 11px; }
+  .tag.a { background: rgb(30, 90, 160); }
+  .tag.b { background: rgb(150, 70, 20); }
+  .cname { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  .vs { color: var(--muted); }
+  .cchk { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .cchk input { margin: 0; accent-color: var(--accent); }
+  .hint-small, .lbl-small { color: var(--muted); font-size: 11px; }
   .view-menu { min-width: 430px; max-width: 480px; gap: 2px; }
   .check { display: flex; align-items: center; gap: 8px; white-space: nowrap; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
   .check:hover { background: #3a3a3a; }

@@ -3,9 +3,11 @@
 // GPU cache policy (phase 1-b): keep textures only for
 //   1. the active tab, 2. the next / previous image in the active tab's folder (prefetched),
 //   3. the two most recently used other tabs.
+//   (while comparing, image B is kept right after the active image)
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
 import { loadImage, SUPPORTED_EXT, type LoadedImage } from "./loader";
-import type { Orientation, Renderer, TextureSet, ViewState } from "./renderer";
+import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
+import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
 import { listFolderImages, setWindowTitle } from "./desktop";
 import { recent } from "./recent.svelte";
@@ -41,6 +43,9 @@ export type Tab = {
 
 export type Guides = { v: number[]; h: number[] };
 
+/** Comparison of the active tab (A) with tab `bId` (B; may be the same tab). */
+export type Compare = { bId: number; mode: CompareMode; linked: boolean; fitB: boolean; split: number; showB: boolean };
+
 const GPU_BUDGET = 2 * 1024 ** 3; // bytes, incl. mipmaps
 const KEEP_OTHER_TABS = 2;
 const PREFETCH_DELAY_MS = 150;
@@ -54,6 +59,7 @@ export class ViewerState {
   zoom = $state(0);
   /** bumps whenever the GPU cache changes (for the stats panel) */
   cacheVersion = $state(0);
+  compare = $state<Compare | null>(null);
 
   renderer: Renderer | undefined;
   private cache = new Map<string, CacheEntry>();
@@ -65,6 +71,10 @@ export class ViewerState {
 
   get active(): Tab | null {
     return this.tabs.find((t) => t.id === this.activeId) ?? null;
+  }
+
+  get compareTab(): Tab | null {
+    return this.compare ? this.tab(this.compare.bId) : null;
   }
 
   get cacheInfo() {
@@ -128,6 +138,8 @@ export class ViewerState {
     if (prev && prev.id !== id && this.renderer?.hasImage) prev.view = this.renderer.getView();
     const tab = this.tab(id);
     if (!tab) return;
+    // activating the compared tab swaps A and B
+    if (this.compare && prev && id === this.compare.bId && prev.id !== id) this.compare.bId = prev.id;
     this.activeId = id;
     this.mru = [id, ...this.mru.filter((x) => x !== id)];
     const entry = this.cache.get(tab.key);
@@ -140,6 +152,7 @@ export class ViewerState {
     this.updateTitle();
     this.enforceCache();
     this.schedulePrefetch();
+    this.syncCompare();
   }
 
   cycle(delta: number) {
@@ -156,6 +169,7 @@ export class ViewerState {
     if (tab.path) this.closed.push({ path: tab.path });
     if (this.closed.length > 20) this.closed.shift();
     this.mru = this.mru.filter((x) => x !== id);
+    if (this.compare?.bId === id) this.stopCompare();
     if (this.activeId === id) {
       const next = this.tabs[i] ?? this.tabs[i - 1];
       if (next) {
@@ -234,6 +248,7 @@ export class ViewerState {
       if (token !== tab.token) return; // superseded (navigated away / closed)
       this.present(tab, entry, false);
       if (tab.path) recent.add(tab.path);
+      if (this.compare?.bId === tab.id) this.syncCompare();
     } catch (e) {
       if (token !== tab.token) return;
       tab.error = `${tab.name}: ${e instanceof Error ? e.message : String(e)}`;
@@ -283,6 +298,7 @@ export class ViewerState {
     else { this.renderer.setOrientation(tab.orient ?? { rotation: 0, flipX: false }); this.renderer.fit(); }
     this.zoom = this.renderer.scale;
     this.updateTitle();
+    this.syncCompare();
   }
 
   // ---------------------------------------------------------------- GPU cache / prefetch
@@ -301,6 +317,8 @@ export class ViewerState {
     // priority order: active > next > previous > recently used tabs
     const keep: string[] = [];
     if (active) keep.push(active.key);
+    const b = this.compareTab;
+    if (b) keep.push(b.key);
     for (const p of this.neighbourPaths(active)) keep.push(keyOf(p));
     for (const id of this.mru.slice(0, KEEP_OTHER_TABS + 1)) {
       const t = this.tab(id);
@@ -318,7 +336,7 @@ export class ViewerState {
     let changed = false;
     for (const [k, e] of this.cache) {
       if (kept.has(k)) continue;
-      if (this.renderer?.activeSet === e.set) continue; // never free what is on screen
+      if (this.renderer?.activeSet === e.set || this.renderer?.compare?.set === e.set) continue; // never free what is on screen
       this.cache.delete(k);
       this.renderer?.dispose(e.set);
       changed = true;
@@ -346,6 +364,59 @@ export class ViewerState {
         this.enforceCache();
       }
     }, PREFETCH_DELAY_MS);
+  }
+
+  // ---------------------------------------------------------------- compare
+
+  /** Compares the active tab with tab `bId` (default: the previously viewed tab, or the same image when there is only one). */
+  startCompare(bId?: number) {
+    const a = this.active;
+    if (!a) return;
+    const id = bId ?? this.mru.find((x) => x !== a.id && this.tab(x)) ?? a.id;
+    this.compare = {
+      bId: id, mode: viewOptions.compareMode, linked: viewOptions.compareLinked, fitB: viewOptions.compareFitB,
+      split: 0.5, showB: false,
+    };
+    this.enforceCache();
+    this.syncCompare();
+  }
+
+  stopCompare() {
+    this.compare = null;
+    this.renderer?.setCompare(null);
+    this.enforceCache();
+  }
+
+  toggleCompare() {
+    if (this.compare) this.stopCompare();
+    else this.startCompare();
+  }
+
+  /** Changes compare settings (mode / linked / fitB are remembered for the next comparison). */
+  updateCompare(patch: Partial<Compare>) {
+    const c = this.compare;
+    if (!c) return;
+    Object.assign(c, patch);
+    if (patch.mode) viewOptions.compareMode = patch.mode;
+    if (patch.linked !== undefined) viewOptions.compareLinked = patch.linked;
+    if (patch.fitB !== undefined) viewOptions.compareFitB = patch.fitB;
+    if (patch.bId !== undefined) this.enforceCache();
+    this.syncCompare();
+  }
+
+  /** Pushes the compare state to the renderer, loading image B first when its texture is not on the GPU. */
+  syncCompare() {
+    const c = this.compare, r = this.renderer;
+    if (!c || !r) return;
+    const b = this.tab(c.bId);
+    if (!b) { this.stopCompare(); return; }
+    const entry = this.cache.get(b.key);
+    if (entry && r.hasImage) {
+      r.setCompare({ set: entry.set, mode: c.mode, linked: c.linked, fitB: c.fitB, split: c.split, showB: c.showB });
+    } else {
+      r.setCompare(null);
+      if (!entry && !b.loading) this.loadTab(b);
+    }
   }
 
   // ---------------------------------------------------------------- misc
