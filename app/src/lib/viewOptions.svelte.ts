@@ -19,9 +19,10 @@ type Saved = {
   compareMode: CompareMode;
   compareLinked: boolean;
   compareFitB: boolean;
+  layersPanel: boolean;
 };
 
-const DEFAULTS: Saved = { navigator: true, rulers: false, extras: true, guides: true, grid: "off", gridPx: 128, pixelGrid: true, compareMode: "side", compareLinked: true, compareFitB: true };
+const DEFAULTS: Saved = { navigator: true, rulers: false, extras: true, guides: true, grid: "off", gridPx: 128, pixelGrid: true, compareMode: "side", compareLinked: true, compareFitB: true, layersPanel: false };
 
 function load(): Saved {
   try {
@@ -49,6 +50,8 @@ class ViewOptions {
   compareMode = $state<CompareMode>(this.s.compareMode);
   compareLinked = $state(this.s.compareLinked);
   compareFitB = $state(this.s.compareFitB);
+  /** layers panel (F7) */
+  layersPanel = $state(this.s.layersPanel);
   /** last grid mode other than "off" (G toggles between it and off) */
   private lastGrid: GridMode = this.s.grid === "off" ? "thirds" : this.s.grid;
 
@@ -59,6 +62,7 @@ class ViewOptions {
           navigator: this.navigator, rulers: this.rulers, extras: this.extras, guides: this.guides,
           grid: this.grid, gridPx: this.gridPx, pixelGrid: this.pixelGrid,
           compareMode: this.compareMode, compareLinked: this.compareLinked, compareFitB: this.compareFitB,
+          layersPanel: this.layersPanel,
         };
         if (v.grid !== "off") this.lastGrid = v.grid;
         try { localStorage.setItem(KEY, JSON.stringify(v)); } catch { /* storage unavailable */ }

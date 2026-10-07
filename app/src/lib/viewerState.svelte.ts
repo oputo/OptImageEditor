@@ -5,7 +5,9 @@
 //   3. the two most recently used other tabs.
 //   (while comparing, image B is kept right after the active image)
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
-import { loadImage, SUPPORTED_EXT, type LoadedImage } from "./loader";
+import { isPsd, loadImage, loadLayers, SUPPORTED_EXT, type LoadedImage } from "./loader";
+import { Compositor, type LayerDoc } from "./compositor";
+import type { DocLayer } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
@@ -38,12 +40,28 @@ export type Tab = {
   guides: Guides;
   /** EXR layer (channel group) shown; reset to 0 when stepping to another file */
   layer: number;
+  /** PSD layers (phase 2-a): loaded on demand when the layers panel is open */
+  layers: LayersState | null;
   loading: boolean;
   error: string | null;
   token: number;
 };
 
 export type Guides = { v: number[]; h: number[] };
+
+/** PSD layer tree of a tab. `useLayers`: show the GPU composite of the layers instead of the composite stored in the file. */
+export type LayersState = {
+  status: "loading" | "ready" | "error";
+  error: string | null;
+  tree: DocLayer[];
+  count: number;
+  useLayers: boolean;
+  selectedId: number | null;
+  /** load / composite timings for the stats panel */
+  stats: { readMs: number; decodeMs: number; uploadMs: number; compositeMs: number; passes: number } | null;
+  /** difference to the stored composite (computed on request) */
+  diff: { max: number; mean: number; over2: number; over8: number } | null;
+};
 
 /** Comparison of the active tab (A) with tab `bId` (B; may be the same tab). */
 export type Compare = { bId: number; mode: CompareMode; linked: boolean; fitB: boolean; split: number; showB: boolean };
@@ -66,6 +84,10 @@ export class ViewerState {
   compare = $state<Compare | null>(null);
 
   renderer: Renderer | undefined;
+  private compositor: Compositor | null = null;
+  /** GPU side of the loaded layer trees, per tab id */
+  private docs = new Map<number, LayerDoc>();
+  private compositePending = new Set<number>();
   private cache = new Map<string, CacheEntry>();
   private inflight = new Map<string, Promise<CacheEntry>>();
   private mru: number[] = [];
@@ -104,7 +126,7 @@ export class ViewerState {
       const id = ++this.seq;
       this.tabs.push({
         id, key: keyOf(path), path, file: null, name: baseName(path),
-        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, loading: false, error: null, token: 0,
+        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, loading: false, error: null, token: 0,
       });
       lastId = id;
       // folder listing in the background (needed for ← / →)
@@ -125,7 +147,7 @@ export class ViewerState {
     const id = ++this.seq;
     this.tabs.push({
       id, key: `file:${id}`, path: null, file, name: file.name,
-      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, loading: false, error: null, token: 0,
+      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, loading: false, error: null, token: 0,
     });
     this.activate(id);
   }
@@ -170,6 +192,7 @@ export class ViewerState {
     if (i < 0) return;
     const [tab] = this.tabs.splice(i, 1);
     tab.token++; // cancel a pending load
+    this.dropLayers(tab);
     if (tab.path) this.closed.push({ path: tab.path });
     if (this.closed.length > 20) this.closed.shift();
     this.mru = this.mru.filter((x) => x !== id);
@@ -212,6 +235,7 @@ export class ViewerState {
     tab.name = baseName(path);
     tab.folderIndex = i;
     tab.layer = 0;
+    this.dropLayers(tab);
     if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
     tab.view = null;
     const entry = this.cache.get(cacheKey(tab));
@@ -247,6 +271,7 @@ export class ViewerState {
     if (e) { this.cache.delete(cacheKey(tab)); this.renderer?.dispose(e.set); this.cacheVersion++; }
     if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
     tab.view = null;
+    this.dropLayers(tab);
     this.loadTab(tab);
   }
 
@@ -311,6 +336,8 @@ export class ViewerState {
     this.renderer.show(entry.set);
     if (tab.view) this.renderer.setView(tab.view);
     else { this.renderer.setOrientation(tab.orient ?? { rotation: 0, flipX: false }); this.renderer.fit(); }
+    const doc = this.docs.get(tab.id);
+    if (tab.layers?.useLayers && doc?.output) this.renderer.show(doc.output);
     this.zoom = this.renderer.scale;
     this.updateTitle();
     this.syncCompare();
@@ -379,6 +406,97 @@ export class ViewerState {
         this.enforceCache();
       }
     }, PREFETCH_DELAY_MS);
+  }
+
+  // ---------------------------------------------------------------- layers (phase 2-a, read only)
+
+  /** Loads the layer tree of a PSD tab (whole file + decode in the worker + GPU upload). */
+  async loadLayers(tab: Tab) {
+    if (tab.layers || !this.renderer || !isPsd(tab.name)) return;
+    const token = tab.token;
+    tab.layers = { status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, stats: null, diff: null };
+    try {
+      const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
+      const data = await loadLayers(src);
+      if (token !== tab.token || !tab.layers || this.tabs.indexOf(tab) < 0) return; // navigated away / closed
+      this.compositor ??= new Compositor(this.renderer);
+      const t0 = performance.now();
+      const doc = this.compositor.upload(data);
+      const uploadMs = performance.now() - t0;
+      this.docs.set(tab.id, doc);
+      this.compositor.render(doc);
+      Object.assign(tab.layers, {
+        status: "ready", tree: data.layers, count: data.count,
+        stats: { readMs: data.readMs, decodeMs: data.decodeMs, uploadMs, compositeMs: doc.lastMs, passes: doc.passes },
+      });
+    } catch (e) {
+      if (tab.layers) Object.assign(tab.layers, { status: "error", error: e instanceof Error ? e.message : String(e) });
+      console.error(e);
+    }
+  }
+
+  /** Frees a tab's layer data (GPU) and goes back to the stored composite. */
+  dropLayers(tab: Tab) {
+    const doc = this.docs.get(tab.id);
+    const wasShown = !!doc?.output && this.renderer?.activeSet === doc.output;
+    if (doc) { this.compositor?.dispose(doc); this.docs.delete(tab.id); }
+    tab.layers = null;
+    if (wasShown && this.activeId === tab.id) {
+      const e = this.cache.get(cacheKey(tab));
+      this.renderer?.show(e?.set ?? null);
+    }
+    if (!this.docs.size) this.compositor?.trim();
+  }
+
+  /** Shows the composite of the layers (true) or the composite stored in the file (false). */
+  setUseLayers(tab: Tab, on: boolean) {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc) return;
+    l.useLayers = on;
+    if (this.activeId !== tab.id || !this.renderer) return;
+    const view = this.renderer.getView();
+    if (on) this.renderer.show(doc.output ?? this.compositor!.render(doc, l.tree));
+    else this.renderer.show(this.cache.get(cacheKey(tab))?.set ?? null);
+    this.renderer.setView(view);
+    this.syncCompare();
+  }
+
+  /** A layer property changed: re-composite (once per frame) and show the layer composite. */
+  layersChanged(tab: Tab) {
+    const l = tab.layers;
+    if (!l || l.status !== "ready") return;
+    l.diff = null;
+    if (!l.useLayers) this.setUseLayers(tab, true);
+    if (this.compositePending.has(tab.id)) return;
+    this.compositePending.add(tab.id);
+    requestAnimationFrame(() => {
+      this.compositePending.delete(tab.id);
+      const doc = this.docs.get(tab.id);
+      if (!doc || !tab.layers) return;
+      this.compositor!.render(doc, tab.layers.tree);
+      if (tab.layers.stats) Object.assign(tab.layers.stats, { compositeMs: doc.lastMs, passes: doc.passes });
+    });
+  }
+
+  /** Compares the layer composite with the composite stored in the file (both 8-bit premultiplied). */
+  diffComposite(tab: Tab) {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    const stored = this.cache.get(cacheKey(tab))?.set;
+    if (!l || !doc?.output || !stored || !this.renderer) return;
+    this.compositor!.render(doc, l.tree);
+    const a = this.renderer.readSet(doc.output), b = this.renderer.readSet(stored);
+    let max = 0, sum = 0, over2 = 0, over8 = 0;
+    const px = a.length / 4;
+    for (let i = 0; i < px; i++) {
+      let m = 0;
+      for (let c = 0; c < 4; c++) { const d = Math.abs(a[i * 4 + c] - b[i * 4 + c]); sum += d; if (d > m) m = d; }
+      if (m > max) max = m;
+      if (m > 2) over2++;
+      if (m > 8) over8++;
+    }
+    l.diff = { max, mean: sum / (px * 4), over2: over2 / px, over8: over8 / px };
   }
 
   // ---------------------------------------------------------------- compare

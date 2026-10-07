@@ -1,6 +1,6 @@
 # OptImageEditor app
 
-Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 1 を実装済み（1-e で EXR / HDR 表示、1-d で比較表示）。1-c でナビゲーター、表示の回転・左右反転、定規、ガイド、グリッド、ピクセルグリッドを追加。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
+Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 2-a（PSD のレイヤーを読み込んで GPU で合成する。ファイルへの書き込みはまだ無い）まで実装済み。フェーズ 1（ビューワー）は完了。1-c でナビゲーター、表示の回転・左右反転、定規、ガイド、グリッド、ピクセルグリッドを追加。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
 
 ## 前提（Windows）
 
@@ -54,6 +54,9 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | EXR / HDR を開く | ステータスバーの「露出」スライダー（−10〜+10 EV、ダブルクリックで 0）。複数のレイヤー（AOV）がある EXR はステータスバーのドロップダウンで切り替え |
 | Ctrl+2 / Ctrl+3〜5 / Ctrl+6 | チャンネル表示: RGB / R・G・B / アルファ（PS と同じ割り当て。ステータスバーのチップをクリックで RGB に戻る） |
 | マウスを画像の上に置く | ステータスバーに座標と画素値（8bit は 0〜255、EXR / HDR は保存されている浮動小数点の値） |
+| F7 / ツールバーの「レイヤー」 | レイヤーパネル。開いている PSD のレイヤーを読み込む（フォルダ送り中は 0.4 秒止まってから）。表示 / 非表示（Alt+クリックでそのレイヤーだけ表示）、描画モード、不透明度、塗り、レイヤーマスクのオン / オフを変えると、レイヤーから合成した画像に切り替わる（ファイルは変更しない） |
+| F4 / パネルの切り替え | 表示する画像: PS がファイルに保存した統合画像 ⇄ このアプリがレイヤーから合成した画像 |
+| パネルの「PS との差を計測」 | 合成結果と PS の統合画像を画素単位で比べる（最大 / 平均 / 差が 2・8 を超える画素の割合） |
 | 「表示」メニュー | 上記の表示設定（設定は localStorage の `oie.view` に保存）、ピクセルグリッド（800% 以上で表示）、ガイドの一括消去 |
 | ≡ メニュー | 最近使ったファイル（20 件、起動画面にも 10 件表示）/ 履歴を消去 /「プログラムから開く」に登録・登録を解除 |
 | 起動時の引数 | `optimageeditor.exe <画像のパス>...` で、その画像を開いて起動する。既に起動している場合は、そのウィンドウに新しいタブで開く（二重起動の防止） |
@@ -78,6 +81,9 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | `src/lib/desktop.ts` | Tauri 連携（ネイティブのドラッグ＆ドロップ、ファイルダイアログ、フォルダ一覧、起動時の引数、ウィンドウタイトル、全画面、二重起動時のファイル受け取り、「プログラムから開く」の登録、確認ダイアログ） |
 | `src-tauri/src/lib.rs` | Rust コマンド: `load_composite_shared`（統合画像を Rust でデコードし、WebView2 の共有メモリで渡す）/ `read_range_shared`（共有メモリでの範囲読み込み）/ `read_range`（IPC、フォールバック用）/ `file_info` / `list_images`（自然順ソート）/ `startup_paths` / `register_open_with`（HKCU に ProgID `OptImageEditor.Image` と各拡張子の `OpenWithProgids` を登録・解除。管理者権限は不要）/ `open_default_apps_settings`。二重起動の防止は `tauri-plugin-single-instance`（2 回目の起動の引数を `oie://open-paths` イベントで送る） |
 | `src-tauri/src/hdr.rs` | EXR（`exr` クレート。読み込みは DWAA / DWAB を含む全圧縮方式、スキャンライン / タイル、マルチパート、f16 / f32 / u32）と Radiance .hdr のデコーダ。半精度浮動小数点の RGBA（リニア、乗算済み）で共有メモリへ渡す（使えない時は IPC で 1 回転送）。EXR のチャンネルは「.」の前の接頭辞でレイヤーにまとめる。テスト: `cargo test --lib hdr` |
+| `src/lib/compositor.ts` | GPU のレイヤー合成。2048px のタイルごとに、レイヤー 1 枚につき 1 回の描画で合成する（RGBA16F の作業バッファ）。全描画モード、マスク、クリッピングマスク、グループ（通過 / 分離）。テキストレイヤーはガンマ 1.45 で合成（PS の「テキストカラーのブレンドにガンマを使用 1.45」に相当、比較から推定） |
+| `src/lib/LayerPanel.svelte` / `psdDoc.ts` | レイヤーパネルと、レイヤーツリーの型。レイヤーの読み込みは ag-psd（ワーカー、埋め込みファイルのデータは読み飛ばす） |
+| `tools/ps_blend_test.jsx` | 描画モードの検証用 PSD を PS で作るスクリプト（ファイル → スクリプト → 参照）。PS の統合画像と、このアプリの合成をセルごとに比べるために使う |
 | `patches/ag-psd+31.0.2.patch` | 未知ブロックを保持する改修（`spike/ag-psd-roundtrip` を参照）。patch-package で自動適用 |
 
 ## 制約（現時点）
@@ -86,6 +92,7 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 - 16 / 32bit の PSD は、表示用に 8bit へ変換する。
 - `.svelte.ts` のモジュール名は、同じフォルダの `.svelte` コンポーネントと大文字小文字違いで重ねない（Windows ではファイル名の大文字小文字を区別しないため、`./lib/viewer.svelte` が `Viewer.svelte` に解決されてしまう）。
 - 「プログラムから開く」の登録は exe の場所を書き込むので、dev ビルドで登録すると `D:\build-cache\OptImageEditor\debug\optimageeditor.exe` が登録される。配布用ビルドに切り替えたら登録し直す。
+- レイヤー合成（2-a）で描画しないもの: レイヤー効果、調整レイヤー、ベクトルマスク、ブレンド条件（Blend If）、ノックアウト。該当レイヤーにはパネルで ⚠ を表示する。16bit / RGB 以外の PSD はレイヤー表示に未対応
 - 比較の「並べる」表示中は定規を隠す。差分表示（|A−B|）は未実装
 - EXR / HDR は GPU 上で RGBA16F（1 画素 8 バイト）として持つ。32bit float は表示用に 16bit float へ変換する（約 65504 を超える値は無限大になる）。表示はリニア → 露出 → sRGB（トーンマップなし）。deep データの EXR は非対応
 - EXR / HDR はデスクトップ版のみ（ブラウザ版はデコーダが無い）

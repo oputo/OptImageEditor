@@ -1,5 +1,6 @@
 // Loads a file source into a renderer-ready image (decoding happens in a Web Worker).
-import type { DecodeRequest, DecodeResult } from "./decoder.worker";
+import type { DecodeRequest, DecodeResult, LayersResult } from "./decoder.worker";
+import type { PsdDocData } from "./psdDoc";
 import type { ImageSource } from "./renderer";
 import { readPsdCompositeOnly } from "./psdSlice";
 import { loadCompositeShared, loadHdr, readTuning, type FileSource, type HdrInfo } from "./source";
@@ -39,7 +40,7 @@ export type LoadOptions = { /** EXR layer (channel group) index */ layer?: numbe
 const worker = new Worker(new URL("./decoder.worker.ts", import.meta.url), { type: "module" });
 let requestId = 0;
 
-function decode(name: string, buffer: ArrayBuffer): Promise<DecodeResult> {
+function decode(name: string, buffer: ArrayBuffer, unmatte = false): Promise<DecodeResult> {
   const id = ++requestId;
   return new Promise((resolve) => {
     const onMsg = (ev: MessageEvent<DecodeResult>) => {
@@ -48,9 +49,29 @@ function decode(name: string, buffer: ArrayBuffer): Promise<DecodeResult> {
       resolve(ev.data);
     };
     worker.addEventListener("message", onMsg);
-    const req: DecodeRequest = { id, name, buffer };
+    const req: DecodeRequest = { id, name, buffer, unmatte };
     worker.postMessage(req, [buffer]);
   });
+}
+
+/** Reads the whole PSD and decodes its layer tree with pixels in the worker (phase 2-a). */
+export async function loadLayers(src: FileSource): Promise<PsdDocData & { readMs: number }> {
+  const t0 = performance.now();
+  const buffer = await src.readAll();
+  const readMs = performance.now() - t0;
+  const id = ++requestId;
+  const res = await new Promise<LayersResult>((resolve) => {
+    const onMsg = (ev: MessageEvent<LayersResult>) => {
+      if (ev.data.id !== id) return;
+      worker.removeEventListener("message", onMsg);
+      resolve(ev.data);
+    };
+    worker.addEventListener("message", onMsg);
+    const req: DecodeRequest = { id, name: src.name, buffer, mode: "layers" };
+    worker.postMessage(req, [buffer]);
+  });
+  if (!res.ok) throw new Error(res.error);
+  return { ...res.doc, readMs };
 }
 
 export async function loadImage(src: FileSource, opts: LoadOptions = {}): Promise<LoadedImage> {
@@ -104,12 +125,14 @@ export async function loadImage(src: FileSource, opts: LoadOptions = {}): Promis
   let buffer: ArrayBuffer;
   let bytesRead = src.size;
   let layerRecords: number | null = null;
+  let unmatte = false;
   if (isPsd(src.name)) {
     try {
       const r = await readPsdCompositeOnly(src);
       buffer = r.buffer;
       bytesRead = r.bytesRead;
       layerRecords = r.layerRecords;
+      unmatte = r.transparent;
     } catch (e) {
       console.warn("partial read failed, reading whole file", e);
       buffer = await src.readAll();
@@ -120,7 +143,7 @@ export async function loadImage(src: FileSource, opts: LoadOptions = {}): Promis
   const readMs = performance.now() - t0;
 
   const t1 = performance.now();
-  const res = await decode(src.name, buffer);
+  const res = await decode(src.name, buffer, unmatte);
   const workerMs = performance.now() - t1;
   if (!res.ok) throw new Error(res.error);
 

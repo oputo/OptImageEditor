@@ -5,10 +5,11 @@
   import Viewer from "./lib/Viewer.svelte";
   import TabBar from "./lib/TabBar.svelte";
   import Navigator from "./lib/Navigator.svelte";
+  import LayerPanel from "./lib/LayerPanel.svelte";
   import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
   import type { ChannelView, CompareMode } from "./lib/renderer";
   import type { Renderer } from "./lib/renderer";
-  import { SUPPORTED_EXT } from "./lib/loader";
+  import { SUPPORTED_EXT, isPsd } from "./lib/loader";
   import { baseName, isTauri, readTuning, READ_MODES, READ_MODE_LABEL } from "./lib/source";
   import {
     confirmDialog, infoDialog, onNativeDrop, onOpenPaths, openDefaultAppsSettings, pickFile,
@@ -60,6 +61,15 @@
 
   const active = $derived(vs.active);
   const meta = $derived(active?.meta ?? null);
+  // layers panel: load the PSD's layers when the panel is open (after 0.4 s on the same image, so that
+  // stepping through a folder with ← / → does not decode every file's layers)
+  $effect(() => {
+    const t = active;
+    const key = t?.key;
+    if (!(opt.layersPanel && t?.meta && !t.layers && isPsd(t.name))) return;
+    const timer = setTimeout(() => { if (vs.active === t && t.key === key) vs.loadLayers(t); }, 400);
+    return () => clearTimeout(timer);
+  });
   const showExposure = $derived(!!(meta?.hdr || (vs.compare && vs.compareTab?.meta?.hdr)));
   const mb = (n: number) => (n / 2 ** 20).toFixed(1) + " MB";
   const ms = (n: number) => n.toFixed(0) + " ms";
@@ -151,6 +161,8 @@
     else if (!ctrl && k === "Home") vs.goTo(0);
     else if (!ctrl && k === "End") vs.goTo((active?.folder.length ?? 1) - 1);
     else if (k === "F11") toggleFullscreen();
+    else if (k === "F7") opt.layersPanel = !opt.layersPanel;
+    else if (k === "F4") { if (active?.layers?.status === "ready") vs.setUseLayers(active, !active.layers.useLayers); }
     else if (k === "F2") showStats = !showStats;
     else if (k === "F3") { readTuning.mode = READ_MODES[(READ_MODES.indexOf(readTuning.mode) + 1) % READ_MODES.length]; readMode = readTuning.mode; showStats = true; }
     else if (k === "F5") vs.reload();
@@ -180,6 +192,10 @@
       `GPU upload  ${ms(meta.uploadMs)}  max tex ${renderer?.maxTextureSize ?? "?"}`,
       `TOTAL       ${meta.fromCache ? "0 ms (from GPU cache)" : ms(meta.totalMs)}`,
       `GPU cache   ${cache.count} images, ${mb(cache.bytes)}`,
+      ...(active.layers?.stats ? [
+        `layers      ${active.layers.count}  read ${ms(active.layers.stats.readMs)}  decode ${ms(active.layers.stats.decodeMs)}  upload ${ms(active.layers.stats.uploadMs)}`,
+        `composite   ${ms(active.layers.stats.compositeMs)}  (${active.layers.stats.passes} passes)  showing ${active.layers.useLayers ? "layers" : "stored composite"}`,
+      ] : []),
       `JS heap     ${(performance as unknown as { memory?: { usedJSHeapSize: number } }).memory ? mb((performance as unknown as { memory: { usedJSHeapSize: number } }).memory.usedJSHeapSize) : "n/a"}`,
     ].join("\n");
   });
@@ -245,6 +261,7 @@
   <button onclick={fit} title="全体表示 (Ctrl+0)">全体</button>
   <button onclick={() => zoomTo(1)} title="100% (Ctrl+1)">100%</button>
   <span class="sep"></span>
+  <button class:active={opt.layersPanel} onclick={() => (opt.layersPanel = !opt.layersPanel)} title="レイヤーパネル (F7)">レイヤー</button>
   <button class:active={!!vs.compare} disabled={!active?.meta && !vs.compare} onclick={() => vs.toggleCompare()} title="比較表示 (C)">比較</button>
   <div class="menu-wrap">
     <button class:active={openMenu === "view"} onclick={() => (openMenu = openMenu === "view" ? null : "view")} title="表示（ナビゲーター / 定規 / ガイド / グリッド / 回転）">表示 ▾</button>
@@ -337,6 +354,7 @@
   </div>
 {/if}
 
+<div class="workspace">
 <main
   class="stage"
   class:drag-over={dragOver}
@@ -376,6 +394,8 @@
     </div>
   {/if}
 </main>
+{#if opt.layersPanel}<LayerPanel {vs} tab={active} />{/if}
+</div>
 
 <footer class="statusbar">
   {#if active && meta}
@@ -499,7 +519,8 @@
   .evv { width: 56px; font-variant-numeric: tabular-nums; color: var(--text); }
   .layer-sel { background: #1e1e1e; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; font: inherit; font-size: 12px; padding: 0 4px; max-width: 220px; }
   .chip { background: #2f4f73; border: 1px solid var(--accent); color: #fff; border-radius: 9px; padding: 0 8px; font-size: 11px; line-height: 16px; }
-  .stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+  .workspace { flex: 1; min-height: 0; display: flex; }
+  .stage { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
   .stage.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }
   .start {
     position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px;

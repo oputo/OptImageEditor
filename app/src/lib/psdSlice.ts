@@ -9,6 +9,9 @@ import type { FileSource } from "./source";
 export type PsdSliceResult = {
   buffer: ArrayBuffer; // minimal PSD: header + color mode + resources + empty layer section + image data
   layerRecords: number | null; // number of layer records (includes group end markers); null if unknown
+  /** negative layer count in the file = the composite has transparency, stored matted against white.
+   *  The rebuilt PSD has no layer section, so the reader must remove the matte itself. */
+  transparent: boolean;
   bytesRead: number;
 };
 
@@ -38,9 +41,14 @@ export async function readPsdCompositeOnly(file: FileSource): Promise<PsdSliceRe
   await ensure(layerLenPos + lenSize * 2 + 2);
   const layerSectionLen = isPsb ? readU64(head, layerLenPos) : readU32(head, layerLenPos);
   let layerRecords: number | null = null;
+  let transparent = false;
   if (layerSectionLen >= lenSize + 2) {
     const layerInfoLen = isPsb ? readU64(head, layerLenPos + lenSize) : readU32(head, layerLenPos + lenSize);
-    if (layerInfoLen > 0) layerRecords = Math.abs(head.getInt16(layerLenPos + lenSize * 2));
+    if (layerInfoLen > 0) {
+      const n = head.getInt16(layerLenPos + lenSize * 2);
+      layerRecords = Math.abs(n);
+      transparent = n < 0;
+    }
   }
   const imageDataPos = layerLenPos + lenSize + layerSectionLen;
   if (imageDataPos > file.size) throw new Error("PSD のセクション長が不正です");
@@ -55,5 +63,5 @@ export async function readPsdCompositeOnly(file: FileSource): Promise<PsdSliceRe
   // layer section length = 0 (bytes already zero)
   out.set(new Uint8Array(imageData), layerLenPos + lenSize);
 
-  return { buffer: out.buffer, layerRecords, bytesRead: layerLenPos + lenSize * 2 + 2 + imageData.byteLength };
+  return { buffer: out.buffer, layerRecords, transparent, bytesRead: layerLenPos + lenSize * 2 + 2 + imageData.byteLength };
 }

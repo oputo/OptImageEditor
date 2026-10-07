@@ -552,6 +552,31 @@ export class Renderer {
     }
   }
 
+  /** Registers textures created elsewhere (the layer compositor) as a TextureSet owned by this renderer. */
+  adopt(s: Omit<TextureSet, "id">): TextureSet {
+    const set: TextureSet = { id: ++setSeq, ...s };
+    this.live.add(set);
+    return set;
+  }
+
+  /** Reads a whole 8-bit image back from the GPU: RGBA, premultiplied, rows top to bottom. */
+  readSet(set: TextureSet): Uint8Array {
+    if (set.hdr) throw new Error("readSet: HDR images are not supported");
+    const gl = this.gl;
+    const out = new Uint8Array(set.width * set.height * 4);
+    const fb = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.pixelStorei(gl.PACK_ROW_LENGTH, set.width);
+    for (const t of set.tiles) {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t.tex, 0);
+      gl.readPixels(0, 0, t.w, t.h, gl.RGBA, gl.UNSIGNED_BYTE, out.subarray((t.y * set.width + t.x) * 4));
+    }
+    gl.pixelStorei(gl.PACK_ROW_LENGTH, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb);
+    return out;
+  }
+
   /** Exposure (EV, HDR images) and channel view. */
   setDisplay(d: Partial<DisplayState>) {
     Object.assign(this.display, d);
