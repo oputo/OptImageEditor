@@ -97,6 +97,8 @@
   function onKey(e: KeyboardEvent) {
     const ctrl = e.ctrlKey || e.metaKey;
     const k = e.key;
+    // letters / digits by physical key: with the Japanese IME on, e.key is "Process" but e.code is still "KeyX" etc.
+    const kk = e.code.startsWith("Key") ? e.code.slice(3).toLowerCase() : e.code.startsWith("Digit") ? e.code.slice(5) : k.length === 1 ? k.toLowerCase() : k;
     // typing in a text / number field: only Ctrl shortcuts and function keys
     const t = e.target as HTMLElement;
     if (((t.tagName === "INPUT" && (t as HTMLInputElement).type !== "checkbox") || t.tagName === "SELECT") && !ctrl && !/^F\d+$/.test(k)) return;
@@ -104,22 +106,22 @@
     const cmp = vs.compare;
     if (k === "Escape" && openMenu) openMenu = null;
     else if (k === "Escape" && cmp) vs.stopCompare();
-    else if (!ctrl && !e.altKey && !e.shiftKey && k.toLowerCase() === "c") { if (active?.meta || cmp) vs.toggleCompare(); }
-    else if (cmp && !ctrl && !e.altKey && (k === "1" || k === "2" || k === "3")) vs.updateCompare({ mode: (["side", "swipe", "toggle"] as const)[Number(k) - 1] });
-    else if (cmp && !ctrl && !e.altKey && k.toLowerCase() === "x") vs.updateCompare({ mode: "toggle", showB: cmp.mode === "toggle" ? !cmp.showB : true });
+    else if (!ctrl && !e.altKey && !e.shiftKey && kk === "c") { if (active?.meta || cmp) vs.toggleCompare(); }
+    else if (cmp && !ctrl && !e.altKey && (kk === "1" || kk === "2" || kk === "3")) vs.updateCompare({ mode: (["side", "swipe", "toggle"] as const)[Number(kk) - 1] });
+    else if (cmp && !ctrl && !e.altKey && kk === "x") vs.updateCompare({ mode: "toggle", showB: cmp.mode === "toggle" ? !cmp.showB : true });
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
-    else if (ctrl && k.toLowerCase() === "r") opt.rulers = !opt.rulers;
-    else if (ctrl && k.toLowerCase() === "h") opt.extras = !opt.extras;
-    else if (!ctrl && !e.altKey && k.toLowerCase() === "n") opt.navigator = !opt.navigator;
-    else if (!ctrl && !e.altKey && !e.shiftKey && k.toLowerCase() === "g") opt.toggleGrid();
-    else if (!ctrl && e.shiftKey && k.toLowerCase() === "h") toggleFlip();
-    else if (!ctrl && (k === "r" || k === "R")) handled = false; // R + drag rotates (handled by the viewer)
+    else if (ctrl && kk === "r") opt.rulers = !opt.rulers;
+    else if (ctrl && kk === "h") opt.extras = !opt.extras;
+    else if (!ctrl && !e.altKey && kk === "n") opt.navigator = !opt.navigator;
+    else if (!ctrl && !e.altKey && !e.shiftKey && kk === "g") opt.toggleGrid();
+    else if (!ctrl && e.shiftKey && kk === "h") toggleFlip();
+    else if (!ctrl && kk === "r") handled = false; // R + drag rotates (handled by the viewer)
     else if (ctrl && k === "Tab") vs.cycle(e.shiftKey ? -1 : 1);
-    else if (ctrl && e.shiftKey && k.toLowerCase() === "t") vs.reopenClosed();
-    else if (ctrl && k.toLowerCase() === "o") openDialog();
-    else if (ctrl && k.toLowerCase() === "w") vs.closeActive();
-    else if (ctrl && k === "0") fit();
-    else if (ctrl && k === "1") zoomTo(1);
+    else if (ctrl && e.shiftKey && kk === "t") vs.reopenClosed();
+    else if (ctrl && kk === "o") openDialog();
+    else if (ctrl && kk === "w") vs.closeActive();
+    else if (ctrl && kk === "0") fit();
+    else if (ctrl && kk === "1") zoomTo(1);
     else if (ctrl && (k === "+" || k === "=" || k === ";")) zoomTo((renderer?.scale ?? 1) * 1.25);
     else if (ctrl && k === "-") zoomTo((renderer?.scale ?? 1) / 1.25);
     else if (!ctrl && (k === "ArrowRight" || k === "PageDown")) vs.step(1);

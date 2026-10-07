@@ -60,11 +60,11 @@
     r.resize();
     const kd = (e: KeyboardEvent) => {
       if (e.code === "Space") spaceDown = true;
-      if ((e.key === "r" || e.key === "R") && !e.ctrlKey && !e.metaKey && !e.altKey) rDown = true;
+      if (e.code === "KeyR" && !e.ctrlKey && !e.metaKey && !e.altKey) rDown = true;
     };
     const ku = (e: KeyboardEvent) => {
       if (e.code === "Space") spaceDown = false;
-      if (e.key === "r" || e.key === "R") rDown = false;
+      if (e.code === "KeyR") rDown = false;
     };
     const blur = () => { spaceDown = false; rDown = false; };
     window.addEventListener("keydown", kd);
