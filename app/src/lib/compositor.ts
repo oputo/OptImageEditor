@@ -12,6 +12,14 @@
 // transparent buffer that is then blended like a layer. Clipping masks: the base layer (with its fill,
 // not its opacity) goes into a transparent buffer, clipped layers are composited "atop" it, and the
 // result is blended with the base's mode and opacity.
+// Formulas checked against Photoshop's own composite of tools/ps_blend_test.jsx (36 cells, PS 27.10):
+// all modes within 0-3 of 255 except dissolve (Photoshop's noise pattern is not reproduced). Findings:
+//  - soft light is the W3C formula; vivid light tests the source extremes first (s = 0 -> 0, s = 1 -> 1)
+//  - hard mix = clamp((b + F*s - F) / (1 - F)) with F = min(fill, 254.5/255) (ties go to the backdrop)
+//  - "special 8" modes (colour / linear burn, colour / linear dodge, vivid / linear light, hard mix,
+//    difference): fill does not scale alpha; it moves the source colour towards the mode's neutral colour
+//    (checked for colour burn, linear dodge, hard mix; the others follow the same rule — inferred)
+//  - clipped layers blend with the base colour as if it were opaque, then take the base's alpha
 // Text layers are blended in a gamma 1.45 space (Photoshop's colour setting "Blend Text Colors Using
 // Gamma 1.45"; inferred from comparing with Photoshop's own composite: mean error 22.9 -> 2.8 on a sample).
 // Layer textures are sampled with texelFetch at integer document px (no filtering).
@@ -49,6 +57,7 @@ uniform int u_mode;
 uniform float u_alpha;            // opacity * fill
 uniform int u_compose;            // 0 = over, 1 = atop (clipped layer), 2 = mix(backdrop, src, alpha * mask)
 uniform float u_gamma;            // 1.0, or 1.45 for text layers
+uniform float u_fill;             // fill ("塗り") for the special modes (others get it through u_alpha)
 out vec4 o;
 
 float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
@@ -67,11 +76,20 @@ vec3 setSat(vec3 c, float s) {
 }
 float dodge(float b, float s) { return b <= 0.0 ? 0.0 : (s >= 1.0 ? 1.0 : min(1.0, b / (1.0 - s))); }
 float burn(float b, float s) { return b >= 1.0 ? 1.0 : (s <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / s)); }
-float softLight(float b, float s) {   // Photoshop's formula (sqrt), not the W3C polynomial
-  return s <= 0.5 ? b - (1.0 - 2.0 * s) * b * (1.0 - b) : b + (2.0 * s - 1.0) * (sqrt(b) - b);
+float softLight(float b, float s) {   // W3C formula (matches Photoshop)
+  float d = b <= 0.25 ? ((16.0 * b - 12.0) * b + 4.0) * b : sqrt(b);
+  return s <= 0.5 ? b - (1.0 - 2.0 * s) * b * (1.0 - b) : b + (2.0 * s - 1.0) * (d - b);
 }
 float hardLight(float b, float s) { return s <= 0.5 ? b * 2.0 * s : 1.0 - (1.0 - b) * (1.0 - (2.0 * s - 1.0)); }
-float vivid(float b, float s) { return s <= 0.5 ? burn(b, 2.0 * s) : dodge(b, 2.0 * (s - 0.5)); }
+float vivid(float b, float s) {
+  if (s <= 0.0) return 0.0;
+  if (s >= 1.0) return 1.0;
+  return s <= 0.5 ? 1.0 - min(1.0, (1.0 - b) / (2.0 * s)) : min(1.0, b / (2.0 * (1.0 - s)));
+}
+float hardMix(float b, float s) {
+  float f = min(u_fill, 254.5 / 255.0);
+  return clamp((b + f * s - f) / (1.0 - f), 0.0, 1.0);
+}
 
 vec3 blend(int m, vec3 b, vec3 s) {
   switch (m) {
@@ -93,7 +111,7 @@ vec3 blend(int m, vec3 b, vec3 s) {
     case 17: return vec3(s.r <= 0.5 ? min(b.r, 2.0 * s.r) : max(b.r, 2.0 * s.r - 1.0),
                          s.g <= 0.5 ? min(b.g, 2.0 * s.g) : max(b.g, 2.0 * s.g - 1.0),
                          s.b <= 0.5 ? min(b.b, 2.0 * s.b) : max(b.b, 2.0 * s.b - 1.0));
-    case 18: return step(1.0, b + s);
+    case 18: return vec3(hardMix(b.r, s.r), hardMix(b.g, s.g), hardMix(b.b, s.b));
     case 19: return abs(b - s);
     case 20: return b + s - 2.0 * b * s;
     case 21: return max(b - s, 0.0);
@@ -138,7 +156,13 @@ void main() {
   vec3 cb = ab > 0.0 ? b.rgb / ab : vec3(0.0);
   vec3 cs = s.rgb;
   if (u_gamma != 1.0) { cb = pow(cb, vec3(u_gamma)); cs = pow(cs, vec3(u_gamma)); }
-  vec3 cs2 = (1.0 - ab) * cs + ab * clamp(blend(u_mode, cb, cs), 0.0, 1.0);
+  // special modes: fill pulls the source towards the neutral colour (hard mix uses u_fill in its formula)
+  if (u_mode == 4 || u_mode == 5) cs = mix(vec3(1.0), cs, u_fill);
+  else if (u_mode == 9 || u_mode == 10 || u_mode == 19) cs = mix(vec3(0.0), cs, u_fill);
+  else if (u_mode == 15 || u_mode == 16) cs = mix(vec3(0.5), cs, u_fill);
+  vec3 bl = clamp(blend(u_mode, cb, cs), 0.0, 1.0);
+  // clipped layers (atop) blend with the base colour as if it were opaque
+  vec3 cs2 = u_compose == 1 ? bl : (1.0 - ab) * cs + ab * bl;
   float ao = u_compose == 1 ? ab : as + ab * (1.0 - as);
   vec3 co = (u_compose == 1 ? as * cs2 * ab : as * cs2) + (1.0 - as) * ab * cb;   // premultiplied
   if (u_gamma != 1.0 && ao > 0.0) co = pow(co / ao, vec3(1.0 / u_gamma)) * ao;
@@ -154,6 +178,11 @@ out vec4 o;
 void main() { o = u_clear ? vec4(0.0) : texelFetch(u_src, ivec2(gl_FragCoord.xy), 0); }`;
 
 type Buf = { tex: WebGLTexture; fb: WebGLFramebuffer };
+
+/** Photoshop's "special 8" modes: fill acts on the colour, not on the alpha */
+const SPECIAL = new Set<LayerBlendMode>(["color burn", "linear burn", "color dodge", "linear dodge", "vivid light", "linear light", "hard mix", "difference"]);
+const fillSplit = (l: DocLayer) =>
+  SPECIAL.has(l.blendMode) ? { alpha: l.opacity, fill: l.fill } : { alpha: l.opacity * l.fill, fill: 1 };
 type GpuLayer = { tex: WebGLTexture | null; mask: WebGLTexture | null };
 
 /** GPU resources of one document. */
@@ -197,7 +226,7 @@ export class Compositor {
     };
     this.passProg = prog(FS_PASS);
     this.copyProg = prog(FS_COPY);
-    for (const n of ["u_back", "u_src", "u_mask", "u_srcIsBuf", "u_srcRect", "u_hasMask", "u_maskRect", "u_maskDefault", "u_origin", "u_mode", "u_alpha", "u_compose", "u_gamma"]) {
+    for (const n of ["u_back", "u_src", "u_mask", "u_srcIsBuf", "u_srcRect", "u_hasMask", "u_maskRect", "u_maskDefault", "u_origin", "u_mode", "u_alpha", "u_compose", "u_gamma", "u_fill"]) {
       this.loc[n] = gl.getUniformLocation(this.passProg, n);
     }
     for (const n of ["u_src", "u_clear"]) this.cloc[n] = gl.getUniformLocation(this.copyProg, n);
@@ -292,13 +321,13 @@ export class Compositor {
   private size: [number, number] = [TILE, TILE];
 
   private clear(): Buf {
+    // gl.clear, not a draw: a draw is rejected ("feedback loop") when the pooled texture is still bound to a unit
     const gl = this.gl;
     const b = this.acquire();
-    gl.useProgram(this.copyProg);
-    gl.uniform1i(this.cloc.u_clear, 1);
     gl.bindFramebuffer(gl.FRAMEBUFFER, b.fb);
     gl.viewport(0, 0, this.size[0], this.size[1]);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
     return b;
   }
 
@@ -318,7 +347,7 @@ export class Compositor {
 
   /** One composite pass; consumes `back` and returns the result buffer. */
   private pass(back: Buf, o: {
-    layer?: DocLayer; buf?: Buf; mode: LayerBlendMode; alpha: number; compose: 0 | 1 | 2; mask?: DocLayer | null;
+    layer?: DocLayer; buf?: Buf; mode: LayerBlendMode; alpha: number; compose: 0 | 1 | 2; mask?: DocLayer | null; fill?: number;
   }): Buf {
     const gl = this.gl;
     const out = this.acquire();
@@ -357,6 +386,7 @@ export class Compositor {
     gl.uniform1f(this.loc.u_alpha, o.alpha);
     gl.uniform1i(this.loc.u_compose, o.compose);
     gl.uniform1f(this.loc.u_gamma, o.layer?.kind === "text" ? TEXT_GAMMA : 1);
+    gl.uniform1f(this.loc.u_fill, o.fill ?? 1);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     this.doc.passes++;
     this.release(back);
@@ -390,7 +420,7 @@ export class Compositor {
         acc = this.pass(acc, { buf: g, mode: node.blendMode, alpha: node.opacity, compose: 0 });
         this.release(g);
       } else if (this.intersects(node)) {
-        acc = this.pass(acc, { layer: node, mode: node.blendMode, alpha: node.opacity * node.fill, compose: 0, mask: node });
+        acc = this.pass(acc, { layer: node, mode: node.blendMode, ...fillSplit(node), compose: 0, mask: node });
       }
     }
     return acc;
@@ -406,7 +436,7 @@ export class Compositor {
       return g;
     }
     if (c.kind === "adjustment" || !this.intersects(c)) return g;
-    return this.pass(g, { layer: c, mode: c.blendMode, alpha: c.opacity * c.fill, compose: 1, mask: c });
+    return this.pass(g, { layer: c, mode: c.blendMode, ...fillSplit(c), compose: 1, mask: c });
   }
 
   private group(node: DocLayer, acc: Buf, clips: DocLayer[]): Buf {
