@@ -1,6 +1,7 @@
 // OptImageEditor — Rust side.
 mod composite;
 mod hdr;
+mod psd_save;
 // File access is done here so the WebView can read byte ranges of large files (PSD composite-only reads)
 // and list sibling images for folder navigation.
 
@@ -261,6 +262,26 @@ async fn write_file(request: tauri::ipc::Request<'_>) -> Result<(), String> {
     std::fs::rename(&tmp, &target).map_err(|e| format!("{}: {e}", target.display()))?;
     eprintln!("write_file {} ({} MB) in {} ms", target.display(), data.len() >> 20, t0.elapsed().as_millis());
     Ok(())
+}
+
+/// Saves an edited PSD / PSB (save method B: layer records rebuilt, channel data copied from the original).
+/// Body: u32 (little endian) JSON length, the JSON `SaveRequest`, then the premultiplied RGBA composite.
+#[tauri::command]
+async fn save_psd(request: tauri::ipc::Request<'_>) -> Result<psd_save::SaveResult, String> {
+    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
+        return Err("raw body expected".into());
+    };
+    if body.len() < 4 { return Err("empty request".into()); }
+    let n = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    if body.len() < 4 + n { return Err("truncated request".into()); }
+    let req: psd_save::SaveRequest = serde_json::from_slice(&body[4..4 + n]).map_err(|e| e.to_string())?;
+    let rgba = &body[4 + n..];
+    let r = psd_save::save(&req, rgba)?;
+    eprintln!(
+        "save_psd {} ({} MB) in {:.0} ms (parse {:.0}, composite {:.0}, write {:.0})",
+        req.dst, r.bytes >> 20, r.ms, r.parse_ms, r.composite_ms, r.write_ms
+    );
+    Ok(r)
 }
 
 /// WebView2 SharedBuffer helper. `post_shared` returns Ok(None) when shared buffers are not available.
@@ -596,6 +617,7 @@ pub fn run() {
             load_hdr,
             take_buffer,
             write_file,
+            save_psd,
             set_close_guard,
             close_ack,
             list_images,

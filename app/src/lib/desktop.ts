@@ -88,6 +88,22 @@ export async function saveDialog(defaultPath: string): Promise<string | null> {
   return r ?? null;
 }
 
+export type SavePsdResult = { bytes: number; ms: number; parseMs: number; compositeMs: number; writeMs: number };
+
+/** Saves an edited PSD / PSB in Rust: layer records rebuilt from `plan`, channel data copied from `src`,
+ *  `rgba` (premultiplied, width x height) as the new composite. */
+export async function savePsd(
+  req: { src: string; dst: string; backup: boolean; width: number; height: number; layerCount: number; plan: unknown },
+  rgba: Uint8Array,
+): Promise<SavePsdResult> {
+  const json = new TextEncoder().encode(JSON.stringify(req));
+  const body = new Uint8Array(4 + json.length + rgba.length);
+  new DataView(body.buffer).setUint32(0, json.length, true);
+  body.set(json, 4);
+  body.set(rgba, 4 + json.length);
+  return invoke<SavePsdResult>("save_psd", body);
+}
+
 /** Writes `data` to `path` (via a temporary file). `backup`: keep the old file as `<path>.bak`. */
 export async function writeFile(path: string, data: ArrayBuffer, backup: boolean) {
   await invoke("write_file", new Uint8Array(data), { headers: { "x-path": encodeURIComponent(path), "x-backup": backup ? "1" : "0" } });

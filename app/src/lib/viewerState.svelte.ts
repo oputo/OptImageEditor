@@ -11,7 +11,7 @@ import { cloneTree, toPlan, type DocLayer } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
-import { confirmDialog, listFolderImages, saveDialog, setWindowTitle, writeFile } from "./desktop";
+import { confirmDialog, listFolderImages, savePsd, saveDialog, setWindowTitle } from "./desktop";
 import { recent } from "./recent.svelte";
 
 export type ImageMeta = Omit<LoadedImage, "image" | "release"> & {
@@ -70,6 +70,8 @@ export type LayersState = {
   savePhase: string | null;
   /** last save: time and size */
   saved: { ms: number; bytes: number; path: string } | null;
+  /** layers (groups included) in the file on disk, in the post-order the source ids refer to */
+  fileCount: number;
 };
 
 /** Undo history of a tab's layer tree (snapshots of the tree; pixels are not edited in 2-b). */
@@ -436,7 +438,7 @@ export class ViewerState {
     const token = tab.token;
     tab.layers = {
       status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, stats: null, diff: null,
-      dirty: false, undoCount: 0, redoCount: 0, saving: false, savePhase: null, saved: null,
+      dirty: false, undoCount: 0, redoCount: 0, saving: false, savePhase: null, saved: null, fileCount: 0,
     };
     try {
       const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
@@ -449,7 +451,7 @@ export class ViewerState {
       this.docs.set(tab.id, doc);
       this.compositor.render(doc);
       Object.assign(tab.layers, {
-        status: "ready", tree: data.layers, count: data.count,
+        status: "ready", tree: data.layers, count: data.count, fileCount: data.count,
         stats: { readMs: data.readMs, decodeMs: data.decodeMs, uploadMs, compositeMs: doc.lastMs, passes: doc.passes },
       });
     } catch (e) {
@@ -744,6 +746,19 @@ export class ViewerState {
     return buffer;
   }
 
+  /** Request for the Rust saver: the edit plan and the GPU composite (premultiplied RGBA). */
+  saveRequest(tab: Tab, src: string, dst: string, backup: boolean) {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc || !this.renderer) throw new Error("レイヤーが読み込まれていません");
+    const set = this.compositor!.render(doc, l.tree);
+    const rgba = this.renderer.readSet(set);
+    const req = {
+      src, dst, backup, width: doc.data.width, height: doc.data.height, layerCount: l.fileCount, plan: toPlan(l.tree),
+    };
+    return { req, rgba: new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength) };
+  }
+
   /** things the compositor does not draw (they are missing from the composite written to the file) */
   private unrendered(tree: DocLayer[]): string[] {
     const out = new Set<string>();
@@ -768,9 +783,9 @@ export class ViewerState {
     l.saving = true;
     try {
       const t0 = performance.now();
-      const buffer = await this.encode(tab, /\.psb$/i.test(target ?? tab.name));
       if (!target) {
-        // browser build: download
+        // browser build: ag-psd in the worker, then download
+        const buffer = await this.encode(tab, /\.psb$/i.test(tab.name));
         const a = document.createElement("a");
         a.href = URL.createObjectURL(new Blob([buffer]));
         a.download = tab.name;
@@ -781,14 +796,19 @@ export class ViewerState {
       }
       const sameFile = keyOf(target) === keyOf(tab.path!);
       const backup = sameFile && !this.backedUp.has(keyOf(target));
-      const tw = performance.now();
-      await writeFile(target, buffer, backup);
-      console.info(`[save] 書き込み: ${(performance.now() - tw).toFixed(0)} ms (${(buffer.byteLength / 2 ** 20).toFixed(0)} MB)`);
+      // desktop: Rust rebuilds the layer records and copies the layers' pixel data from the original file
+      l.savePhase = "統合画像";
+      const { req, rgba } = this.saveRequest(tab, tab.path!, target, backup);
+      l.savePhase = "書き込み";
+      const r = await savePsd(req, rgba);
+      console.info(`[save] total ${(performance.now() - t0).toFixed(0)} ms; Rust ${r.ms.toFixed(0)} ms (parse ${r.parseMs.toFixed(0)}, composite ${r.compositeMs.toFixed(0)}, write ${r.writeMs.toFixed(0)}), ${(r.bytes / 2 ** 20).toFixed(0)} MB`);
+      const buffer = { byteLength: r.bytes };
       if (backup) this.backedUp.add(keyOf(target));
       // the file now holds exactly this tree: renumber the source ids the way the worker reads them (post-order)
       let n = 0;
       const renumber = (ls: DocLayer[]) => { for (const x of ls) { if (x.children) renumber(x.children); x.origId = ++n; x.dup = false; } };
       renumber(l.tree);
+      l.fileCount = n;
       l.dirty = false;
       l.saved = { ms: performance.now() - t0, bytes: buffer.byteLength, path: target };
       if (!sameFile) {
