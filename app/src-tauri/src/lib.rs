@@ -275,8 +275,10 @@ async fn save_psd(request: tauri::ipc::Request<'_>) -> Result<psd_save::SaveResu
     let n = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
     if body.len() < 4 + n { return Err("truncated request".into()); }
     let req: psd_save::SaveRequest = serde_json::from_slice(&body[4..4 + n]).map_err(|e| e.to_string())?;
-    let rgba = &body[4 + n..];
-    let r = psd_save::save(&req, rgba)?;
+    let rest = &body[4 + n..];
+    let size = req.width as usize * req.height as usize * 4;
+    if rest.len() < size { return Err("composite missing".into()); }
+    let r = psd_save::save(&req, &rest[..size], &rest[size..])?;
     eprintln!(
         "save_psd {} ({} MB) in {:.0} ms (parse {:.0}, composite {:.0}, write {:.0})",
         req.dst, r.bytes >> 20, r.ms, r.parse_ms, r.composite_ms, r.write_ms

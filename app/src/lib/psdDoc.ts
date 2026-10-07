@@ -39,6 +39,12 @@ export type DocLayer = {
   origId: number | null;
   /** created by duplicating `origId` (the saved file gets a copy of that layer) */
   dup: boolean;
+  /** pixels made in the app (merge / flatten): saved from the GPU texture, not copied from the file */
+  raster: boolean;
+  /** background layer (no transparency; made by "flatten") */
+  background: boolean;
+  /** lock flags as in the file ("lspf"): LOCK_* bits */
+  locks: number;
   name: string;
   kind: LayerKind;
   hidden: boolean;
@@ -73,6 +79,14 @@ export type PsdDocData = {
   decodeMs: number;
 };
 
+/** lock flags ("lspf"; same bits as Photoshop / psd-tools) */
+export const LOCK_TRANSPARENCY = 0x01;
+export const LOCK_PIXELS = 0x02;
+export const LOCK_POSITION = 0x04;
+export const LOCK_ALL = 0x80000000;
+/** pixels cannot be changed (merge into it is refused) */
+export const pixelsLocked = (l: DocLayer) => (l.locks & (LOCK_PIXELS | LOCK_ALL)) !== 0;
+
 /** Depth-first walk (bottom -> top), children before nothing — callers decide. */
 export function* walkLayers(layers: DocLayer[]): Generator<DocLayer> {
   for (const l of layers) {
@@ -83,6 +97,8 @@ export function* walkLayers(layers: DocLayer[]): Generator<DocLayer> {
 
 /** Serializable description of the layer tree for saving (no pixels; the worker takes them from the file). */
 export type PlanNode = {
+  /** layer id in the app (to find the pixels of raster layers) */
+  id: number;
   origId: number | null;
   dup: boolean;
   group: boolean;
@@ -94,14 +110,18 @@ export type PlanNode = {
   clipping: boolean;
   maskDisabled: boolean | null;
   open: boolean;
+  /** pixels made in the app: index into the pixel blobs sent with the save request (set by the saver) */
+  raster: boolean;
+  background: boolean;
+  locks: number;
   children: PlanNode[] | null;
 };
 
 export function toPlan(layers: DocLayer[]): PlanNode[] {
   return layers.map((l) => ({
-    origId: l.origId, dup: l.dup, group: !!l.children, name: l.name, hidden: l.hidden,
+    id: l.id, origId: l.origId, dup: l.dup, group: !!l.children, name: l.name, hidden: l.hidden,
     opacity: l.opacity, fill: l.fill, blendMode: l.blendMode, clipping: l.clipping,
-    maskDisabled: l.mask ? l.mask.disabled : null, open: l.open,
+    maskDisabled: l.mask ? l.mask.disabled : null, open: l.open, raster: l.raster, background: l.background, locks: l.locks,
     children: l.children ? toPlan(l.children) : null,
   }));
 }
@@ -116,4 +136,23 @@ export function cloneTree(layers: DocLayer[]): DocLayer[] {
     thumb: l.thumb ? { ...l.thumb } : null,
     children: l.children ? cloneTree(l.children) : null,
   }));
+}
+
+/** layer thumbnail size (longest side, px) */
+export const THUMB = 40;
+
+/** Small preview of straight RGBA pixels (nearest neighbour). */
+export function thumbOf(data: Uint8ClampedArray | Uint8Array, w: number, h: number) {
+  if (w <= 0 || h <= 0) return null;
+  const k = Math.min(1, THUMB / Math.max(w, h));
+  const tw = Math.max(1, Math.round(w * k)), th = Math.max(1, Math.round(h * k));
+  const out = new Uint8ClampedArray(tw * th * 4);
+  for (let y = 0; y < th; y++) {
+    const sy = Math.min(h - 1, Math.floor((y + 0.5) / k));
+    for (let x = 0; x < tw; x++) {
+      const sx = Math.min(w - 1, Math.floor((x + 0.5) / k));
+      out.set(data.subarray((sy * w + sx) * 4, (sy * w + sx) * 4 + 4), (y * tw + x) * 4);
+    }
+  }
+  return { w: tw, h: th, data: out };
 }

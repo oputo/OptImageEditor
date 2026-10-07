@@ -167,6 +167,7 @@
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
     else if (ctrl && kk === "z") layerKey((t) => (e.shiftKey ? vs.redo(t) : vs.undo(t)));
     else if (ctrl && kk === "y") layerKey((t) => vs.redo(t));
+    else if (ctrl && !e.altKey && kk === "e") layerKey((t) => { const m = e.shiftKey ? vs.mergeVisible(t) : vs.mergeDown(t); if (m) showToast(m); });
     else if (ctrl && kk === "s") save(e.shiftKey);
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "j") layerKey((t) => vs.duplicate(t));
     else if (ctrl && e.shiftKey && !e.altKey && kk === "n") layerKey((t) => vs.newLayer(t));
@@ -431,7 +432,7 @@
     </div>
   {/if}
 </main>
-{#if opt.layersPanel}<LayerPanel {vs} tab={active} onsave={save} />{/if}
+{#if opt.layersPanel}<LayerPanel {vs} tab={active} onsave={save} onmsg={showToast} />{/if}
 </div>
 
 <footer class="statusbar">

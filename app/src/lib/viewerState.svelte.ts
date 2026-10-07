@@ -7,7 +7,7 @@
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
 import { buildPsd, isPsd, loadImage, loadLayers, SUPPORTED_EXT, type LoadedImage } from "./loader";
 import { Compositor, type LayerDoc } from "./compositor";
-import { cloneTree, toPlan, type DocLayer } from "./psdDoc";
+import { LOCK_ALL, cloneTree, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
@@ -548,6 +548,7 @@ export class ViewerState {
     h.lastKey = key;
     h.lastTime = now;
     mutate(l.tree);
+    if (h.undo.length >= HISTORY_MAX) this.releaseUnused(tab); // the oldest step may have dropped pixel data
     l.dirty = true;
     l.undoCount = h.undo.length;
     l.redoCount = h.redo.length;
@@ -590,7 +591,7 @@ export class ViewerState {
 
   private newLayerData(doc: LayerDoc, name: string, group: boolean): DocLayer {
     return {
-      id: doc.nextId++, origId: null, dup: false, name, kind: group ? "group" : "pixel", hidden: false, opacity: 1, fill: 1,
+      id: doc.nextId++, origId: null, dup: false, raster: false, background: false, locks: 0, name, kind: group ? "group" : "pixel", hidden: false, opacity: 1, fill: 1,
       blendMode: group ? "pass through" : "normal", clipping: false, x: 0, y: 0, w: 0, h: 0, pixels: null, mask: null,
       thumb: null, children: group ? [] : null, open: true, warnings: [],
     };
@@ -685,7 +686,7 @@ export class ViewerState {
   }
 
   /** Changes properties of layer `id` (same `key` within 1 s = one undo step, e.g. while dragging a slider). */
-  updateLayer(tab: Tab, id: number, patch: Partial<Pick<DocLayer, "name" | "hidden" | "opacity" | "fill" | "blendMode" | "clipping" | "open">> & { maskDisabled?: boolean }, key: string | null = null) {
+  updateLayer(tab: Tab, id: number, patch: Partial<Pick<DocLayer, "name" | "hidden" | "opacity" | "fill" | "blendMode" | "clipping" | "open" | "locks">> & { maskDisabled?: boolean }, key: string | null = null) {
     this.edit(tab, key, (tree) => {
       const at = this.locate(tree, id);
       if (!at) return;
@@ -700,6 +701,225 @@ export class ViewerState {
     const l = tab.layers;
     const at = l && this.locate(l.tree, l.selectedId);
     if (at) this.updateLayer(tab, at.node.id, { clipping: !at.node.clipping });
+  }
+
+  // ---------------------------------------------------------------- merge / flatten / locks (phase 2-c)
+
+  /** After a save the file's layers are numbered anew: point the undo / redo snapshots at the new numbers.
+   *  Steps that need a layer which is no longer in the file (deleted before saving) cannot be restored from the
+   *  new file, so they (and everything older) are dropped from the history. */
+  private remapHistory(tab: Tab) {
+    const l = tab.layers;
+    const h = this.histories.get(tab.id);
+    if (!l || !h) return;
+    const now = new Map<number, number>();
+    const index = (ls: DocLayer[]) => { for (const x of ls) { now.set(x.id, x.origId!); if (x.children) index(x.children); } };
+    index(l.tree);
+    const fix = (ls: DocLayer[]): boolean => {
+      let ok = true;
+      for (const x of ls) {
+        const o = now.get(x.id);
+        if (o !== undefined) { x.origId = o; x.dup = false; x.raster = false; }
+        else if (!(x.raster || x.origId === null)) ok = false;
+        if (x.children && !fix(x.children)) ok = false;
+      }
+      return ok;
+    };
+    // newest first: the last element of each stack is the next step
+    for (let i = h.undo.length - 1; i >= 0; i--) if (!fix(h.undo[i])) { h.undo = h.undo.slice(i + 1); break; }
+    for (let i = h.redo.length - 1; i >= 0; i--) if (!fix(h.redo[i])) { h.redo = h.redo.slice(i + 1); break; }
+    l.undoCount = h.undo.length;
+    l.redoCount = h.redo.length;
+    this.releaseUnused(tab);
+  }
+
+  /** Toggles a lock flag of layer `id` (LOCK_ALL replaces the others, as in Photoshop). */
+  toggleLock(tab: Tab, id: number, flag: number) {
+    const at = tab.layers && this.locate(tab.layers.tree, id);
+    if (!at) return;
+    const cur = at.node.locks >>> 0;
+    const next = flag === LOCK_ALL ? (cur & LOCK_ALL ? 0 : LOCK_ALL) : ((cur & ~LOCK_ALL) ^ flag) >>> 0;
+    this.updateLayer(tab, id, { locks: next >>> 0 });
+  }
+
+  /** why `nodes` (their visible parts) cannot be merged: unrendered content would be lost */
+  private mergeBlocker(nodes: DocLayer[]): string | null {
+    for (const n of nodes) {
+      if (n.hidden) continue;
+      if (n.kind === "adjustment") return `調整レイヤー「${n.name}」は合成できないため結合できません`;
+      if (n.warnings.length) return `「${n.name}」: ${n.warnings[0]}。結合すると失われるため結合できません`;
+      if (n.children) { const r = this.mergeBlocker(n.children); if (r) return r; }
+    }
+    return null;
+  }
+
+  /** Renders `layers` (bottom -> top) into a transparent buffer and returns straight RGBA cropped to the
+   *  non-transparent area. `white`: composite over white (flatten), full canvas, opaque. */
+  private rasterize(doc: LayerDoc, layers: DocLayer[], white = false) {
+    const set = this.compositor!.renderSeparate(doc, layers);
+    const p = this.renderer!.readSet(set);
+    this.renderer!.dispose(set);
+    const W = doc.data.width, H = doc.data.height;
+    if (white) {
+      for (let i = 0; i < p.length; i += 4) {
+        const k = 255 - p[i + 3];
+        p[i] += k; p[i + 1] += k; p[i + 2] += k; p[i + 3] = 255;
+      }
+      return { x: 0, y: 0, w: W, h: H, px: p };
+    }
+    let x0 = W, y0 = H, x1 = -1, y1 = -1;
+    for (let y = 0; y < H; y++) {
+      const row = y * W * 4;
+      for (let x = 0; x < W; x++) {
+        if (p[row + x * 4 + 3]) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; y1 = y; }
+      }
+    }
+    if (x1 < 0) return { x: 0, y: 0, w: 0, h: 0, px: new Uint8Array(0) };
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    const px = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const s = ((y + y0) * W + x + x0) * 4, d = (y * w + x) * 4;
+        const a = p[s + 3];
+        if (!a) continue;
+        px[d] = Math.min(255, (p[s] * 255) / a + 0.5);
+        px[d + 1] = Math.min(255, (p[s + 1] * 255) / a + 0.5);
+        px[d + 2] = Math.min(255, (p[s + 2] * 255) / a + 0.5);
+        px[d + 3] = a;
+      }
+    }
+    return { x: x0, y: y0, w, h, px };
+  }
+
+  /** a new layer holding rasterized pixels */
+  private rasterLayer(doc: LayerDoc, name: string, r: { x: number; y: number; w: number; h: number; px: Uint8Array }): DocLayer {
+    const id = doc.nextId++;
+    this.compositor!.setLayerPixels(doc, id, r.px, r.w, r.h);
+    return {
+      id, origId: null, dup: false, raster: true, background: false, locks: 0, name, kind: "pixel", hidden: false,
+      opacity: 1, fill: 1, blendMode: "normal", clipping: false, x: r.x, y: r.y, w: r.w, h: r.h, pixels: null, mask: null,
+      thumb: thumbOf(r.px, r.w, r.h), children: null, open: true, warnings: [],
+    };
+  }
+
+  /** Frees GPU pixel data no longer reachable from the tree or the undo history. */
+  private releaseUnused(tab: Tab) {
+    const doc = this.docs.get(tab.id);
+    const l = tab.layers;
+    if (!doc || !l) return;
+    const keep = new Set<number>();
+    const walk = (ls: DocLayer[]) => { for (const x of ls) { keep.add(x.id); if (x.children) walk(x.children); } };
+    walk(l.tree);
+    const h = this.histories.get(tab.id);
+    if (h) for (const t of [...h.undo, ...h.redo]) walk(t);
+    this.compositor!.releaseUnused(doc, keep);
+  }
+
+  /** Ctrl+E: merges the selected layer into the one below (a selected group: merges the group).
+   *  Returns a message when it cannot. */
+  mergeDown(tab: Tab): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    const at = l && this.locate(l.tree, l.selectedId);
+    if (!l || !doc || !at) return "レイヤーを選択してください";
+    if (at.node.children) return this.mergeGroup(tab);
+    const node = at.node, lower = at.list[at.index - 1];
+    if (!lower) return "下にレイヤーがありません";
+    if (lower.children) return "下のレイヤーがグループのため結合できません";
+    if (lower.hidden) return "下のレイヤーが非表示のため結合できません";
+    if (pixelsLocked(lower) || pixelsLocked(node)) return "ロックされているレイヤーは結合できません";
+    const blocked = this.mergeBlocker([lower, node]);
+    if (blocked) return blocked;
+    // a normal lower layer: the result looks the same as before (normal, 100 %); otherwise the result keeps the
+    // lower layer's blend mode and opacity, with the upper layer merged into its content
+    const keep = lower.blendMode !== "normal";
+    const base: DocLayer = { ...lower, clipping: false, ...(keep ? { blendMode: "normal", opacity: 1 } : {}) };
+    const r = this.rasterize(doc, [base, { ...node }]);
+    const res = this.rasterLayer(doc, lower.name, r);
+    res.clipping = lower.clipping;
+    if (keep) { res.blendMode = lower.blendMode; res.opacity = lower.opacity; }
+    this.edit(tab, null, (tree) => {
+      const a = this.locate(tree, node.id)!;
+      a.list.splice(a.index - 1, 2, res);
+    });
+    l.selectedId = res.id;
+    this.releaseUnused(tab);
+    return null;
+  }
+
+  /** merges the selected group into one layer */
+  mergeGroup(tab: Tab): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    const at = l && this.locate(l.tree, l.selectedId);
+    if (!l || !doc || !at?.node.children) return "グループを選択してください";
+    const g = at.node;
+    if (g.hidden) return "非表示のグループは結合できません";
+    if (pixelsLocked(g)) return "ロックされているグループは結合できません";
+    const blocked = this.mergeBlocker(g.children!);
+    if (blocked) return blocked;
+    const keep = !(g.blendMode === "pass through" || g.blendMode === "normal");
+    const src: DocLayer = { ...g, clipping: false, blendMode: "normal", ...(keep ? { opacity: 1 } : {}) };
+    const r = this.rasterize(doc, [src]);
+    const res = this.rasterLayer(doc, g.name, r);
+    res.clipping = g.clipping;
+    if (keep) { res.blendMode = g.blendMode; res.opacity = g.opacity; }
+    this.edit(tab, null, (tree) => {
+      const a = this.locate(tree, g.id)!;
+      a.list.splice(a.index, 1, res);
+    });
+    l.selectedId = res.id;
+    this.releaseUnused(tab);
+    return null;
+  }
+
+  /** Ctrl+Shift+E: merges all visible layers into one (at the lowest visible layer; hidden layers stay). */
+  mergeVisible(tab: Tab): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || !doc) return null;
+    const visible = l.tree.filter((n) => !n.hidden);
+    if (!visible.length) return "表示されているレイヤーがありません";
+    if (visible.length === 1 && !visible[0].children) return "結合する表示レイヤーがありません";
+    const blocked = this.mergeBlocker(visible);
+    if (blocked) return blocked;
+    const r = this.rasterize(doc, l.tree);
+    const res = this.rasterLayer(doc, visible[0].name, r);
+    this.edit(tab, null, (tree) => {
+      const out: DocLayer[] = [];
+      let placed = false;
+      // hidden layers inside merged groups are kept (moved out of the group)
+      const lift = (n: DocLayer) => { if (n.hidden) out.push(n); else n.children?.forEach(lift); };
+      for (const n of tree) {
+        if (n.hidden) { out.push(n); continue; }
+        if (!placed) { out.push(res); placed = true; }
+        n.children?.forEach(lift);
+      }
+      tree.splice(0, tree.length, ...out);
+    });
+    l.selectedId = res.id;
+    this.releaseUnused(tab);
+    return null;
+  }
+
+  /** Flattens the image into one opaque background layer (transparent areas become white). */
+  async flatten(tab: Tab): Promise<string | null> {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || !doc) return null;
+    const blocked = this.mergeBlocker(l.tree);
+    if (blocked) return blocked;
+    let hidden = false;
+    const walk = (ls: DocLayer[]) => { for (const x of ls) { if (x.hidden) hidden = true; else if (x.children) walk(x.children); } };
+    walk(l.tree);
+    if (hidden && !(await confirmDialog("非表示のレイヤーを破棄して画像を統合しますか？"))) return null;
+    const r = this.rasterize(doc, l.tree, true);
+    const res = this.rasterLayer(doc, "背景", r);
+    res.background = true;
+    this.edit(tab, null, (tree) => { tree.splice(0, tree.length, res); });
+    l.selectedId = res.id;
+    this.releaseUnused(tab);
+    return null;
   }
 
   hasUnsaved(): boolean { return this.tabs.some((t) => t.layers?.dirty); }
@@ -752,11 +972,33 @@ export class ViewerState {
     const doc = this.docs.get(tab.id);
     if (!l || l.status !== "ready" || !doc || !this.renderer) throw new Error("レイヤーが読み込まれていません");
     const set = this.compositor!.render(doc, l.tree);
-    const rgba = this.renderer.readSet(set);
-    const req = {
-      src, dst, backup, width: doc.data.width, height: doc.data.height, layerCount: l.fileCount, plan: toPlan(l.tree),
+    const composite = this.renderer.readSet(set);
+    const plan = toPlan(l.tree);
+    // pixels of layers made in the app, read back from their textures
+    const blobs: Uint8Array[] = [];
+    let offset = 0;
+    const byId = new Map<number, DocLayer>();
+    const walk = (ls: DocLayer[]) => { for (const x of ls) { byId.set(x.id, x); if (x.children) walk(x.children); } };
+    walk(l.tree);
+    const attach = (ns: PlanNode[]) => {
+      for (const n of ns as (PlanNode & { pixels?: unknown })[]) {
+        if (n.raster) {
+          const d = byId.get(n.id)!;
+          const px = this.compositor!.readLayerPixels(doc, d.id, d.w, d.h);
+          n.pixels = { offset, x: d.x, y: d.y, w: d.w, h: d.h };
+          blobs.push(px);
+          offset += px.length;
+        }
+        if (n.children) attach(n.children);
+      }
     };
-    return { req, rgba: new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength) };
+    attach(plan);
+    const req = { src, dst, backup, width: doc.data.width, height: doc.data.height, layerCount: l.fileCount, plan };
+    const rgba = new Uint8Array(composite.length + offset);
+    rgba.set(composite, 0);
+    let o = composite.length;
+    for (const b of blobs) { rgba.set(b, o); o += b.length; }
+    return { req, rgba };
   }
 
   /** things the compositor does not draw (they are missing from the composite written to the file) */
@@ -806,9 +1048,10 @@ export class ViewerState {
       if (backup) this.backedUp.add(keyOf(target));
       // the file now holds exactly this tree: renumber the source ids the way the worker reads them (post-order)
       let n = 0;
-      const renumber = (ls: DocLayer[]) => { for (const x of ls) { if (x.children) renumber(x.children); x.origId = ++n; x.dup = false; } };
+      const renumber = (ls: DocLayer[]) => { for (const x of ls) { if (x.children) renumber(x.children); x.origId = ++n; x.dup = false; x.raster = false; } };
       renumber(l.tree);
       l.fileCount = n;
+      this.remapHistory(tab);
       l.dirty = false;
       l.saved = { ms: performance.now() - t0, bytes: buffer.byteLength, path: target };
       if (!sameFile) {

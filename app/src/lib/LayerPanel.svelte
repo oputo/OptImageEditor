@@ -3,10 +3,26 @@
   // 2-b: every change goes through ViewerState (undo history, dirty flag): new layer / group, duplicate, delete,
   // drag to reorder (pointer events: HTML5 drag & drop does not work in the Windows webview while native file drop is on),
   // double click to rename, clipping mask, save.
-  import { BLEND_LABEL, BLEND_MODES, type DocLayer, type LayerBlendMode } from "./psdDoc";
+  import { BLEND_LABEL, BLEND_MODES, LOCK_ALL, LOCK_PIXELS, LOCK_POSITION, LOCK_TRANSPARENCY, type DocLayer, type LayerBlendMode } from "./psdDoc";
   import type { Tab, ViewerState } from "./viewerState.svelte";
 
-  let { vs, tab, onsave }: { vs: ViewerState; tab: Tab | null; onsave: (saveAs: boolean) => void } = $props();
+  let { vs, tab, onsave, onmsg }: { vs: ViewerState; tab: Tab | null; onsave: (saveAs: boolean) => void; onmsg: (text: string) => void } = $props();
+
+  // merge menu (phase 2-c)
+  let mergeMenu = $state(false);
+  async function merge(kind: "down" | "visible" | "flatten") {
+    mergeMenu = false;
+    if (!tab) return;
+    const m = kind === "down" ? vs.mergeDown(tab) : kind === "visible" ? vs.mergeVisible(tab) : await vs.flatten(tab);
+    if (m) onmsg(m);
+  }
+  const LOCKS = [
+    { flag: LOCK_TRANSPARENCY, icon: "▦", label: "透明部分をロック" },
+    { flag: LOCK_PIXELS, icon: "✎", label: "画像をロック" },
+    { flag: LOCK_POSITION, icon: "✥", label: "位置をロック" },
+    { flag: LOCK_ALL, icon: "🔒", label: "すべてをロック" },
+  ];
+  const hasLock = (l: DocLayer, f: number) => ((l.locks >>> 0) & f) !== 0;
 
   const L = $derived(tab?.layers ?? null);
   type Row = { l: DocLayer; depth: number; clipped: boolean };
@@ -158,6 +174,8 @@
   const kb = (n: number) => (n / 2 ** 20).toFixed(1) + " MB";
 </script>
 
+<svelte:window onmousedown={(e) => { if (mergeMenu && !(e.target as HTMLElement).closest(".mwrap")) mergeMenu = false; }} />
+
 <aside class="panel">
   <header>
     <span class="title">レイヤー</span>
@@ -209,6 +227,7 @@
             <span class="name" title="{l.name}（ダブルクリックで名前を変更）" role="textbox" tabindex="-1" ondblclick={() => startRename(l)}>{l.name}</span>
           {/if}
           {#if KIND_BADGE[l.kind]}<span class="badge">{KIND_BADGE[l.kind]}</span>{/if}
+          {#if l.locks}<span class="lock" title="ロック">{hasLock(l, LOCK_ALL) ? "🔒" : "🔓"}</span>{/if}
           {#if l.warnings.length}<span class="warn" title={l.warnings.join("\n")}>⚠</span>{/if}
           {#if l.blendMode !== "normal" && l.blendMode !== "pass through"}<span class="mode">{BLEND_LABEL[l.blendMode]}</span>{/if}
         </div>
@@ -242,6 +261,12 @@
         {#if !selected.children}
           <label class="prow chk" title="下のレイヤーでクリッピング (Ctrl+Alt+G)"><input type="checkbox" checked={selected.clipping} onchange={(e) => update(selected.id, { clipping: (e.currentTarget as HTMLInputElement).checked })} />クリッピングマスク</label>
         {/if}
+        <div class="prow">
+          <span class="lbl">ロック</span>
+          {#each LOCKS as k (k.flag)}
+            <button class="lk" class:on={hasLock(selected, k.flag)} title={k.label} onclick={() => tab && vs.toggleLock(tab, selected.id, k.flag)}>{k.icon}</button>
+          {/each}
+        </div>
         {#if selected.warnings.length}<div class="pwarn">⚠ {selected.warnings.join(" / ")}</div>{/if}
       </div>
     {/if}
@@ -255,15 +280,28 @@
       <button disabled={!selected} onclick={() => tab && vs.groupSelected(tab)} title="選択レイヤーをグループ化 (Ctrl+G)">G</button>
       <button disabled={!selected} onclick={() => tab && vs.duplicate(tab)} title="複製 (Ctrl+J)">⧉</button>
       <button disabled={!selected} onclick={() => tab && vs.deleteSelected(tab)} title="削除 (Delete)">🗑</button>
-      <span class="spacer"></span>
-      <button class="save" disabled={L.saving} onclick={() => onsave(false)} title={tab?.path ? "上書き保存 (Ctrl+S)。初回は元ファイルを .bak として残します" : "PSD をダウンロード（ブラウザ版）"}>{L.saving ? "保存中…" : "保存"}</button>
-      <button disabled={L.saving || !tab?.path} onclick={() => onsave(true)} title="別名で保存 (Ctrl+Shift+S)">別名…</button>
+      <div class="mwrap">
+        <button class:on={mergeMenu} onclick={() => (mergeMenu = !mergeMenu)} title="結合・統合">結合▾</button>
+        {#if mergeMenu}
+          <div class="mmenu" role="menu">
+            <button role="menuitem" disabled={!selected} onclick={() => merge("down")}>{selected?.children ? "グループを結合" : "下のレイヤーと結合"}<kbd>Ctrl+E</kbd></button>
+            <button role="menuitem" onclick={() => merge("visible")}>表示レイヤーを結合<kbd>Ctrl+Shift+E</kbd></button>
+            <button role="menuitem" onclick={() => merge("flatten")}>画像を統合</button>
+          </div>
+        {/if}
+      </div>
+
     </div>
 
     <footer>
+      <div class="frow">
+        <button onclick={() => tab && vs.diffComposite(tab)} title="レイヤー合成と、ファイルに保存されている PS の統合画像を画素単位で比べる">PS との差を計測</button>
+        <span class="spacer"></span>
+      <button class="save" disabled={L.saving} onclick={() => onsave(false)} title={tab?.path ? "上書き保存 (Ctrl+S)。初回は元ファイルを .bak として残します" : "PSD をダウンロード（ブラウザ版）"}>{L.saving ? "保存中…" : "保存"}</button>
+      <button disabled={L.saving || !tab?.path} onclick={() => onsave(true)} title="別名で保存 (Ctrl+Shift+S)">別名…</button>
+      </div>
       {#if L.saving}<span class="savedinfo">保存中: {L.savePhase ?? "準備"}…</span>{/if}
       {#if L.saved}<span class="savedinfo" title={L.saved.path}>保存 {L.saved.ms.toFixed(0)} ms / {kb(L.saved.bytes)}</span>{/if}
-      <button onclick={() => tab && vs.diffComposite(tab)} title="レイヤー合成と、ファイルに保存されている PS の統合画像を画素単位で比べる">PS との差を計測</button>
       {#if L.diff}
         <span class="diff" class:good={L.diff.max <= 3} title="差（0〜255）: 最大 / 平均 / 差が 2 を超える画素の割合 / 8 を超える画素の割合">
           最大 {L.diff.max}　平均 {L.diff.mean.toFixed(3)}　&gt;2: {(L.diff.over2 * 100).toFixed(2)}%　&gt;8: {(L.diff.over8 * 100).toFixed(2)}%
@@ -317,11 +355,21 @@
   footer { border-top: 1px solid var(--border); padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
   footer button { background: #3a3a3a; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; padding: 2px 8px; font: inherit; cursor: pointer; }
   .dirty { color: #f0c040; font-size: 11px; }
+  .lock { font-size: 10px; flex: none; opacity: 0.8; }
+  .lk { background: #3a3a3a; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; width: 26px; height: 22px; padding: 0; cursor: pointer; font-size: 12px; }
+  .lk.on { background: #2f4f73; border-color: var(--accent); }
+  .mwrap { position: relative; }
+  .mmenu { position: absolute; bottom: 26px; right: 0; z-index: 10; background: #2b2b2b; border: 1px solid #555; border-radius: 4px; padding: 3px; display: flex; flex-direction: column; min-width: 220px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+  .mmenu button { display: flex; justify-content: space-between; gap: 12px; background: transparent; border: none; color: var(--text); text-align: left; padding: 5px 8px; font: inherit; cursor: pointer; border-radius: 3px; }
+  .mmenu button:hover:not(:disabled) { background: #2f4f73; }
+  .mmenu button:disabled { opacity: 0.4; }
+  .mmenu kbd { color: var(--muted); font-size: 10px; font-family: inherit; }
   .tools { display: flex; align-items: center; gap: 3px; padding: 4px 6px; border-top: 1px solid var(--border); }
   .tools button { background: #3a3a3a; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; min-width: 26px; height: 22px; padding: 0 5px; font: inherit; cursor: pointer; }
   .tools button:disabled { opacity: 0.4; cursor: default; }
-  .tools button.save { background: #2f4f73; border-color: var(--accent); color: #fff; }
   .tools .sep { width: 6px; }
+  .frow { display: flex; align-items: center; gap: 4px; align-self: stretch; }
+  footer button.save { background: #2f4f73; border-color: var(--accent); color: #fff; }
   .savedinfo { color: var(--muted); font-size: 11px; }
   .rename { flex: 1; min-width: 0; background: #1e1e1e; color: var(--text); border: 1px solid var(--accent); font: inherit; padding: 1px 3px; }
   .list.dragging { cursor: grabbing; }

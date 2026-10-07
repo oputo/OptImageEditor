@@ -465,18 +465,27 @@ export class Compositor {
   /** Renders the whole document into `doc.output` (created on first use). `layers` defaults to the loaded tree
    *  (pass the UI's reactive tree so property changes are picked up). */
   render(doc: LayerDoc, layers: DocLayer[] = doc.data.layers): TextureSet {
+    const { width: W, height: H } = doc.data;
+    if (!doc.output) doc.output = this.createOutput(W, H);
+    return this.renderInto(doc, layers, doc.output);
+  }
+
+  /** Renders `layers` into a new, transparent document-size TextureSet (merging). Dispose it with renderer.dispose. */
+  renderSeparate(doc: LayerDoc, layers: DocLayer[]): TextureSet {
+    return this.renderInto(doc, layers, this.createOutput(doc.data.width, doc.data.height));
+  }
+
+  private renderInto(doc: LayerDoc, layers: DocLayer[], output: TextureSet): TextureSet {
     const gl = this.gl;
     const t0 = performance.now();
     this.doc = doc;
     doc.passes = 0;
-    const { width: W, height: H } = doc.data;
-    if (!doc.output) doc.output = this.createOutput(W, H);
     // the renderer's samplers would make these textures incomplete for texelFetch
     for (let u = 0; u < 3; u++) gl.bindSampler(u, null);
     gl.disable(gl.SCISSOR_TEST);
     gl.disable(gl.BLEND);
     gl.bindVertexArray(this.vao);
-    for (const t of doc.output.tiles) {
+    for (const t of output.tiles) {
       this.origin = [t.x, t.y];
       this.size = [t.w, t.h];
       let acc = this.clear();
@@ -504,7 +513,50 @@ export class Compositor {
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); // GPU sync for the timing
     doc.lastMs = performance.now() - t0;
     this.renderer.requestDraw();
-    return doc.output;
+    return output;
+  }
+
+  // ---------------------------------------------------------------- pixels made in the app (phase 2-c)
+
+  /** Gives layer `id` new pixels (straight RGBA, w x h; the layer rectangle is on the DocLayer). */
+  setLayerPixels(doc: LayerDoc, id: number, rgba: Uint8Array | Uint8ClampedArray, w: number, h: number) {
+    const gl = this.gl;
+    const g: GpuLayer = { tex: null, mask: null };
+    if (w > 0 && h > 0) {
+      g.tex = this.texture(gl.RGBA8, w, h);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    }
+    doc.gpu.set(id, g);
+  }
+
+  /** Straight RGBA pixels of layer `id` (w x h), read back from its texture. */
+  readLayerPixels(doc: LayerDoc, id: number, w: number, h: number): Uint8Array {
+    const gl = this.gl;
+    const out = new Uint8Array(w * h * 4);
+    const tex = doc.gpu.get(id)?.tex;
+    if (!tex || w <= 0 || h <= 0) return out;
+    const fb = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb);
+    return out;
+  }
+
+  /** Frees the GPU data of layers that are neither in the tree nor in the undo history (`keep`). */
+  releaseUnused(doc: LayerDoc, keep: Set<number>) {
+    const gl = this.gl;
+    const used = new Set<WebGLTexture>();
+    for (const [id, g] of doc.gpu) if (keep.has(id)) { if (g.tex) used.add(g.tex); if (g.mask) used.add(g.mask); }
+    for (const [id, g] of [...doc.gpu]) {
+      if (keep.has(id)) continue;
+      for (const t of [g.tex, g.mask]) if (t && !used.has(t)) { used.add(t); gl.deleteTexture(t); }
+      doc.gpu.delete(id);
+    }
   }
 
   private createOutput(W: number, H: number): TextureSet {

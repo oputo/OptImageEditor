@@ -2,7 +2,7 @@
 // PSD/PSB: ag-psd reads only the stored composite image (layer pixels are skipped -> fast, low memory).
 // PNG/JPG/WebP: decoded by the browser engine via createImageBitmap.
 import { initializeCanvas, readPsd, writePsd, type Layer } from "ag-psd";
-import type { DocLayer, LayerBlendMode, LayerKind, PlanNode, PsdDocData } from "./psdDoc";
+import { thumbOf, type DocLayer, type LayerBlendMode, type LayerKind, type PlanNode, type PsdDocData } from "./psdDoc";
 
 // Workers have no `document`: give ag-psd OffscreenCanvas / ImageData factories.
 initializeCanvas(
@@ -65,22 +65,6 @@ function toRgba8(data: Uint8ClampedArray | Uint16Array | Float32Array | Uint8Arr
 
 // ---------------------------------------------------------------- layers (phase 2-a)
 
-const THUMB = 40;
-
-function thumbOf(data: Uint8ClampedArray, w: number, h: number) {
-  if (w <= 0 || h <= 0) return null;
-  const k = Math.min(1, THUMB / Math.max(w, h));
-  const tw = Math.max(1, Math.round(w * k)), th = Math.max(1, Math.round(h * k));
-  const out = new Uint8ClampedArray(tw * th * 4);
-  for (let y = 0; y < th; y++) {
-    const sy = Math.min(h - 1, Math.floor((y + 0.5) / k));
-    for (let x = 0; x < tw; x++) {
-      const sx = Math.min(w - 1, Math.floor((x + 0.5) / k));
-      out.set(data.subarray((sy * w + sx) * 4, (sy * w + sx) * 4 + 4), (y * tw + x) * 4);
-    }
-  }
-  return { w: tw, h: th, data: out };
-}
 
 function kindOf(l: Layer): LayerKind {
   if (l.children) return "group";
@@ -99,6 +83,12 @@ function effectsEnabled(l: Layer): boolean {
     const list = Array.isArray(v) ? v : [v];
     return list.some((e) => e && (e as { enabled?: boolean }).enabled !== false);
   });
+}
+
+function lockFlags(l: Layer): number {
+  const p = l.protected as (Layer["protected"] & { all?: boolean }) | undefined;
+  if (!p) return 0;
+  return ((p.transparency ? 0x01 : 0) | (p.composite ? 0x02 : 0) | (p.position ? 0x04 : 0) | (p.artboards ? 0x08 : 0) | (p.all ? 0x80000000 : 0)) >>> 0;
 }
 
 function convertLayers(layers: Layer[] | undefined, seq: { n: number }, transfer: ArrayBuffer[]): DocLayer[] {
@@ -140,6 +130,9 @@ function convertLayers(layers: Layer[] | undefined, seq: { n: number }, transfer
       id,
       origId: id,
       dup: false,
+      raster: false,
+      background: false,
+      locks: lockFlags(l),
       name: l.name ?? "",
       kind,
       hidden: !!l.hidden,
@@ -177,6 +170,7 @@ function saveDoc(id: number, buffer: ArrayBuffer, p: SaveParams) {
   };
   const build = (nodes: PlanNode[]): Layer[] => nodes.map((q) => {
     let l: Layer;
+    if (q.raster) throw new Error("ブラウザ版では、結合・統合したレイヤーを含む PSD の保存に未対応です");
     if (q.origId !== null) {
       const src = byId.get(q.origId);
       if (!src) throw new Error(`layer ${q.origId} not found in the file`);

@@ -1,3 +1,23 @@
+diff --git a/node_modules/ag-psd/dist-es/additionalInfo.js b/node_modules/ag-psd/dist-es/additionalInfo.js
+index a12e7da..c81b47d 100644
+--- a/node_modules/ag-psd/dist-es/additionalInfo.js
++++ b/node_modules/ag-psd/dist-es/additionalInfo.js
+@@ -488,11 +488,14 @@ addHandler('lspf', hasKey('protected'), (reader, target) => {
+     };
+     if (flags & 0x08)
+         target.protected.artboards = true;
++    if (flags & 0x80000000)
++        target.protected.all = true; // OptImageEditor: "lock all"
+ }, (writer, target) => {
+     const flags = (target.protected.transparency ? 0x01 : 0) |
+         (target.protected.composite ? 0x02 : 0) |
+         (target.protected.position ? 0x04 : 0) |
+-        (target.protected.artboards ? 0x08 : 0);
++        (target.protected.artboards ? 0x08 : 0) |
++        (target.protected.all ? 0x80000000 : 0);
+     (0, psdWriter_1.writeUint32)(writer, flags);
+ });
+ addHandler('lclr', hasKey('layerColor'), (reader, target) => {
 diff --git a/node_modules/ag-psd/dist-es/psdReader.js b/node_modules/ag-psd/dist-es/psdReader.js
 index 2261784..f51be9c 100644
 --- a/node_modules/ag-psd/dist-es/psdReader.js
@@ -78,6 +98,26 @@ index c57f679..4d34bc1 100644
      for (const handler of additionalInfo_1.infoHandlers) {
          let key = handler.key;
          if (key === 'Txt2' && options.invalidateTextLayers)
+diff --git a/node_modules/ag-psd/dist/additionalInfo.js b/node_modules/ag-psd/dist/additionalInfo.js
+index a12e7da..c81b47d 100644
+--- a/node_modules/ag-psd/dist/additionalInfo.js
++++ b/node_modules/ag-psd/dist/additionalInfo.js
+@@ -488,11 +488,14 @@ addHandler('lspf', hasKey('protected'), (reader, target) => {
+     };
+     if (flags & 0x08)
+         target.protected.artboards = true;
++    if (flags & 0x80000000)
++        target.protected.all = true; // OptImageEditor: "lock all"
+ }, (writer, target) => {
+     const flags = (target.protected.transparency ? 0x01 : 0) |
+         (target.protected.composite ? 0x02 : 0) |
+         (target.protected.position ? 0x04 : 0) |
+-        (target.protected.artboards ? 0x08 : 0);
++        (target.protected.artboards ? 0x08 : 0) |
++        (target.protected.all ? 0x80000000 : 0);
+     (0, psdWriter_1.writeUint32)(writer, flags);
+ });
+ addHandler('lclr', hasKey('layerColor'), (reader, target) => {
 diff --git a/node_modules/ag-psd/dist/psdReader.js b/node_modules/ag-psd/dist/psdReader.js
 index 2261784..f51be9c 100644
 --- a/node_modules/ag-psd/dist/psdReader.js

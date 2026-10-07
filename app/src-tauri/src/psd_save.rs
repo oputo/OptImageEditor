@@ -35,7 +35,28 @@ pub struct PlanNode {
     pub clipping: bool,
     pub mask_disabled: Option<bool>,
     pub open: bool,
+    /// pixels made in the app (merge / flatten): taken from `pixels`, not from the file
+    #[serde(default)]
+    pub raster: bool,
+    /// background layer: no transparency channel
+    #[serde(default)]
+    pub background: bool,
+    /// "lspf" lock flags
+    #[serde(default)]
+    pub locks: u32,
+    #[serde(default)]
+    pub pixels: Option<PixelRef>,
     pub children: Option<Vec<PlanNode>>,
+}
+
+/// Straight RGBA pixels of a raster layer: `w * h * 4` bytes at `offset` in the request's pixel area.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PixelRef {
+    pub offset: u64,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,10 +468,41 @@ fn parse(f: &mut File) -> Result<Source, String> {
 enum Data {
     Copy(u64, u64),
     Empty,
+    /// encoded channel image data (made here)
+    Bytes(Vec<u8>),
+}
+
+/// Channel image data of a raster layer: (channels with their lengths, data), RLE per channel.
+fn encode_layer(px: &[u8], w: usize, h: usize, background: bool, psb: bool) -> (Vec<(i16, u64)>, Vec<u8>) {
+    let ids: &[i16] = if background { &[0, 1, 2] } else { &[-1, 0, 1, 2] };
+    let mut chans = vec![];
+    let mut data = vec![];
+    for &id in ids {
+        let c = if id < 0 { 3 } else { id as usize };
+        let rows: Vec<Vec<u8>> = (0..h)
+            .into_par_iter()
+            .map(|y| {
+                let row: Vec<u8> = px[y * w * 4..(y + 1) * w * 4].chunks_exact(4).map(|p| p[c]).collect();
+                let mut o = Vec::with_capacity(w + w / 64 + 2);
+                pack_bits(&row, &mut o);
+                o
+            })
+            .collect();
+        let start = data.len();
+        data.extend_from_slice(&1u16.to_be_bytes());
+        for r in &rows {
+            if psb { data.extend_from_slice(&(r.len() as u32).to_be_bytes()) } else { data.extend_from_slice(&(r.len() as u16).to_be_bytes()) }
+        }
+        for r in &rows { data.extend_from_slice(r); }
+        chans.push((id, (data.len() - start) as u64));
+    }
+    (chans, data)
 }
 
 struct Builder<'a> {
     src: &'a Source,
+    /// pixel area of the request (raster layers)
+    pixels: &'a [u8],
     /// post-order index (1-based, dividers not counted) -> record index
     by_id: HashMap<u32, usize>,
     /// group record index -> its bounding divider record index
@@ -479,7 +531,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        Ok(Builder { src, by_id, divider_of, next_layer_id: max_id + 1, out: vec![] })
+        Ok(Builder { src, pixels: &[], by_id, divider_of, next_layer_id: max_id + 1, out: vec![] })
     }
 
     fn layer_count(&self) -> u32 { self.by_id.len() as u32 }
@@ -520,6 +572,9 @@ impl<'a> Builder<'a> {
             } else if fill != 255 {
                 rec.set_block(b"iOpa", vec![fill, 0, 0, 0], false);
             }
+        }
+        if q.locks != 0 || rec.block(b"lspf").is_some() {
+            rec.set_block(b"lspf", q.locks.to_be_bytes().to_vec(), false);
         }
         if let Some(d) = q.mask_disabled {
             if rec.mask.len() >= 18 {
@@ -563,6 +618,30 @@ impl<'a> Builder<'a> {
                     let id = self.new_layer_id();
                     rec.set_block(b"lyid", id, false);
                 }
+                self.apply(&mut rec, q)?;
+                self.out.push((rec, data));
+            } else if q.raster {
+                let p = q.pixels.as_ref().ok_or("raster layer without pixels")?;
+                let (w, h) = (p.w as usize, p.h as usize);
+                let start = p.offset as usize;
+                let end = start + w * h * 4;
+                if end > self.pixels.len() { return err("raster layer pixels out of range"); }
+                let mut rec = Record::empty(0x08);
+                let mut rect = [0u8; 16];
+                rect[0..4].copy_from_slice(&p.y.to_be_bytes());
+                rect[4..8].copy_from_slice(&p.x.to_be_bytes());
+                rect[8..12].copy_from_slice(&(p.y + p.h as i32).to_be_bytes());
+                rect[12..16].copy_from_slice(&(p.x + p.w as i32).to_be_bytes());
+                rec.rect = rect;
+                let data = if w > 0 && h > 0 {
+                    let (chans, bytes) = encode_layer(&self.pixels[start..end], w, h, q.background, self.src.psb);
+                    rec.channels = chans;
+                    Data::Bytes(bytes)
+                } else {
+                    Data::Empty
+                };
+                let id = self.new_layer_id();
+                rec.set_block(b"lyid", id, false);
                 self.apply(&mut rec, q)?;
                 self.out.push((rec, data));
             } else {
@@ -752,7 +831,7 @@ fn copy_range(src: &mut File, off: u64, len: u64, w: &mut impl Write) -> Result<
 fn is_psb_path(p: &str) -> bool { p.to_ascii_lowercase().ends_with(".psb") }
 
 /// Writes the edited document to `req.dst` (via `<dst>.tmp`). `rgba`: premultiplied composite, width * height * 4.
-pub fn save(req: &SaveRequest, rgba: &[u8]) -> Result<SaveResult, String> {
+pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult, String> {
     let t0 = std::time::Instant::now();
     let (w, h) = (req.width as usize, req.height as usize);
     if rgba.len() != w * h * 4 { return err(format!("composite size {} != {}x{}x4", rgba.len(), w, h)); }
@@ -768,6 +847,7 @@ pub fn save(req: &SaveRequest, rgba: &[u8]) -> Result<SaveResult, String> {
             return err("PSD と PSB の相互変換は未対応です（拡張子を元と同じにしてください）");
         }
         let mut b = Builder::new(&src)?;
+        b.pixels = pixels;
         if b.layer_count() != req.layer_count {
             return err(format!(
                 "ファイルのレイヤー数（{}）が読み込み時（{}）と違います。読み込んだ後にファイルが変更された可能性があります（F5 で読み直してください）",
@@ -809,7 +889,7 @@ pub fn save(req: &SaveRequest, rgba: &[u8]) -> Result<SaveResult, String> {
         let count = out.len() as i16;
         recs.extend_from_slice(&(if transparency { -count } else { count }).to_be_bytes());
         for (r, _) in &out { serialize_record(r, psb, &mut recs); }
-        let data_len: u64 = out.iter().map(|(r, d)| match d { Data::Copy(_, n) => *n, Data::Empty => r.channels.iter().map(|c| c.1).sum() }).sum();
+        let data_len: u64 = out.iter().map(|(r, d)| match d { Data::Copy(_, n) => *n, Data::Bytes(v) => v.len() as u64, Data::Empty => r.channels.iter().map(|c| c.1).sum() }).sum();
         let mut li_len = recs.len() as u64 + data_len;
         let li_pad = (4 - li_len % 4) % 4;
         li_len += li_pad;
@@ -831,6 +911,7 @@ pub fn save(req: &SaveRequest, rgba: &[u8]) -> Result<SaveResult, String> {
                 for (r, d) in &out {
                     match d {
                         Data::Copy(off, n) => copy_range(&mut f, *off, *n, &mut o)?,
+                        Data::Bytes(v) => wr(&mut o, v)?,
                         Data::Empty => {
                             // each channel: compression 0, no pixels
                             for c in &r.channels { wr(&mut o, &vec![0u8; c.1 as usize])?; }
@@ -902,7 +983,8 @@ mod tests {
         let Ok(dir) = std::env::var("OIE_SAVE_TEST") else { return };
         let req: SaveRequest = serde_json::from_slice(&std::fs::read(format!("{dir}/req.json")).unwrap()).unwrap();
         let rgba = std::fs::read(format!("{dir}/composite.rgba")).unwrap();
-        let r = save(&req, &rgba).unwrap();
+        let n = (req.width * req.height * 4) as usize;
+        let r = save(&req, &rgba[..n], &rgba[n..]).unwrap();
         println!("saved {} bytes in {:.0} ms (parse {:.0}, composite {:.0}, write {:.0})", r.bytes, r.ms, r.parse_ms, r.composite_ms, r.write_ms);
     }
 }
