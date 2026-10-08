@@ -1122,8 +1122,10 @@ export class ViewerState {
       if (backup) this.backedUp.add(keyOf(target));
       // the file now holds exactly this tree: renumber the source ids the way the worker reads them (post-order)
       let n = 0;
-      const renumber = (ls: DocLayer[]) => { for (const x of ls) { if (x.children) renumber(x.children); x.origId = ++n; x.dup = false; x.raster = false; } };
-      renumber(l.tree);
+      const renumber = (ls: DocLayer[]) => { for (const x of ls) { if (x.children) renumber(x.children); x.origId = ++n; x.dup = false; x.raster = false; x.background = false; } };
+      // a flattened image is saved without layer records: its background stays a layer made in the app
+      const flat = l.tree.length === 1 && l.tree[0].background && !l.tree[0].children;
+      if (flat) { l.tree[0].origId = null; l.tree[0].raster = true; } else renumber(l.tree);
       l.fileCount = n;
       this.remapHistory(tab);
       l.dirty = false;

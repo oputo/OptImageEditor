@@ -194,7 +194,12 @@ export class LayerDoc {
   passes = 0;
   /** next id for layers created in the app */
   nextId: number;
-  constructor(readonly data: PsdDocData) { this.nextId = data.count + 1; }
+  constructor(readonly data: PsdDocData) {
+    let max = data.count;
+    const walk = (ls: PsdDocData["layers"]) => { for (const l of ls) { max = Math.max(max, l.id); if (l.children) walk(l.children); } };
+    walk(data.layers);
+    this.nextId = max + 1;
+  }
 }
 
 export class Compositor {

@@ -98,6 +98,10 @@ const PSB_LONG_KEYS: [&[u8; 4]; 13] = [
     b"LMsk", b"Lr16", b"Lr32", b"Layr", b"Mt16", b"Mt32", b"Mtrn", b"Alph", b"FMsk", b"lnk2", b"FEid", b"FXid", b"PxSD",
 ];
 
+/// "Blend if" ranges as Photoshop writes them for an RGB layer: gray + 4 channels, source and destination 0..255
+const DEFAULT_BLEND_RANGES: [u8; 40] = [0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff,
+    0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff];
+
 fn err<T>(s: impl Into<String>) -> Result<T, String> { Err(s.into()) }
 
 pub fn blend_key(mode: &str) -> Result<[u8; 4], String> {
@@ -195,7 +199,7 @@ impl Record {
             clipping: 0,
             flags,
             mask: vec![],
-            blend_ranges: vec![],
+            blend_ranges: DEFAULT_BLEND_RANGES.to_vec(),
             name: vec![],
             blocks: vec![],
             data_off: 0,
@@ -473,8 +477,10 @@ enum Data {
 }
 
 /// Channel image data of a raster layer: (channels with their lengths, data), RLE per channel.
-fn encode_layer(px: &[u8], w: usize, h: usize, background: bool, psb: bool) -> (Vec<(i16, u64)>, Vec<u8>) {
-    let ids: &[i16] = if background { &[0, 1, 2] } else { &[-1, 0, 1, 2] };
+fn encode_layer(px: &[u8], w: usize, h: usize, psb: bool) -> (Vec<(i16, u64)>, Vec<u8>) {
+    // always with a transparency channel: a layer record without one made Photoshop fail to open the file
+    // ("program error"); a background-only document is written without layer records instead (see `save`)
+    let ids: &[i16] = &[-1, 0, 1, 2];
     let mut chans = vec![];
     let mut data = vec![];
     for &id in ids {
@@ -634,7 +640,7 @@ impl<'a> Builder<'a> {
                 rect[12..16].copy_from_slice(&(p.x + p.w as i32).to_be_bytes());
                 rec.rect = rect;
                 let data = if w > 0 && h > 0 {
-                    let (chans, bytes) = encode_layer(&self.pixels[start..end], w, h, q.background, self.src.psb);
+                    let (chans, bytes) = encode_layer(&self.pixels[start..end], w, h, self.src.psb);
                     rec.channels = chans;
                     Data::Bytes(bytes)
                 } else {
@@ -854,14 +860,17 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
                 b.layer_count(), req.layer_count
             ));
         }
-        b.emit(&req.plan)?;
+        // flattened image (one background layer): written like Photoshop writes a document without layers —
+        // no layer records, the background is the composite
+        let flattened = req.plan.len() == 1 && req.plan[0].raster && req.plan[0].background && !req.plan[0].group;
+        if !flattened { b.emit(&req.plan)?; }
         let out = std::mem::take(&mut b.out);
         parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // composite: transparency channel when the old one had it or the new composite is not opaque
         let t1 = std::time::Instant::now();
         let opaque = rgba.par_chunks(4 * 4096).all(|c| c.chunks_exact(4).all(|p| p[3] == 255));
-        let transparency = src.had_transparency || !opaque;
+        let transparency = if flattened { false } else { src.had_transparency || !opaque };
         let extras_from = if src.had_transparency { 4 } else { 3 };
         let mut rows = composite_rows(rgba, w, h, transparency);
         rows.extend(extra_rows(&mut f, &src, extras_from)?);
@@ -890,11 +899,11 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         recs.extend_from_slice(&(if transparency { -count } else { count }).to_be_bytes());
         for (r, _) in &out { serialize_record(r, psb, &mut recs); }
         let data_len: u64 = out.iter().map(|(r, d)| match d { Data::Copy(_, n) => *n, Data::Bytes(v) => v.len() as u64, Data::Empty => r.channels.iter().map(|c| c.1).sum() }).sum();
-        let mut li_len = recs.len() as u64 + data_len;
+        let mut li_len = if out.is_empty() { 0 } else { recs.len() as u64 + data_len };
         let li_pad = (4 - li_len % 4) % 4;
         li_len += li_pad;
         let tagged_len = src.tagged.1 - src.tagged.0;
-        let lm_len = if out.is_empty() && src.records.is_empty() && src.global_mask.is_empty() && tagged_len == 0 {
+        let lm_len = if flattened || (out.is_empty() && src.records.is_empty() && src.global_mask.is_empty() && tagged_len == 0) {
             0
         } else {
             l + li_len + 4 + src.global_mask.len() as u64 + tagged_len

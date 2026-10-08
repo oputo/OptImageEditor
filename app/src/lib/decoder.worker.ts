@@ -217,6 +217,24 @@ function readLayers(id: number, buffer: ArrayBuffer) {
   const transfer: ArrayBuffer[] = [];
   const seq = { n: 0 };
   const layers = convertLayers(psd.children, seq, transfer);
+  if (!layers.length) {
+    // a document without layers (flattened): its composite is the background layer. It is not a layer of the
+    // file (count stays 0), so it is saved from its pixels ("raster")
+    const full = readPsd(buffer, { skipLayerImageData: true, skipThumbnail: true, skipLinkedFilesData: true, useImageData: true });
+    const img = full.imageData;
+    if (img) {
+      const px = toRgba8(img.data as Uint8ClampedArray, psd.width, psd.height);
+      for (let i = 3; i < px.length; i += 4) px[i] = 255; // a background is opaque
+      const thumb = thumbOf(px, psd.width, psd.height);
+      transfer.push(px.buffer as ArrayBuffer);
+      if (thumb) transfer.push(thumb.data.buffer as ArrayBuffer);
+      layers.push({
+        id: 1, origId: null, dup: false, raster: true, background: true, locks: 0, name: "背景", kind: "pixel",
+        hidden: false, opacity: 1, fill: 1, blendMode: "normal", clipping: false, x: 0, y: 0, w: psd.width, h: psd.height,
+        pixels: px, mask: null, thumb, children: null, open: true, warnings: [],
+      });
+    }
+  }
   const doc: PsdDocData = { width: psd.width, height: psd.height, bitsPerChannel: bits, layers, count: seq.n, decodeMs: performance.now() - t0 };
   const res: LayersResult = { id, ok: true, doc };
   (self as unknown as Worker).postMessage(res, transfer);
