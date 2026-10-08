@@ -82,9 +82,12 @@ export async function infoDialog(text: string, title = "OptImageEditor") {
 }
 
 /** "Save as" dialog; null when cancelled (or not in the desktop app). */
-export async function saveDialog(defaultPath: string): Promise<string | null> {
+export async function saveDialog(
+  defaultPath: string,
+  filters: { name: string; extensions: string[] }[] = [{ name: "Photoshop", extensions: ["psd", "psb"] }],
+): Promise<string | null> {
   if (!isTauri()) return null;
-  const r = await save({ defaultPath, filters: [{ name: "Photoshop", extensions: ["psd", "psb"] }] });
+  const r = await save({ defaultPath, filters });
   return r ?? null;
 }
 
@@ -102,6 +105,18 @@ export async function savePsd(
   body.set(json, 4);
   body.set(rgba, 4 + json.length);
   return invoke<SavePsdResult>("save_psd", body);
+}
+
+/** Clipboard image through Rust (when navigator.clipboard.write is refused). False outside the desktop app. */
+export async function copyImageFallback(w: number, h: number, rgba: Uint8ClampedArray): Promise<boolean> {
+  if (!isTauri()) return false;
+  const body = new Uint8Array(8 + rgba.length);
+  const dv = new DataView(body.buffer);
+  dv.setUint32(0, w, true);
+  dv.setUint32(4, h, true);
+  body.set(rgba, 8);
+  await invoke("copy_image", body);
+  return true;
 }
 
 /** Writes `data` to `path` (via a temporary file). `backup`: keep the old file as `<path>.bak`. */

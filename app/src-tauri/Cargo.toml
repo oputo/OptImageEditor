@@ -26,6 +26,8 @@ rayon = "1"
 # OpenEXR (all compressions incl. DWAA/DWAB for reading) and half floats for the GPU upload
 exr = "1.74"
 half = "2"
+# clipboard image (fallback when the WebView refuses navigator.clipboard.write)
+arboard = { version = "3", default-features = false, features = ["image-data"] }
 
 
 # Windows only: WebView2 SharedBuffer (zero-copy file reads). Versions must match the ones used by tauri/wry.

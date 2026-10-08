@@ -11,8 +11,9 @@ import { LOCK_ALL, cloneTree, pixelsLocked, thumbOf, toPlan, type DocLayer, type
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
-import { confirmDialog, listFolderImages, savePsd, saveDialog, setWindowTitle } from "./desktop";
+import { confirmDialog, copyImageFallback, listFolderImages, savePsd, saveDialog, setWindowTitle, writeFile } from "./desktop";
 import { recent } from "./recent.svelte";
+import { Annotations, flattenToPng } from "./annotations.svelte";
 
 export type ImageMeta = Omit<LoadedImage, "image" | "release"> & {
   uploadMs: number;
@@ -42,6 +43,8 @@ export type Tab = {
   layer: number;
   /** PSD layers (phase 2-a): loaded on demand when the layers panel is open */
   layers: LayersState | null;
+  /** annotations drawn over the image (reset when the tab shows another file) */
+  annot: Annotations;
   loading: boolean;
   error: string | null;
   token: number;
@@ -146,7 +149,7 @@ export class ViewerState {
       const id = ++this.seq;
       this.tabs.push({
         id, key: keyOf(path), path, file: null, name: baseName(path),
-        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, loading: false, error: null, token: 0,
+        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, annot: new Annotations(), loading: false, error: null, token: 0,
       });
       lastId = id;
       // folder listing in the background (needed for ← / →)
@@ -167,7 +170,7 @@ export class ViewerState {
     const id = ++this.seq;
     this.tabs.push({
       id, key: `file:${id}`, path: null, file, name: file.name,
-      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, loading: false, error: null, token: 0,
+      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, annot: new Annotations(), loading: false, error: null, token: 0,
     });
     this.activate(id);
   }
@@ -257,6 +260,7 @@ export class ViewerState {
     tab.name = baseName(path);
     tab.folderIndex = i;
     tab.layer = 0;
+    tab.annot = new Annotations();
     this.dropLayers(tab);
     if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
     tab.view = null;
@@ -920,6 +924,76 @@ export class ViewerState {
     l.selectedId = res.id;
     this.releaseUnused(tab);
     return null;
+  }
+
+  // ---------------------------------------------------------------- annotations
+
+  /** Opens an image from the clipboard (pasted) in a new tab. */
+  private pasteSeq = 0;
+  openPasted(blob: Blob) {
+    const n = ++this.pasteSeq;
+    this.openFile(new File([blob], `クリップボード ${n}.png`, { type: blob.type || "image/png" }));
+  }
+
+  /** The active tab's image as shown (layer composite or stored composite) with its annotations, as PNG. */
+  private annotatedPng(): { blob: Promise<Blob>; w: number; h: number; tab: Tab } {
+    const tab = this.active;
+    const r = this.renderer;
+    const set = r?.activeSet;
+    if (!tab || !r || !set) throw new Error("画像がありません");
+    if (set.hdr) throw new Error("EXR / HDR の注釈付き書き出しは未対応です");
+    const px = r.readSet(set);
+    return { blob: flattenToPng(px, set.width, set.height, tab.annot.shapes), w: set.width, h: set.height, tab };
+  }
+
+  /** Ctrl+Shift+C: copies the image with its annotations to the clipboard. Call from the key / click handler
+   *  (the clipboard needs the user's gesture; the PNG is encoded while the write is pending). */
+  async copyAnnotated(): Promise<void> {
+    const { blob, w, h } = this.annotatedPng();
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    } catch (e) {
+      // WebView refused (permission / no user gesture): put it on the clipboard from Rust
+      console.warn("navigator.clipboard.write failed, using the native clipboard", e);
+      const bmp = await createImageBitmap(await blob);
+      const c = new OffscreenCanvas(w, h);
+      const ctx = c.getContext("2d")!;
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close();
+      const ok = await copyImageFallback(w, h, ctx.getImageData(0, 0, w, h).data);
+      if (!ok) throw e;
+    }
+  }
+
+  /** Saves the image with its annotations as PNG: next to the original as `<name>_注釈.png` (a free number is
+   *  appended when it exists); images without a file (pasted) ask where. Returns the path, or null. */
+  async saveAnnotatedPng(): Promise<string | null> {
+    const { blob, tab } = this.annotatedPng();
+    const stem = tab.name.replace(/\.[^.]+$/, "");
+    let target: string | null = null;
+    if (tab.path) {
+      const dir = tab.path.slice(0, Math.max(tab.path.lastIndexOf("\\"), tab.path.lastIndexOf("/")) + 1);
+      for (let i = 1; i < 1000 && !target; i++) {
+        const p = `${dir}${stem}_注釈${i > 1 ? i : ""}.png`;
+        try { await TauriFileSource.open(p); } catch { target = p; } // does not exist yet
+      }
+    } else {
+      target = await saveDialog(`${stem}_注釈.png`, [{ name: "PNG", extensions: ["png"] }]);
+    }
+    const data = await (await blob).arrayBuffer();
+    if (!target) {
+      if (tab.path) return null;
+      // browser build: download
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([data], { type: "image/png" }));
+      a.download = `${stem}_注釈.png`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      return a.download;
+    }
+    await writeFile(target, data, false);
+    recent.add(target);
+    return target;
   }
 
   hasUnsaved(): boolean { return this.tabs.some((t) => t.layers?.dirty); }

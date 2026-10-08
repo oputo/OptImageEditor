@@ -286,6 +286,22 @@ async fn save_psd(request: tauri::ipc::Request<'_>) -> Result<psd_save::SaveResu
     Ok(r)
 }
 
+/// Puts an image on the clipboard (fallback for navigator.clipboard.write).
+/// Body: u32 width, u32 height (little endian), then straight RGBA.
+#[tauri::command]
+async fn copy_image(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
+        return Err("raw body expected".into());
+    };
+    if body.len() < 8 { return Err("empty request".into()); }
+    let w = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let h = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    if body.len() != 8 + w * h * 4 { return Err("bad image size".into()); }
+    let img = arboard::ImageData { width: w, height: h, bytes: std::borrow::Cow::Borrowed(&body[8..]) };
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_image(img).map_err(|e| e.to_string())
+}
+
 /// WebView2 SharedBuffer helper. `post_shared` returns Ok(None) when shared buffers are not available.
 #[cfg(windows)]
 mod shared {
@@ -620,6 +636,7 @@ pub fn run() {
             take_buffer,
             write_file,
             save_psd,
+            copy_image,
             set_close_guard,
             close_ack,
             list_images,

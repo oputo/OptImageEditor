@@ -7,10 +7,16 @@
   import { Renderer, applyInverse, type Affine, type Pane, type View } from "./renderer";
   import { viewOptions as opt } from "./viewOptions.svelte";
   import type { Guides } from "./viewerState.svelte";
+  import {
+    FONT_SIZES, WIDTHS, annotTool, constrain, drawSelection, drawShape, shapeAt, translate,
+    type Annotations, type Shape,
+  } from "./annotations.svelte";
 
-  let { renderer = $bindable(), guides = null, labels = null, oncursor, onsplit }: {
+  let { renderer = $bindable(), guides = null, annot = null, labels = null, oncursor, onsplit }: {
     renderer?: Renderer;
     guides?: Guides | null;
+    /** annotations of the shown image (drawn and edited while an annotation tool is active) */
+    annot?: Annotations | null;
     /** names shown on the panes while comparing */
     labels?: { a: string; b: string } | null;
     /** image px (of image A) under the mouse (null when outside the canvas) */
@@ -39,11 +45,17 @@
     | { kind: "pan"; view: View; x: number; y: number }
     | { kind: "rotate"; view: View; cx: number; cy: number; start: number; startRot: number }
     | { kind: "guide"; axis: "v" | "h"; index: number }
-    | { kind: "split" };
+    | { kind: "split" }
+    | { kind: "draw"; shape: Shape; x0: number; y0: number }
+    | { kind: "move"; shape: Shape; x: number; y: number; moved: boolean };
   let drag: Drag | null = null;
   let hot: { axis: "v" | "h"; index: number } | null = $state(null); // guide under the mouse / being dragged
 
   const showRulers = $derived(opt.rulers && hasImage && !rotated && !sideBySide);
+  /** annotation tool in use (not while comparing) */
+  const annotating = () => !!annot && !!annotTool.tool && !renderer?.compare;
+  /** text being typed: position in css px and image px */
+  let textEdit = $state<{ cx: number; cy: number; ix: number; iy: number; size: number; color: string; value: string; replace: Shape | null } | null>(null);
   const guidesOn = () => opt.extras && opt.guides && !!guides;
 
   onMount(() => {
@@ -85,6 +97,9 @@
     void [opt.extras, opt.guides, opt.grid, opt.gridPx, opt.pixelGrid, opt.rulers, showRulers, hot];
     void (guides && [guides.v.length, guides.h.length, ...guides.v, ...guides.h]);
     void (labels && [labels.a, labels.b]);
+    void annot?.version;
+    void annot?.selected;
+    void annotTool.tool;
     renderer?.requestDraw();
   });
 
@@ -109,12 +124,23 @@
     if (!r.hasImage) return;
     const panes = r.panes();
     if (opt.extras) for (const p of panes) drawExtras(ctx, p, dpr, r.imageWidth, r.imageHeight);
+    if (annot && !r.compare && panes.length) drawAnnotations(ctx, panes[0], dpr);
     if (r.compare) drawCompareChrome(ctx, r, panes, dpr);
     if (showRulers) drawRulers(r, dpr);
   }
 
   const setMatrix = (ctx: CanvasRenderingContext2D, m: Affine, dpr: number) =>
     ctx.setTransform(dpr * m[0], dpr * m[3], dpr * m[1], dpr * m[4], dpr * m[2], dpr * m[5]);
+
+  function drawAnnotations(ctx: CanvasRenderingContext2D, p: Pane, dpr: number) {
+    ctx.save();
+    setMatrix(ctx, p.matrix, dpr);
+    for (const s of annot!.shapes) drawShape(ctx, s);
+    if (drag?.kind === "draw") drawShape(ctx, drag.shape);
+    const sel = drag?.kind === "move" ? drag.shape : annot!.shapes.find((s) => s.id === annot!.selected);
+    if (sel && annotTool.tool === "select") drawSelection(ctx, sel, 1 / p.view.scale);
+    ctx.restore();
+  }
 
   /** Bounding box (in the matrix's source space) of the pane rectangle. */
   function visibleBox(m: Affine, p: Pane) {
@@ -352,7 +378,10 @@
     const [cx, cy] = local(e);
     const pane = r.paneAt(cx, cy);
     if (!pane) return;
-    if (e.button === 0 && rDown) {
+    if (e.button === 0 && !rDown && !spaceDown && annotating()) {
+      e.preventDefault(); // no focus change: a text box opened here keeps the focus
+      if (!annotDown(e, cx, cy, pane)) return;
+    } else if (e.button === 0 && rDown) {
       const pcx = pane.ox + pane.view.vw / 2, pcy = pane.oy + pane.view.vh / 2;
       drag = { kind: "rotate", view: pane.view, cx: pcx, cy: pcy, start: Math.atan2(cy - pcy, cx - pcx), startRot: pane.view.rotation };
     } else if (e.button === 0 && !spaceDown && onSplitHandle(cx)) {
@@ -369,6 +398,98 @@
     canvas.setPointerCapture(e.pointerId);
     e.preventDefault();
     updateCursor(cx, cy);
+  }
+
+  /** Starts drawing / selecting with the annotation tool. Returns false when nothing needs a pointer capture. */
+  function annotDown(e: PointerEvent, cx: number, cy: number, pane: Pane): boolean {
+    const a = annot!;
+    const [ix, iy] = applyInverse(pane.matrix, cx, cy);
+    const px = 1 / pane.view.scale; // image px per css px
+    const tool = annotTool.tool!;
+    if (textEdit) { commitText(); return false; }
+    if (tool === "select") {
+      const s = shapeAt(a.shapes, ix, iy, 6 * px);
+      a.selected = s?.id ?? null;
+      if (!s) return false;
+      if (e.detail >= 2 && s.kind === "text") { editText(s, pane); return false; }
+      drag = { kind: "move", shape: s, x: ix, y: iy, moved: false };
+      return true;
+    }
+    if (tool === "text") {
+      const s = shapeAt(a.shapes.filter((x) => x.kind === "text"), ix, iy, 2 * px);
+      if (s) { editText(s, pane); return false; }
+      const size = FONT_SIZES[annotTool.widthIndex];
+      textEdit = { cx, cy: cy - size * 0.1, ix, iy, size: size * px, color: annotTool.color, value: "", replace: null };
+      return false;
+    }
+    a.selected = null;
+    const shape: Shape = {
+      id: a.nextId(), kind: tool, color: annotTool.color, width: WIDTHS[annotTool.widthIndex] * px,
+      pts: tool === "pen" ? [ix, iy] : [ix, iy, ix, iy],
+    };
+    drag = { kind: "draw", shape, x0: ix, y0: iy };
+    return true;
+  }
+
+  function annotMove(e: PointerEvent, cx: number, cy: number) {
+    const pane = renderer?.panes()[0];
+    if (!pane || !drag) return;
+    const [ix, iy] = applyInverse(pane.matrix, cx, cy);
+    if (drag.kind === "draw") {
+      const s = drag.shape;
+      if (s.kind === "pen") {
+        const n = s.pts.length;
+        if (Math.hypot(ix - s.pts[n - 2], iy - s.pts[n - 1]) * pane.view.scale >= 1.5) s.pts = [...s.pts, ix, iy];
+      } else {
+        const [x, y] = e.shiftKey ? constrain(s.kind, drag.x0, drag.y0, ix, iy) : [ix, iy];
+        s.pts = [drag.x0, drag.y0, x, y];
+      }
+    } else if (drag.kind === "move") {
+      drag.shape = translate(drag.shape, ix - drag.x, iy - drag.y);
+      drag.x = ix;
+      drag.y = iy;
+      drag.moved = true;
+    }
+    renderer?.requestDraw();
+  }
+
+  function annotUp() {
+    const a = annot;
+    if (!a || !drag) return;
+    if (drag.kind === "draw") {
+      const s = drag.shape;
+      const p = s.pts;
+      const tiny = s.kind !== "pen" && Math.hypot(p[2] - p[0], p[3] - p[1]) * (renderer?.panes()[0]?.view.scale ?? 1) < 3;
+      if (!tiny) a.add(s);
+    } else if (drag.kind === "move" && drag.moved) {
+      a.replace(drag.shape);
+    }
+  }
+
+  // ---- text
+
+  function editText(s: Shape, pane: Pane) {
+    const [cx, cy] = [pane.matrix[0] * s.pts[0] + pane.matrix[1] * s.pts[1] + pane.matrix[2], pane.matrix[3] * s.pts[0] + pane.matrix[4] * s.pts[1] + pane.matrix[5]];
+    textEdit = { cx, cy, ix: s.pts[0], iy: s.pts[1], size: s.size ?? 24, color: s.color, value: s.text ?? "", replace: s };
+  }
+
+  function commitText() {
+    const t = textEdit;
+    const a = annot;
+    textEdit = null;
+    if (!t || !a) return;
+    const text = t.value.replace(/\s+$/, "");
+    if (t.replace) {
+      if (!text) a.remove(t.replace.id);
+      else if (text !== t.replace.text) a.replace({ ...t.replace, text });
+      return;
+    }
+    if (!text) return;
+    a.add({ id: a.nextId(), kind: "text", color: t.color, width: t.size / 8, pts: [t.ix, t.iy], text, size: t.size });
+  }
+
+  function focusText(el: HTMLTextAreaElement) {
+    queueMicrotask(() => { el.focus(); el.select(); });
   }
 
   /** New guide dragged out of a ruler (top ruler: horizontal guide, left ruler: vertical guide). */
@@ -390,7 +511,9 @@
     if (!r) return;
     const [cx, cy] = local(e);
     mouse = [cx, cy];
-    if (drag?.kind === "pan") {
+    if (drag?.kind === "draw" || drag?.kind === "move") {
+      annotMove(e, cx, cy);
+    } else if (drag?.kind === "pan") {
       drag.view.panBy(e.clientX - drag.x, e.clientY - drag.y);
       drag.x = e.clientX;
       drag.y = e.clientY;
@@ -424,6 +547,7 @@
       if (outside || onRuler) guides[drag.axis].splice(drag.index, 1);
       hot = null;
     }
+    if (drag?.kind === "draw" || drag?.kind === "move") annotUp();
     drag = null;
     const [cx, cy] = local(e);
     updateCursor(cx, cy);
@@ -439,6 +563,16 @@
 
   function updateCursor(cx: number, cy: number) {
     if (drag?.kind === "pan") { cursorClass = "grabbing"; return; }
+    if (annotating() && !spaceDown && !rDown) {
+      const t = annotTool.tool;
+      if (t === "select") {
+        const pk = pick(cx, cy);
+        cursorClass = drag?.kind === "move" || (pk && annot && shapeAt(annot.shapes, pk.ix, pk.iy, 6 / pk.pane.view.scale)) ? "move" : "";
+      } else {
+        cursorClass = t === "text" ? "text" : "draw";
+      }
+      return;
+    }
     if (drag?.kind === "rotate" || rDown) { cursorClass = "rotate"; return; }
     if (drag?.kind === "guide") { cursorClass = drag.axis === "v" ? "col" : "row"; return; }
     if (drag?.kind === "split" || (!spaceDown && onSplitHandle(cx))) { cursorClass = "col"; return; }
@@ -466,6 +600,19 @@
     onpointerleave={onLeave}
   ></canvas>
   <canvas bind:this={overlay} class="overlay"></canvas>
+  {#if textEdit}
+    {@const scale = renderer?.panes()[0]?.view.scale ?? 1}
+    <textarea class="annot-text" rows="1" use:focusText bind:value={textEdit.value}
+      style:left="{textEdit.cx}px" style:top="{textEdit.cy}px" style:color={textEdit.color}
+      style:font-size="{textEdit.size * scale}px" style:min-width="{textEdit.size * scale * 4}px"
+      style:height="{(textEdit.value.split('\n').length * 1.25 + 0.2) * textEdit.size * scale}px"
+      onkeydown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Escape") { textEdit = null; }
+        else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); commitText(); }
+      }}
+      onblur={commitText}></textarea>
+  {/if}
   {#if showRulers}
     <canvas bind:this={rulerTop} class="ruler top" title="ドラッグで水平ガイドを作成"
       onpointerdown={(e) => onRulerDown(e, "h")} onpointermove={onPointerMove} onpointerup={onPointerUp}></canvas>
@@ -484,6 +631,15 @@
   .gl.col { cursor: col-resize; }
   .gl.row { cursor: row-resize; }
   .gl.rotate { cursor: crosshair; }
+  .gl.draw { cursor: crosshair; }
+  .gl.text { cursor: text; }
+  .gl.move { cursor: move; }
+  .annot-text {
+    position: absolute; z-index: 5; margin: 0; padding: 0; border: 1px dashed rgba(255, 255, 255, 0.7);
+    background: rgba(0, 0, 0, 0.25); font-weight: bold; line-height: 1.25; resize: none; overflow: hidden;
+    font-family: "Segoe UI", "Yu Gothic UI", "Hiragino Sans", sans-serif; outline: none;
+    -webkit-text-stroke: 0.5px rgba(0, 0, 0, 0.6);
+  }
   .overlay { pointer-events: none; }
   .ruler { background: #262626; touch-action: none; }
   .ruler.top { left: 18px; right: 0; top: 0; height: 18px; width: calc(100% - 18px); cursor: row-resize; }

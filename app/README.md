@@ -1,6 +1,6 @@
 # OptImageEditor app
 
-Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 2-c（結合・統合・ロック）まで実装済み。2-b でレイヤー構造の編集・Undo・PSD 保存。2-a で PSD のレイヤーを読み込んで GPU で合成。フェーズ 1（ビューワー）は完了。1-c でナビゲーター、表示の回転・左右反転、定規、ガイド、グリッド、ピクセルグリッドを追加。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
+Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 2-c（結合・統合・ロック）と注釈機能まで実装済み。2-b でレイヤー構造の編集・Undo・PSD 保存。2-a で PSD のレイヤーを読み込んで GPU で合成。フェーズ 1（ビューワー）は完了。1-c でナビゲーター、表示の回転・左右反転、定規、ガイド、グリッド、ピクセルグリッドを追加。676MB の PSD を約 0.19 秒で表示する（詳細は `docs/perf_ipc.md`）。
 
 ## 前提（Windows）
 
@@ -57,6 +57,10 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | F7 / ツールバーの「レイヤー」 | レイヤーパネル。開いている PSD のレイヤーを読み込む（フォルダ送り中は 0.4 秒止まってから）。表示 / 非表示（Alt+クリックでそのレイヤーだけ表示）、描画モード、不透明度、塗り、レイヤーマスク・クリッピングマスクのオン / オフを変えると、レイヤーから合成した画像に切り替わる |
 | パネル下部のボタン / Ctrl+Shift+N / Ctrl+J / Ctrl+G / Delete | 新規レイヤー（選択の上）/ 新規グループ / 複製 / 選択レイヤーをグループ化 / 削除 |
 | Ctrl+Alt+G | クリッピングマスクのオン / オフ |
+| Ctrl+V | クリップボードの画像（Win+Shift+S のスクショなど）を新しいタブで開く |
+| ツールバーの「注釈」/ P・L・A・U・T・V | 注釈: ペン / 直線 / 矢印 / 四角 / テキスト / 選択。Shift で直線・矢印は 45° 刻み、四角は正方形。色 6 色・太さ 3 段階（画面上の太さで描く）。選択ツールでドラッグ移動、Delete で削除、テキストはダブルクリックで編集、選択中に色を押すとその図形の色を変える。注釈中の Ctrl+Z / Ctrl+Shift+Z は注釈の取り消し / やり直し。Esc で選択解除 → 注釈終了。スペース + ドラッグでパン |
+| Ctrl+Shift+C | 注釈込みの画像をクリップボードへ（AI のチャットに貼る用。WebView が拒否した時は Rust の arboard でコピー） |
+| Ctrl+Shift+S（注釈がある時） | 注釈込みの画像を PNG 保存（元画像の横に `名前_注釈.png`、既存なら番号付き。貼り付けた画像は保存先を尋ねる）。注釈が無い時は従来どおり PSD の別名保存 |
 | Ctrl+E / パネルの「結合▾」 | 下のレイヤーと結合（下が通常モードなら見た目を保って通常・100% に。それ以外は下のレイヤーの描画モードと不透明度を引き継ぐ）。グループを選んでいる時はグループを結合 |
 | Ctrl+Shift+E | 表示レイヤーを結合（一番下の表示レイヤーの位置・名前。非表示のレイヤーは残す） |
 | 「結合▾」→ 画像を統合 | 1 枚の「背景」レイヤーに（透明部分は白。非表示のレイヤーがあれば破棄してよいか確認） |
@@ -92,6 +96,7 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 | `src-tauri/src/lib.rs` | Rust コマンド: `save_psd`（保存。本体は IPC の raw body = JSON + 統合画像）/ `set_close_guard`・`close_ack`（未保存時の閉じる確認。ページが 3 秒応答しなければ強制終了）/ `load_composite_shared`（統合画像を Rust でデコードし、WebView2 の共有メモリで渡す）/ `read_range_shared`（共有メモリでの範囲読み込み）/ `read_range`（IPC、フォールバック用）/ `file_info` / `list_images`（自然順ソート）/ `startup_paths` / `register_open_with`（HKCU に ProgID `OptImageEditor.Image` と各拡張子の `OpenWithProgids` を登録・解除。管理者権限は不要）/ `open_default_apps_settings`。二重起動の防止は `tauri-plugin-single-instance`（2 回目の起動の引数を `oie://open-paths` イベントで送る） |
 | `src-tauri/src/hdr.rs` | EXR（`exr` クレート。読み込みは DWAA / DWAB を含む全圧縮方式、スキャンライン / タイル、マルチパート、f16 / f32 / u32）と Radiance .hdr のデコーダ。半精度浮動小数点の RGBA（リニア、乗算済み）で共有メモリへ渡す（使えない時は IPC で 1 回転送）。EXR のチャンネルは「.」の前の接頭辞でレイヤーにまとめる。テスト: `cargo test --lib hdr` |
 | `src/lib/compositor.ts` | GPU のレイヤー合成。2048px のタイルごとに、レイヤー 1 枚につき 1 回の描画で合成する（RGBA16F の作業バッファ）。全描画モード、マスク、クリッピングマスク、グループ（通過 / 分離）。テキストレイヤーはガンマ 1.45 で合成（PS の「テキストカラーのブレンドにガンマを使用 1.45」に相当、比較から推定） |
+| `src/lib/annotations.svelte.ts` / `AnnotBar.svelte` | 注釈。図形（画像 px）をタブごとに保持し Undo は図形単位。描画は Viewer のオーバーレイ、書き出し時だけ OffscreenCanvas で画像に焼き込む。フォルダ内で別の画像に移ると消える |
 | `src/lib/LayerPanel.svelte` / `psdDoc.ts` | レイヤーパネルと、レイヤーツリーの型。レイヤーの読み込みは ag-psd（ワーカー、埋め込みファイルのデータは読み飛ばす）。並べ替えはポインタイベントで実装（Windows の WebView ではネイティブのファイルドロップが有効な間 HTML5 のドラッグ＆ドロップが効かないため） |
 | 保存（2-b） | `src-tauri/src/psd_save.rs`（方式 B）。元ファイルからレイヤーレコードだけを読み、編集後の構造に組み替えて書く。各レイヤーのチャンネル画像データ・グローバルの追加情報（スマートオブジェクトの埋め込みファイルなど）は元ファイルからバイト列のままコピーする（画素は展開しない。メモリはレコード + 統合画像だけ）。統合画像は GPU の合成結果（乗算済み）を RLE で書く（透明がある時は白マット + 透明チャンネル）。レイヤー数の不一致（読み込み後にファイルが変更された）は保存を中止する。複製したスマートオブジェクトにはインスタンス ID を新しく振る。PSD ⇄ PSB の相互変換は未対応。ブラウザ版のダウンロードは ag-psd（ワーカー）。テスト: `OIE_SAVE_TEST=<dir> cargo test --lib save_from_env`（`<dir>/req.json` と `composite.rgba`） |
 | `tools/ps_blend_test.jsx` | 描画モードの検証用 PSD を PS で作るスクリプト（ファイル → スクリプト → 参照）。PS の統合画像と、このアプリの合成をセルごとに比べるために使う |

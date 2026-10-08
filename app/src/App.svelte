@@ -6,6 +6,8 @@
   import TabBar from "./lib/TabBar.svelte";
   import Navigator from "./lib/Navigator.svelte";
   import LayerPanel from "./lib/LayerPanel.svelte";
+  import AnnotBar from "./lib/AnnotBar.svelte";
+  import { TOOL_KEY, annotTool, type Tool } from "./lib/annotations.svelte";
   import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
   import type { ChannelView, CompareMode } from "./lib/renderer";
   import type { Renderer } from "./lib/renderer";
@@ -120,6 +122,37 @@
     else if (t && isPsd(t.name)) showToast("レイヤーの編集はレイヤーパネル (F7) を開いてから");
   }
 
+  // ---- annotations
+  const annotOn = $derived(annotTool.tool !== null && !!active?.meta && !vs.compare);
+  const TOOL_BY_KEY = Object.fromEntries(Object.entries(TOOL_KEY).map(([t, k]) => [k, t as Tool]));
+
+  function copyAnnotated() {
+    if (!active?.meta) return;
+    vs.copyAnnotated()
+      .then(() => showToast(active?.annot.shapes.length ? "注釈込みの画像をコピーしました" : "画像をコピーしました（注釈なし）"))
+      .catch((e) => showToast(`コピーできませんでした: ${e instanceof Error ? e.message : String(e)}`));
+  }
+
+  async function saveAnnotated() {
+    if (!active?.meta) return;
+    try {
+      const p = await vs.saveAnnotatedPng();
+      if (p) showToast(`保存しました: ${baseName(p)}`);
+    } catch (e) {
+      showToast(`保存できませんでした: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // Ctrl+V: an image on the clipboard opens in a new tab (Win+Shift+S screenshots etc.)
+  function onPaste(e: ClipboardEvent) {
+    const t = e.target as HTMLElement;
+    if (t.tagName === "INPUT" || t.tagName === "TEXTAREA") return;
+    const file = Array.from(e.clipboardData?.files ?? []).find((f) => f.type.startsWith("image/"));
+    if (!file) { showToast("クリップボードに画像がありません"); return; }
+    e.preventDefault();
+    vs.openPasted(file);
+  }
+
   function toggleFlip() { if (renderer?.hasImage) renderer.setFlip(!renderer.flipX); }
 
   function fit() { renderer?.fit(); vs.zoom = renderer?.scale ?? 0; }
@@ -164,7 +197,13 @@
     else if (!ctrl && !e.altKey && !e.shiftKey && kk === "c") { if (active?.meta || cmp) vs.toggleCompare(); }
     else if (cmp && !ctrl && !e.altKey && (kk === "1" || kk === "2" || kk === "3")) vs.updateCompare({ mode: (["side", "swipe", "toggle"] as const)[Number(kk) - 1] });
     else if (cmp && !ctrl && !e.altKey && kk === "x") vs.updateCompare({ mode: "toggle", showB: cmp.mode === "toggle" ? !cmp.showB : true });
+    else if (k === "Escape" && annotOn) { if (active!.annot.selected !== null) active!.annot.selected = null; else annotTool.tool = null; }
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
+    else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) annotTool.tool = TOOL_BY_KEY[kk];
+    else if (ctrl && e.shiftKey && kk === "c") copyAnnotated();
+    else if (ctrl && e.shiftKey && kk === "s" && active?.annot.shapes.length) saveAnnotated();
+    else if (annotOn && ctrl && (kk === "z" || kk === "y")) { if (kk === "y" || e.shiftKey) active!.annot.redo(); else active!.annot.undo(); }
+    else if (annotOn && !ctrl && (k === "Delete" || k === "Backspace") && active!.annot.selected !== null) active!.annot.remove(active!.annot.selected!);
     else if (ctrl && kk === "z") layerKey((t) => (e.shiftKey ? vs.redo(t) : vs.undo(t)));
     else if (ctrl && kk === "y") layerKey((t) => vs.redo(t));
     else if (ctrl && !e.altKey && kk === "e") layerKey((t) => { const m = e.shiftKey ? vs.mergeVisible(t) : vs.mergeDown(t); if (m) showToast(m); });
@@ -263,7 +302,7 @@
   });
 </script>
 
-<svelte:window onkeydown={onKey} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
+<svelte:window onkeydown={onKey} onpaste={onPaste} ondragover={(e) => e.preventDefault()} ondrop={(e) => e.preventDefault()} />
 
 <header class="toolbar">
   <div class="menu-wrap">
@@ -301,6 +340,8 @@
   <span class="sep"></span>
   <button class:active={opt.layersPanel} onclick={() => (opt.layersPanel = !opt.layersPanel)} title="レイヤーパネル (F7)">レイヤー</button>
   <button class:active={!!vs.compare} disabled={!active?.meta && !vs.compare} onclick={() => vs.toggleCompare()} title="比較表示 (C)">比較</button>
+  <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => (annotTool.tool = annotTool.tool ? null : "pen")}
+    title="注釈（ペン P / 直線 L / 矢印 A / 四角 U / テキスト T / 選択 V）。Ctrl+Shift+C で注釈込みの画像をコピー">注釈</button>
   <div class="menu-wrap">
     <button class:active={openMenu === "view"} onclick={() => (openMenu = openMenu === "view" ? null : "view")} title="表示（ナビゲーター / 定規 / ガイド / グリッド / 回転）">表示 ▾</button>
     {#if openMenu === "view"}
@@ -400,7 +441,8 @@
   ondragleave={() => { if (!isTauri()) dragOver = false; }}
   ondrop={onHtmlDrop}
 >
-  <Viewer bind:renderer guides={active?.guides ?? null} oncursor={onCursor}
+  {#if annotOn}<AnnotBar annot={active?.annot ?? null} oncopy={copyAnnotated} onsave={saveAnnotated} />{/if}
+  <Viewer bind:renderer guides={active?.guides ?? null} annot={active?.annot ?? null} oncursor={onCursor}
     labels={vs.compare && active ? { a: active.name, b: vs.compareTab?.name ?? "" } : null}
     onsplit={(v) => vs.updateCompare({ split: v })} />
   {#if vs.compare && vs.compareTab?.loading}<div class="busy">B を読み込み中…</div>{/if}
