@@ -262,6 +262,11 @@ export function drawSelection(ctx: Ctx, s: Shape, px: number) {
 
 /** Burns the shapes into the image. `premultiplied`: RGBA8 as read back from the GPU. Returns a PNG. */
 export async function flattenToPng(premultiplied: Uint8Array, w: number, h: number, shapes: Shape[]): Promise<Blob> {
+  return flattenToCanvas(premultiplied, w, h, shapes).convertToBlob({ type: "image/png" });
+}
+
+/** The image (straight alpha) with the shapes drawn on it. */
+export function flattenToCanvas(premultiplied: Uint8Array, w: number, h: number, shapes: Shape[]): OffscreenCanvas {
   const data = new Uint8ClampedArray(premultiplied.length);
   for (let i = 0; i < data.length; i += 4) {
     const a = premultiplied[i + 3];
@@ -275,5 +280,5 @@ export async function flattenToPng(premultiplied: Uint8Array, w: number, h: numb
   const ctx = c.getContext("2d")!;
   ctx.putImageData(new ImageData(data, w, h), 0, 0);
   for (const s of shapes) drawShape(ctx, s);
-  return c.convertToBlob({ type: "image/png" });
+  return c;
 }

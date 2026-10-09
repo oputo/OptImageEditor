@@ -7,6 +7,9 @@
   import Navigator from "./lib/Navigator.svelte";
   import LayerPanel from "./lib/LayerPanel.svelte";
   import AnnotBar from "./lib/AnnotBar.svelte";
+  import ExportDialog, { type ExportOptions } from "./lib/ExportDialog.svelte";
+  import CanvasDialog from "./lib/CanvasDialog.svelte";
+  import HelpOverlay from "./lib/HelpOverlay.svelte";
   import { TOOL_KEY, annotTool, type Tool } from "./lib/annotations.svelte";
   import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
   import type { ChannelView, CompareMode } from "./lib/renderer";
@@ -122,6 +125,40 @@
     else if (t && isPsd(t.name)) showToast("レイヤーの編集はレイヤーパネル (F7) を開いてから");
   }
 
+  // ---- 2-d: export / image size / canvas size / shortcut list
+  let exportDlg = $state<{ mode: "export" | "size"; w: number; h: number } | null>(null);
+  let canvasDlg = $state<{ w: number; h: number } | null>(null);
+  let showHelp = $state(false);
+
+  function openExport(mode: "export" | "size") {
+    openMenu = null;
+    const set = renderer?.activeSet;
+    if (!active?.meta || !set) { showToast("画像を開いてください"); return; }
+    if (set.hdr) { showToast("EXR / HDR の書き出しは未対応です"); return; }
+    exportDlg = { mode, w: set.width, h: set.height };
+  }
+  async function doExport(o: ExportOptions) {
+    exportDlg = null;
+    try {
+      const p = await vs.exportImage(o);
+      if (p) showToast(`書き出しました: ${baseName(p)}`);
+    } catch (e) {
+      showToast(`書き出せませんでした: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  function openCanvas() {
+    openMenu = null;
+    const l = active?.layers;
+    if (l?.status !== "ready") { showToast(active && isPsd(active.name) ? "カンバスサイズはレイヤーを読み込んでから（F7）" : "カンバスサイズは PSD のみです"); return; }
+    canvasDlg = { w: l.canvas.w, h: l.canvas.h };
+  }
+  function doCanvas(w: number, h: number, anchor: number) {
+    canvasDlg = null;
+    if (!active) return;
+    const m = vs.canvasSize(active, w, h, anchor);
+    if (m) showToast(m);
+  }
+
   // ---- annotations
   const annotOn = $derived(annotTool.tool !== null && !!active?.meta && !vs.compare);
   const TOOL_BY_KEY = Object.fromEntries(Object.entries(TOOL_KEY).map(([t, k]) => [k, t as Tool]));
@@ -192,6 +229,8 @@
     if (((t.tagName === "INPUT" && (t as HTMLInputElement).type !== "checkbox") || t.tagName === "SELECT") && !ctrl && !/^F\d+$/.test(k)) return;
     let handled = true;
     const cmp = vs.compare;
+    if (exportDlg || canvasDlg) return; // the dialog handles its keys
+    if (showHelp && (k === "Escape" || k === "F1")) { showHelp = false; e.preventDefault(); return; }
     if (k === "Escape" && openMenu) openMenu = null;
     else if (k === "Escape" && cmp) vs.stopCompare();
     else if (!ctrl && !e.altKey && !e.shiftKey && kk === "c") { if (active?.meta || cmp) vs.toggleCompare(); }
@@ -201,6 +240,10 @@
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
     else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) annotTool.tool = TOOL_BY_KEY[kk];
     else if (ctrl && e.shiftKey && kk === "c") copyAnnotated();
+    else if (ctrl && e.altKey && e.shiftKey && kk === "w") openExport("export");
+    else if (ctrl && e.altKey && !e.shiftKey && kk === "i") openExport("size");
+    else if (ctrl && e.altKey && !e.shiftKey && kk === "c") openCanvas();
+    else if (k === "F1") showHelp = !showHelp;
     else if (ctrl && e.shiftKey && kk === "s" && active?.annot.shapes.length) saveAnnotated();
     else if (annotOn && ctrl && (kk === "z" || kk === "y")) { if (kk === "y" || e.shiftKey) active!.annot.redo(); else active!.annot.undo(); }
     else if (annotOn && !ctrl && (k === "Delete" || k === "Backspace") && active!.annot.selected !== null) active!.annot.remove(active!.annot.selected!);
@@ -320,6 +363,11 @@
         {#if recent.list.length}
           <button class="item small" role="menuitem" onclick={() => { recent.clear(); }}>履歴を消去</button>
         {/if}
+        <div class="menu-sep"></div>
+        <button class="item" role="menuitem" disabled={!active?.meta} onclick={() => openExport("export")}>書き出し…<span class="fdir">Ctrl+Alt+Shift+W</span></button>
+        <button class="item" role="menuitem" disabled={!active?.meta} onclick={() => openExport("size")}>画像解像度…<span class="fdir">Ctrl+Alt+I</span></button>
+        <button class="item" role="menuitem" disabled={active?.layers?.status !== "ready"} onclick={openCanvas}>カンバスサイズ…<span class="fdir">Ctrl+Alt+C</span></button>
+        <button class="item" role="menuitem" onclick={() => { openMenu = null; showHelp = true; }}>ショートカット一覧<span class="fdir">F1</span></button>
         {#if isTauri()}
           <div class="menu-sep"></div>
           <button class="item" role="menuitem" onclick={() => registerOpenWith(true)}>「プログラムから開く」に登録</button>
@@ -466,6 +514,13 @@
   {/if}
   {#if active?.loading}<div class="busy">読み込み中…</div>{/if}
   {#if toast}<div class="toast">{toast}</div>{/if}
+  {#if exportDlg && active}
+    <ExportDialog w0={exportDlg.w} h0={exportDlg.h} name={active.name} mode={exportDlg.mode}
+      hasAnnotations={active.annot.shapes.length > 0} isPsd={isPsd(active.name)}
+      onexport={doExport} onclose={() => (exportDlg = null)} />
+  {/if}
+  {#if canvasDlg}<CanvasDialog w0={canvasDlg.w} h0={canvasDlg.h} onapply={doCanvas} onclose={() => (canvasDlg = null)} />{/if}
+  {#if showHelp}<HelpOverlay onclose={() => (showHelp = false)} />{/if}
   {#if showStats && meta}
     <div class="stats">
       <pre>{statsText}</pre>

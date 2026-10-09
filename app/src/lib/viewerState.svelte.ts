@@ -13,7 +13,7 @@ import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
 import { confirmDialog, copyImageFallback, listFolderImages, savePsd, saveDialog, setWindowTitle, writeFile } from "./desktop";
 import { recent } from "./recent.svelte";
-import { Annotations, flattenToPng } from "./annotations.svelte";
+import { Annotations, flattenToCanvas, flattenToPng } from "./annotations.svelte";
 
 export type ImageMeta = Omit<LoadedImage, "image" | "release"> & {
   uploadMs: number;
@@ -78,10 +78,14 @@ export type LayersState = {
   saved: { ms: number; bytes: number; path: string } | null;
   /** layers (groups included) in the file on disk, in the post-order the source ids refer to */
   fileCount: number;
+  canvas: Canvas;
 };
 
 /** Undo history of a tab's layer tree (snapshots of the tree; pixels are not edited in 2-b). */
-type History = { undo: DocLayer[][]; redo: DocLayer[][]; lastKey: string | null; lastTime: number };
+/** Canvas of a layered document: size, and how far the file's layers have moved (canvas size changes not saved yet). */
+export type Canvas = { w: number; h: number; ox: number; oy: number };
+type Snapshot = { tree: DocLayer[]; canvas: Canvas };
+type History = { undo: Snapshot[]; redo: Snapshot[]; lastKey: string | null; lastTime: number };
 const HISTORY_MAX = 100;
 
 /** Comparison of the active tab (A) with tab `bId` (B; may be the same tab). */
@@ -445,7 +449,7 @@ export class ViewerState {
     const token = tab.token;
     tab.layers = {
       status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, selection: [], stats: null, diff: null,
-      dirty: false, undoCount: 0, redoCount: 0, saving: false, savePhase: null, saved: null, fileCount: 0,
+      dirty: false, undoCount: 0, redoCount: 0, saving: false, savePhase: null, saved: null, fileCount: 0, canvas: { w: 0, h: 0, ox: 0, oy: 0 },
     };
     try {
       const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
@@ -459,6 +463,7 @@ export class ViewerState {
       this.compositor.render(doc);
       Object.assign(tab.layers, {
         status: "ready", tree: data.layers, count: data.count, fileCount: data.count,
+        canvas: { w: data.width, h: data.height, ox: 0, oy: 0 },
         stats: { readMs: data.readMs, decodeMs: data.decodeMs, uploadMs, compositeMs: doc.lastMs, passes: doc.passes },
       });
     } catch (e) {
@@ -507,7 +512,20 @@ export class ViewerState {
       this.compositePending.delete(tab.id);
       const doc = this.docs.get(tab.id);
       if (!doc || !tab.layers) return;
-      this.compositor!.render(doc, tab.layers.tree);
+      const c = tab.layers.canvas;
+      const resized = c.w !== doc.data.width || c.h !== doc.data.height;
+      if (resized) {
+        // canvas size changed (or undone): a new output of the new size
+        const shown = !!doc.output && this.renderer?.activeSet === doc.output;
+        doc.data.width = c.w;
+        doc.data.height = c.h;
+        if (doc.output) { this.renderer?.dispose(doc.output); doc.output = null; }
+        const out = this.compositor!.render(doc, tab.layers.tree);
+        if (shown && this.activeId === tab.id && this.renderer) { this.renderer.show(out); this.renderer.fit(); this.zoom = this.renderer.scale; }
+        if (tab.meta) tab.meta = { ...tab.meta, width: c.w, height: c.h };
+      } else {
+        this.compositor!.render(doc, tab.layers.tree);
+      }
       if (tab.layers.stats) Object.assign(tab.layers.stats, { compositeMs: doc.lastMs, passes: doc.passes });
     });
   }
@@ -518,6 +536,7 @@ export class ViewerState {
     const doc = this.docs.get(tab.id);
     const stored = this.cache.get(cacheKey(tab))?.set;
     if (!l || !doc?.output || !stored || !this.renderer) return;
+    if (stored.width !== doc.data.width || stored.height !== doc.data.height) return; // canvas size changed
     this.compositor!.render(doc, l.tree);
     const a = this.renderer.readSet(doc.output), b = this.renderer.readSet(stored);
     let max = 0, sum = 0, over2 = 0, over8 = 0;
@@ -548,7 +567,7 @@ export class ViewerState {
     const h = this.hist(tab);
     const now = performance.now();
     if (!(key && h.lastKey === key && (mergeAlways || now - h.lastTime < 1000))) {
-      h.undo.push(cloneTree(l.tree));
+      h.undo.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas } });
       if (h.undo.length > HISTORY_MAX) h.undo.shift();
       h.redo = [];
     }
@@ -572,9 +591,10 @@ export class ViewerState {
     const from = back ? h.undo : h.redo, to = back ? h.redo : h.undo;
     const snap = from.pop();
     if (!snap) return;
-    to.push(cloneTree(l.tree));
-    l.tree = snap;
-    this.select(tab, l.selection.filter((id) => this.locate(snap, id)), l.selectedId);
+    to.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas } });
+    l.tree = snap.tree;
+    l.canvas = { ...snap.canvas };
+    this.select(tab, l.selection.filter((id) => this.locate(snap.tree, id)), l.selectedId);
     h.lastKey = null;
     l.dirty = true;
     l.undoCount = h.undo.length;
@@ -632,6 +652,34 @@ export class ViewerState {
     const doc = this.docs.get(tab.id);
     if (!doc || !tab.layers) return;
     this.insert(tab, this.newLayerData(doc, `グループ ${this.countLayers(tab.layers.tree) + 1}`, true), "新規グループ");
+  }
+
+  // ---------------------------------------------------------------- canvas size (phase 2-d)
+
+  /** Ctrl+Alt+C: new canvas `w` x `h`; `anchor` 0..8 (row-major 3 x 3: where the current image stays). Layers move,
+   *  their pixels do not change (outside the canvas they are kept, as in Photoshop). */
+  canvasSize(tab: Tab, w: number, h: number, anchor: number): string | null {
+    const l = tab.layers;
+    if (!l || l.status !== "ready") return "カンバスサイズは PSD のレイヤーを読み込んだ時だけ変えられます（F7）";
+    w = Math.round(w); h = Math.round(h);
+    if (!(w >= 1 && h >= 1 && w <= 30000 && h <= 30000)) return "幅と高さは 1〜30000 px にしてください";
+    const c = l.canvas;
+    if (w === c.w && h === c.h) return null;
+    const col = anchor % 3, row = Math.floor(anchor / 3);
+    const dx = col === 0 ? 0 : col === 1 ? Math.round((w - c.w) / 2) : w - c.w;
+    const dy = row === 0 ? 0 : row === 1 ? Math.round((h - c.h) / 2) : h - c.h;
+    this.edit(tab, null, (tree) => {
+      const walk = (ls: DocLayer[]) => {
+        for (const x of ls) {
+          x.x += dx; x.y += dy;
+          if (x.mask) { x.mask.x += dx; x.mask.y += dy; }
+          if (x.children) walk(x.children);
+        }
+      };
+      walk(tree);
+      l.canvas = { w, h, ox: c.ox + dx, oy: c.oy + dy };
+    });
+    return null;
   }
 
   // ---------------------------------------------------------------- selection
@@ -790,7 +838,7 @@ export class ViewerState {
   /** After a save the file's layers are numbered anew: point the undo / redo snapshots at the new numbers.
    *  Steps that need a layer which is no longer in the file (deleted before saving) cannot be restored from the
    *  new file, so they (and everything older) are dropped from the history. */
-  private remapHistory(tab: Tab) {
+  private remapHistory(tab: Tab, savedOffset: { ox: number; oy: number }) {
     const l = tab.layers;
     const h = this.histories.get(tab.id);
     if (!l || !h) return;
@@ -808,8 +856,11 @@ export class ViewerState {
       return ok;
     };
     // newest first: the last element of each stack is the next step
-    for (let i = h.undo.length - 1; i >= 0; i--) if (!fix(h.undo[i])) { h.undo = h.undo.slice(i + 1); break; }
-    for (let i = h.redo.length - 1; i >= 0; i--) if (!fix(h.redo[i])) { h.redo = h.redo.slice(i + 1); break; }
+    // snapshots' canvas offsets are relative to the file: the saved file moved by `saved`
+    const saved = { ox: savedOffset.ox, oy: savedOffset.oy };
+    for (const sn of [...h.undo, ...h.redo]) { sn.canvas = { ...sn.canvas, ox: sn.canvas.ox - saved.ox, oy: sn.canvas.oy - saved.oy }; }
+    for (let i = h.undo.length - 1; i >= 0; i--) if (!fix(h.undo[i].tree)) { h.undo = h.undo.slice(i + 1); break; }
+    for (let i = h.redo.length - 1; i >= 0; i--) if (!fix(h.redo[i].tree)) { h.redo = h.redo.slice(i + 1); break; }
     l.undoCount = h.undo.length;
     l.redoCount = h.redo.length;
     this.releaseUnused(tab);
@@ -902,7 +953,7 @@ export class ViewerState {
     const walk = (ls: DocLayer[]) => { for (const x of ls) { keep.add(x.id); if (x.children) walk(x.children); } };
     walk(l.tree);
     const h = this.histories.get(tab.id);
-    if (h) for (const t of [...h.undo, ...h.redo]) walk(t);
+    if (h) for (const t of [...h.undo, ...h.redo]) walk(t.tree);
     this.compositor!.releaseUnused(doc, keep);
   }
 
@@ -1109,6 +1160,65 @@ export class ViewerState {
     return target;
   }
 
+  // ---------------------------------------------------------------- export (phase 2-d)
+
+  /** size of the image shown in the active tab (what export writes at 100 %) */
+  get shownSize(): { w: number; h: number } | null {
+    void this.cacheVersion;
+    const set = this.renderer?.activeSet;
+    return set ? { w: set.width, h: set.height } : null;
+  }
+
+  /** Writes the active tab's image as shown (layer composite or stored composite), optionally with its annotations,
+   *  scaled to `w` x `h`, as PNG / JPEG / WebP. `target`: path, or null = next to the original (a free name;
+   *  images without a file ask). `ask`: always choose the place. Returns the written path (browser: file name). */
+  async exportImage(o: { format: "png" | "jpeg" | "webp"; quality: number; w: number; h: number; annotations: boolean; ask: boolean }): Promise<string | null> {
+    const tab = this.active;
+    const r = this.renderer;
+    const set = r?.activeSet;
+    if (!tab || !r || !set) throw new Error("画像がありません");
+    if (set.hdr) throw new Error("EXR / HDR の書き出しは未対応です");
+    const full = flattenToCanvas(r.readSet(set), set.width, set.height, o.annotations ? tab.annot.shapes : []);
+    const w = Math.max(1, Math.round(o.w)), h = Math.max(1, Math.round(o.h));
+    const out = new OffscreenCanvas(w, h);
+    const ctx = out.getContext("2d")!;
+    if (o.format === "jpeg") { ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, w, h); } // no transparency in JPEG
+    if (w === set.width && h === set.height) {
+      ctx.drawImage(full, 0, 0);
+    } else {
+      const bmp = await createImageBitmap(full, { resizeWidth: w, resizeHeight: h, resizeQuality: "high" });
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close();
+    }
+    const blob = await out.convertToBlob({ type: `image/${o.format}`, quality: o.format === "png" ? undefined : o.quality });
+    const ext = o.format === "jpeg" ? "jpg" : o.format;
+    const stem = tab.name.replace(/\.[^.]+$/, "") + (w !== set.width || h !== set.height ? `_${w}x${h}` : "");
+    const data = await blob.arrayBuffer();
+    let target: string | null = null;
+    if (tab.path && !o.ask) {
+      const dir = tab.path.slice(0, Math.max(tab.path.lastIndexOf("\\"), tab.path.lastIndexOf("/")) + 1);
+      for (let i = 1; i < 1000 && !target; i++) {
+        const p = `${dir}${stem}${i > 1 ? ` (${i})` : ""}.${ext}`;
+        try { await TauriFileSource.open(p); } catch { target = p; } // does not exist yet
+      }
+    } else {
+      const dir = tab.path ? tab.path.slice(0, Math.max(tab.path.lastIndexOf("\\"), tab.path.lastIndexOf("/")) + 1) : "";
+      target = await saveDialog(`${dir}${stem}.${ext}`, [{ name: ext.toUpperCase(), extensions: [ext] }]);
+      if (!target && tab.path) return null;
+    }
+    if (!target) {
+      // browser build: download
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([data], { type: blob.type }));
+      a.download = `${stem}.${ext}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      return a.download;
+    }
+    await writeFile(target, data, false);
+    return target;
+  }
+
   hasUnsaved(): boolean { return this.tabs.some((t) => t.layers?.dirty); }
 
   /** Asks before discarding unsaved layer edits of `tab`. */
@@ -1180,7 +1290,10 @@ export class ViewerState {
       }
     };
     attach(plan);
-    const req = { src, dst, backup, width: doc.data.width, height: doc.data.height, layerCount: l.fileCount, plan };
+    const req = {
+      src, dst, backup, width: doc.data.width, height: doc.data.height, layerCount: l.fileCount, plan,
+      offsetX: l.canvas.ox, offsetY: l.canvas.oy,
+    };
     const rgba = new Uint8Array(composite.length + offset);
     rgba.set(composite, 0);
     let o = composite.length;
@@ -1240,7 +1353,8 @@ export class ViewerState {
       const flat = l.tree.length === 1 && l.tree[0].background && !l.tree[0].children;
       if (flat) { l.tree[0].origId = null; l.tree[0].raster = true; } else renumber(l.tree);
       l.fileCount = n;
-      this.remapHistory(tab);
+      this.remapHistory(tab, l.canvas);
+      l.canvas = { ...l.canvas, ox: 0, oy: 0 };
       l.dirty = false;
       l.saved = { ms: performance.now() - t0, bytes: buffer.byteLength, path: target };
       if (!sameFile) {

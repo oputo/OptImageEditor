@@ -71,6 +71,104 @@ pub struct SaveRequest {
     /// number of layers (groups included, dividers not) the app read from `src`: guards against a file changed on disk
     pub layer_count: u32,
     pub plan: Vec<PlanNode>,
+    /// canvas size change: the file's layers move by (offset_x, offset_y) px; `width` / `height` are the new size
+    #[serde(default)]
+    pub offset_x: i32,
+    #[serde(default)]
+    pub offset_y: i32,
+}
+
+/// Canvas change applied to records copied from the file.
+#[derive(Clone, Copy)]
+struct Shift { dx: i32, dy: i32, old_w: f64, old_h: f64, new_w: f64, new_h: f64 }
+
+impl Shift {
+    fn is_none(&self) -> bool { self.dx == 0 && self.dy == 0 && self.old_w == self.new_w && self.old_h == self.new_h }
+}
+
+fn shift_rect(r: &mut [u8], dx: i32, dy: i32) {
+    let v: Vec<i32> = (0..4).map(|i| i32::from_be_bytes(r[i * 4..i * 4 + 4].try_into().unwrap())).collect();
+    if v.iter().all(|&x| x == 0) { return; } // empty layer
+    let n = [v[0] + dy, v[1] + dx, v[2] + dy, v[3] + dx];
+    for i in 0..4 { r[i * 4..i * 4 + 4].copy_from_slice(&n[i].to_be_bytes()); }
+}
+
+/// adds (dx, dy) to the x / y pairs of a descriptor list of doubles: `key` (as encoded: u32 length 0 + 4 chars, or
+/// u32 length + chars) followed by "VlLs", count and "doub" items
+fn shift_doubles_after(d: &mut [u8], key: &[u8], dx: f64, dy: f64) {
+    let mut from = 0;
+    while let Some(i) = d[from..].windows(key.len() + 4).position(|w| &w[..key.len()] == key && &w[key.len()..] == b"VlLs") {
+        let mut o = from + i + key.len() + 4;
+        if o + 4 > d.len() { return; }
+        let n = u32::from_be_bytes(d[o..o + 4].try_into().unwrap()) as usize;
+        o += 4;
+        for k in 0..n {
+            if o + 12 > d.len() || &d[o..o + 4] != b"doub" { break; }
+            let v = f64::from_be_bytes(d[o + 4..o + 12].try_into().unwrap()) + if k % 2 == 0 { dx } else { dy };
+            d[o + 4..o + 12].copy_from_slice(&v.to_be_bytes());
+            o += 12;
+        }
+        from = o;
+    }
+}
+
+impl Record {
+    /// Moves this (file) layer for a canvas size change: pixel and mask rectangles, smart object placement,
+    /// text position and vector mask points (stored as fractions of the document size).
+    fn shift(&mut self, s: Shift) {
+        let (dx, dy) = (s.dx, s.dy);
+        shift_rect(&mut self.rect, dx, dy);
+        if self.mask.len() >= 18 {
+            shift_rect(&mut self.mask[0..16], dx, dy);
+            if self.mask.len() >= 36 {
+                let n = self.mask.len();
+                shift_rect(&mut self.mask[n - 16..n], dx, dy);
+            }
+        }
+        for b in &mut self.blocks {
+            let d = &mut b.data;
+            match &b.key {
+                b"PlLd" if d.len() > 9 && &d[0..4] == b"plcL" => {
+                    let o = 8 + 1 + d[8] as usize + 16;
+                    for k in 0..8 {
+                        let p = o + k * 8;
+                        if p + 8 > d.len() { break; }
+                        let v = f64::from_be_bytes(d[p..p + 8].try_into().unwrap()) + if k % 2 == 0 { dx as f64 } else { dy as f64 };
+                        d[p..p + 8].copy_from_slice(&v.to_be_bytes());
+                    }
+                }
+                b"SoLd" | b"SoLE" => {
+                    shift_doubles_after(d, b"\0\0\0\0Trnf", dx as f64, dy as f64);
+                    shift_doubles_after(d, b"\0\0\0\x12nonAffineTransform", dx as f64, dy as f64);
+                }
+                b"TySh" if d.len() >= 50 => {
+                    for (k, delta) in [(4usize, dx as f64), (5, dy as f64)] {
+                        let p = 2 + k * 8;
+                        let v = f64::from_be_bytes(d[p..p + 8].try_into().unwrap()) + delta;
+                        d[p..p + 8].copy_from_slice(&v.to_be_bytes());
+                    }
+                }
+                b"vmsk" | b"vsms" if d.len() >= 8 => {
+                    // path records (26 bytes) after version + flags; knots hold 3 points (y, x) as 8.24 fractions
+                    let mut o = 8;
+                    while o + 26 <= d.len() {
+                        let sel = u16::from_be_bytes([d[o], d[o + 1]]);
+                        if matches!(sel, 1 | 2 | 4 | 5) {
+                            for k in 0..6 {
+                                let p = o + 2 + k * 4;
+                                let f = i32::from_be_bytes(d[p..p + 4].try_into().unwrap()) as f64 / 16777216.0;
+                                let (old, new, delta) = if k % 2 == 0 { (s.old_h, s.new_h, dy) } else { (s.old_w, s.new_w, dx) };
+                                let nf = (f * old + delta as f64) / new;
+                                d[p..p + 4].copy_from_slice(&((nf * 16777216.0).round() as i32).to_be_bytes());
+                            }
+                        }
+                        o += 26;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -480,6 +578,8 @@ struct Builder<'a> {
     src: &'a Source,
     /// pixel area of the request (raster layers)
     pixels: &'a [u8],
+    /// canvas change for layers copied from the file
+    shift: Option<Shift>,
     /// post-order index (1-based, dividers not counted) -> record index
     by_id: HashMap<u32, usize>,
     /// group record index -> its bounding divider record index
@@ -508,7 +608,7 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        Ok(Builder { src, pixels: &[], by_id, divider_of, next_layer_id: max_id + 1, out: vec![] })
+        Ok(Builder { src, pixels: &[], shift: None, by_id, divider_of, next_layer_id: max_id + 1, out: vec![] })
     }
 
     fn layer_count(&self) -> u32 { self.by_id.len() as u32 }
@@ -520,6 +620,7 @@ impl<'a> Builder<'a> {
     }
 
     fn apply(&mut self, rec: &mut Record, q: &PlanNode) -> Result<(), String> {
+        if let Some(s) = self.shift { if !q.raster { rec.shift(s); } }
         rec.set_name(&q.name);
         rec.opacity = (q.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         if q.hidden { rec.flags |= 0x02 } else { rec.flags &= !0x02 }
@@ -756,8 +857,50 @@ fn composite_rows(rgba: &[u8], w: usize, h: usize, transparency: bool) -> Vec<Ve
         .collect()
 }
 
+/// Guides resource (1032) moved with the canvas. `block`: the whole resource block (signature .. padded data).
+fn shift_guides(block: &[u8], s: Shift) -> Vec<u8> {
+    let mut b = block.to_vec();
+    let nl = b[6] as usize;
+    let data = 6 + ((nl + 2) & !1) + 4;
+    if data + 16 > b.len() { return b; }
+    let n = u32::from_be_bytes(b[data + 12..data + 16].try_into().unwrap()) as usize;
+    for i in 0..n {
+        let o = data + 16 + i * 5;
+        if o + 5 > b.len() { break; }
+        let v = i32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+        let d = if b[o + 4] == 0 { s.dx } else { s.dy }; // 0 = vertical guide (x)
+        b[o..o + 4].copy_from_slice(&(v + d * 32).to_be_bytes());
+    }
+    b
+}
+
 /// Extra channels (alpha / spot) of the original merged image, as RLE rows.
-fn extra_rows(f: &mut File, src: &Source, first: usize) -> Result<Vec<Vec<u8>>, String> {
+fn extra_rows(f: &mut File, src: &Source, first: usize, canvas: Option<(Shift, usize, usize)>) -> Result<Vec<Vec<u8>>, String> {
+    if let Some((s, nw, nh)) = canvas {
+        // canvas size changed: decode each extra plane, place it at the offset in a new plane (0 outside), re-encode
+        let rows = extra_rows(f, src, first, None)?;
+        let (w, h) = (src.width as usize, src.height as usize);
+        let mut out = vec![];
+        for plane in rows.chunks(h.max(1)) {
+            let mut old = vec![0u8; w * h];
+            for (y, r) in plane.iter().enumerate() { unpack_bits(r, &mut old[y * w..(y + 1) * w])?; }
+            let mut new = vec![0u8; nw * nh];
+            for y in 0..h {
+                let ny = y as i64 + s.dy as i64;
+                if ny < 0 || ny >= nh as i64 { continue; }
+                for x in 0..w {
+                    let nx = x as i64 + s.dx as i64;
+                    if nx >= 0 && nx < nw as i64 { new[ny as usize * nw + nx as usize] = old[y * w + x]; }
+                }
+            }
+            for y in 0..nh {
+                let mut r = vec![];
+                pack_bits(&new[y * nw..(y + 1) * nw], &mut r);
+                out.push(r);
+            }
+        }
+        return Ok(out);
+    }
     let (w, h) = (src.width as usize, src.height as usize);
     let total = src.channels as usize;
     if first >= total { return Ok(vec![]); }
@@ -892,12 +1035,16 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
     {
         let mut f = File::open(&req.src).map_err(|e| format!("{}: {e}", req.src))?;
         let src = parse(&mut f)?;
-        if src.width != req.width || src.height != req.height { return err("画像サイズがファイルと一致しません"); }
+        let shift = Shift {
+            dx: req.offset_x, dy: req.offset_y,
+            old_w: src.width as f64, old_h: src.height as f64, new_w: req.width as f64, new_h: req.height as f64,
+        };
         if src.psb != is_psb_path(&req.dst) {
             return err("PSD と PSB の相互変換は未対応です（拡張子を元と同じにしてください）");
         }
         let mut b = Builder::new(&src)?;
         b.pixels = pixels;
+        if !shift.is_none() { b.shift = Some(shift); }
         if b.layer_count() != req.layer_count {
             return err(format!(
                 "ファイルのレイヤー数（{}）が読み込み時（{}）と違います。読み込んだ後にファイルが変更された可能性があります（F5 で読み直してください）",
@@ -917,7 +1064,7 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         let transparency = if flattened { false } else { src.had_transparency || !opaque };
         let extras_from = if src.had_transparency { 4 } else { 3 };
         let mut rows = composite_rows(rgba, w, h, transparency);
-        rows.extend(extra_rows(&mut f, &src, extras_from)?);
+        rows.extend(extra_rows(&mut f, &src, extras_from, if shift.is_none() { None } else { Some((shift, w, h)) })?);
         let planes = rows.len() / h.max(1);
         composite_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
@@ -930,12 +1077,17 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         // header (channel count = composite planes)
         let mut header = src.header.clone();
         header[12..14].copy_from_slice(&(planes as u16).to_be_bytes());
+        header[14..18].copy_from_slice(&req.height.to_be_bytes());
+        header[18..22].copy_from_slice(&req.width.to_be_bytes());
         wr(&mut o, &header)?;
         wr(&mut o, &(src.color_mode_data.len() as u32).to_be_bytes())?;
         wr(&mut o, &src.color_mode_data)?;
-        let res: Vec<&Vec<u8>> = src.resources.iter().filter(|(id, _)| !DROP_RESOURCES.contains(id)).map(|(_, d)| d).collect();
+        let res: Vec<Vec<u8>> = src.resources.iter()
+            .filter(|(id, _)| !DROP_RESOURCES.contains(id) && !(*id == 1050 && !shift.is_none())) // slices: PS rebuilds them
+            .map(|(id, d)| if *id == 1032 && !shift.is_none() { shift_guides(d, shift) } else { d.clone() })
+            .collect();
         wr(&mut o, &(res.iter().map(|d| d.len()).sum::<usize>() as u32).to_be_bytes())?;
-        for d in res { wr(&mut o, d)?; }
+        for d in &res { wr(&mut o, d)?; }
 
         // layer and mask information
         let mut recs = Vec::new();
