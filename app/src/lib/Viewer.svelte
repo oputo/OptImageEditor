@@ -53,7 +53,7 @@
     | { kind: "split" }
     | { kind: "draw"; shape: Shape; x0: number; y0: number }
     | { kind: "move"; shape: Shape; x: number; y: number; moved: boolean }
-    | { kind: "sel"; tool: "rect" | "ellipse" | "lasso"; mode: SelMode; pts: number[]; square: boolean };
+    | { kind: "sel"; tool: "rect" | "ellipse" | "lasso"; mode: SelMode; pts: number[]; shiftAtStart: boolean; shiftReleased: boolean };
   let drag: Drag | null = null;
   let hot: { axis: "v" | "h"; index: number } | null = $state(null); // guide under the mouse / being dragged
 
@@ -68,6 +68,7 @@
   /** polygon being clicked (image px) and the mouse position for its rubber band */
   let poly = $state<{ pts: number[]; mode: SelMode } | null>(null);
   let polyMouse: [number, number] | null = null;
+  let lastPolyClick: { t: number; cx: number; cy: number } | null = null;
   // marching ants: the outline of the selection, as a path in image px (made once per selection)
   const selPath = $derived.by(() => {
     if (!sel) return null;
@@ -495,14 +496,18 @@
     const [ix, iy] = applyInverse(pane.matrix, cx, cy);
     const tool = selTool.tool!;
     if (tool === "poly") {
+      // double click: pointerdown's `detail` is not reliable in WebView2, so time and distance decide
+      const now = performance.now();
+      const dbl = !!lastPolyClick && now - lastPolyClick.t < 450 && Math.hypot(cx - lastPolyClick.cx, cy - lastPolyClick.cy) < 6;
+      lastPolyClick = { t: now, cx, cy };
       if (!poly) { poly = { pts: [ix, iy], mode: modeOf(e) }; renderer?.requestDraw(); return false; }
       const near = Math.hypot(ix - poly.pts[0], iy - poly.pts[1]) * pane.view.scale < 7;
-      if (near || e.detail >= 2) { finishPoly(); return false; }
+      if (near || dbl) { lastPolyClick = null; finishPoly(); return false; }
       poly.pts = [...poly.pts, ix, iy];
       renderer?.requestDraw();
       return false;
     }
-    drag = { kind: "sel", tool, mode: modeOf(e), pts: tool === "lasso" ? [ix, iy] : [ix, iy, ix, iy], square: false };
+    drag = { kind: "sel", tool, mode: modeOf(e), pts: tool === "lasso" ? [ix, iy] : [ix, iy, ix, iy], shiftAtStart: e.shiftKey, shiftReleased: false };
     return true;
   }
 
@@ -524,7 +529,9 @@
       if (Math.hypot(ix - drag.pts[n - 2], iy - drag.pts[n - 1]) * pane.view.scale >= 1.5) drag.pts = [...drag.pts, ix, iy];
     } else {
       let [x, y] = [ix, iy];
-      if (e.shiftKey) {
+      // Shift pressed to add (at the start) does not make a square; Shift pressed (again) while dragging does
+      if (!e.shiftKey) drag.shiftReleased = true;
+      if (e.shiftKey && (!drag.shiftAtStart || drag.shiftReleased)) {
         // square / circle
         const dx = x - drag.pts[0], dy = y - drag.pts[1], d = Math.max(Math.abs(dx), Math.abs(dy));
         x = drag.pts[0] + Math.sign(dx || 1) * d;

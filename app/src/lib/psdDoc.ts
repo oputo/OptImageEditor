@@ -29,8 +29,12 @@ export type MaskData = {
   /** value outside the mask rectangle (0 or 255) */
   defaultColor: number;
   disabled: boolean;
-  /** w * h grey values; null when the rectangle is empty */
+  /** w * h grey values; null when the rectangle is empty (dropped after the GPU upload) */
   pixels: Uint8Array | null;
+  /** small grey preview (RGBA) for the layers panel */
+  thumb: { w: number; h: number; data: Uint8ClampedArray } | null;
+  /** the vector mask is also present (Photoshop then stores the pixel mask differently: editing is refused) */
+  withVector?: boolean;
 };
 
 export type DocLayer = {
@@ -60,6 +64,8 @@ export type DocLayer = {
   /** straight (not premultiplied) RGBA, w * h * 4; dropped after the GPU upload */
   pixels: Uint8ClampedArray | null;
   mask: MaskData | null;
+  /** the layer mask was added / changed / deleted in the app (saved from the GPU, not copied from the file) */
+  maskEdited: boolean;
   /** small preview (RGBA, thumbW x thumbH) */
   thumb: { w: number; h: number; data: Uint8ClampedArray } | null;
   children: DocLayer[] | null;
@@ -109,6 +115,8 @@ export type PlanNode = {
   blendMode: LayerBlendMode;
   clipping: boolean;
   maskDisabled: boolean | null;
+  /** mask added / changed / deleted in the app: the saver attaches `maskPixels` (none = the mask was deleted) */
+  maskEdited: boolean;
   open: boolean;
   /** pixels made in the app: index into the pixel blobs sent with the save request (set by the saver) */
   raster: boolean;
@@ -121,7 +129,7 @@ export function toPlan(layers: DocLayer[]): PlanNode[] {
   return layers.map((l) => ({
     id: l.id, origId: l.origId, dup: l.dup, group: !!l.children, name: l.name, hidden: l.hidden,
     opacity: l.opacity, fill: l.fill, blendMode: l.blendMode, clipping: l.clipping,
-    maskDisabled: l.mask ? l.mask.disabled : null, open: l.open, raster: l.raster, background: l.background, locks: l.locks,
+    maskDisabled: l.mask ? l.mask.disabled : null, maskEdited: l.maskEdited, open: l.open, raster: l.raster, background: l.background, locks: l.locks,
     children: l.children ? toPlan(l.children) : null,
   }));
 }
@@ -136,6 +144,27 @@ export function cloneTree(layers: DocLayer[]): DocLayer[] {
     thumb: l.thumb ? { ...l.thumb } : null,
     children: l.children ? cloneTree(l.children) : null,
   }));
+}
+
+/** grey preview of a mask (w x h values; an empty mask: its default colour) */
+export function maskThumbOf(px: Uint8Array | null, w: number, h: number, defaultColor: number) {
+  if (!px || w <= 0 || h <= 0) {
+    const d = new Uint8ClampedArray(8 * 8 * 4);
+    for (let i = 0; i < d.length; i += 4) { d[i] = d[i + 1] = d[i + 2] = defaultColor; d[i + 3] = 255; }
+    return { w: 8, h: 8, data: d };
+  }
+  const k = Math.min(1, THUMB / Math.max(w, h));
+  const tw = Math.max(1, Math.round(w * k)), th = Math.max(1, Math.round(h * k));
+  const out = new Uint8ClampedArray(tw * th * 4);
+  for (let y = 0; y < th; y++) {
+    const sy = Math.min(h - 1, Math.floor((y + 0.5) / k));
+    for (let x = 0; x < tw; x++) {
+      const v = px[sy * w + Math.min(w - 1, Math.floor((x + 0.5) / k))], o = (y * tw + x) * 4;
+      out[o] = out[o + 1] = out[o + 2] = v;
+      out[o + 3] = 255;
+    }
+  }
+  return { w: tw, h: th, data: out };
 }
 
 /** layer thumbnail size (longest side, px) */

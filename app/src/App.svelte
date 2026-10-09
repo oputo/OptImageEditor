@@ -280,7 +280,8 @@
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "c") copySel(false);
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "x") copySel(true);
     else if (ctrl && !e.altKey && kk === "j" && active?.sel) layerKey((t) => msg(vs.layerViaSelection(t, e.shiftKey)));
-    else if (!ctrl && (k === "Delete" || k === "Backspace") && active?.sel && !annotOn) layerKey((t) => msg(vs.clearSelection(t)));
+    else if (!ctrl && (k === "Delete" || k === "Backspace") && active?.sel && !annotOn) layerKey((t) => msg(t.layers!.maskTarget ? vs.hideInMask(t) : vs.clearSelection(t)));
+    else if (ctrl && !e.shiftKey && !e.altKey && kk === "i" && active?.layers?.maskTarget) layerKey((t) => msg(vs.invertMask(t)));
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
     else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) setAnnotTool(TOOL_BY_KEY[kk]);
     else if (ctrl && e.shiftKey && kk === "c") copyAnnotated();
@@ -292,8 +293,12 @@
     else if (ctrl && e.shiftKey && kk === "s" && active?.annot.shapes.length) saveAnnotated();
     else if (annotOn && ctrl && (kk === "z" || kk === "y")) { if (kk === "y" || e.shiftKey) active!.annot.redo(); else active!.annot.undo(); }
     else if (annotOn && !ctrl && (k === "Delete" || k === "Backspace") && active!.annot.selected !== null) active!.annot.remove(active!.annot.selected!);
-    else if (ctrl && kk === "z") layerKey((t) => (e.shiftKey ? vs.redo(t) : vs.undo(t)));
-    else if (ctrl && kk === "y") layerKey((t) => vs.redo(t));
+    else if (ctrl && (kk === "z" || kk === "y")) {
+      const redo = kk === "y" || e.shiftKey;
+      // layers loaded: the document's history (the selection is part of it); otherwise the selection's own
+      if (active?.layers?.status === "ready") { if (redo) vs.redo(active); else vs.undo(active); }
+      else if (!(active && vs.travelSelection(active, !redo))) layerKey(() => {});
+    }
     else if (ctrl && !e.altKey && kk === "e") layerKey((t) => { const m = e.shiftKey ? vs.mergeVisible(t) : vs.mergeDown(t); if (m) showToast(m); });
     else if (ctrl && kk === "s") save(e.shiftKey);
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "j") layerKey((t) => vs.duplicate(t));

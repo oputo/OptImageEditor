@@ -2,7 +2,7 @@
 // PSD/PSB: ag-psd reads only the stored composite image (layer pixels are skipped -> fast, low memory).
 // PNG/JPG/WebP: decoded by the browser engine via createImageBitmap.
 import { initializeCanvas, readPsd, writePsd, type Layer } from "ag-psd";
-import { thumbOf, type DocLayer, type LayerBlendMode, type LayerKind, type PlanNode, type PsdDocData } from "./psdDoc";
+import { maskThumbOf, thumbOf, type DocLayer, type LayerBlendMode, type LayerKind, type PlanNode, type PsdDocData } from "./psdDoc";
 
 // Workers have no `document`: give ag-psd OffscreenCanvas / ImageData factories.
 initializeCanvas(
@@ -119,7 +119,9 @@ function convertLayers(layers: Layer[] | undefined, seq: { n: number }, transfer
         for (let i = 0; i < mp.length; i++) mp[i] = src[i * 4] as number;
         transfer.push(mp.buffer as ArrayBuffer);
       }
-      mask = { x: mx, y: my, w: mp ? mw : 0, h: mp ? mh : 0, defaultColor: m.defaultColor ?? 255, disabled: !!m.disabled, pixels: mp };
+      const thumb = maskThumbOf(mp, mw, mh, m.defaultColor ?? 255);
+      transfer.push(thumb.data.buffer as ArrayBuffer);
+      mask = { x: mx, y: my, w: mp ? mw : 0, h: mp ? mh : 0, defaultColor: m.defaultColor ?? 255, disabled: !!m.disabled, pixels: mp, thumb, withVector: !!l.vectorMask };
     }
     const thumb = pixels ? thumbOf(pixels, w, h) : null;
     if (pixels) transfer.push(pixels.buffer as ArrayBuffer);
@@ -143,6 +145,7 @@ function convertLayers(layers: Layer[] | undefined, seq: { n: number }, transfer
       x, y, w: pixels ? w : 0, h: pixels ? h : 0,
       pixels,
       mask,
+      maskEdited: false,
       thumb,
       children,
       open: !!l.opened,
@@ -231,7 +234,7 @@ function readLayers(id: number, buffer: ArrayBuffer) {
       layers.push({
         id: 1, origId: null, dup: false, raster: true, background: true, locks: 0, name: "背景", kind: "pixel",
         hidden: false, opacity: 1, fill: 1, blendMode: "normal", clipping: false, x: 0, y: 0, w: psd.width, h: psd.height,
-        pixels: px, mask: null, thumb, children: null, open: true, warnings: [],
+        pixels: px, mask: null, maskEdited: false, thumb, children: null, open: true, warnings: [],
       });
     }
   }

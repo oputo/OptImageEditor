@@ -1,8 +1,13 @@
 // Selection (phase 3-a): an 8-bit mask over the canvas (0 = not selected, 255 = selected, values between for
 // anti-aliased / feathered edges), kept as its bounding rectangle + the mask inside it. A selection is an immutable
 // value: every change makes a new one, so undo snapshots can share them.
+// A class (not a plain object): Svelte's $state does not proxy class instances. A proxied selection made every pixel
+// access go through the proxy (selecting on a 4096 px image took seconds).
 
-export type Sel = { x: number; y: number; w: number; h: number; m: Uint8Array };
+export class Sel {
+  constructor(readonly x: number, readonly y: number, readonly w: number, readonly h: number, readonly m: Uint8Array) {}
+}
+const mk = (x: number, y: number, w: number, h: number, m: Uint8Array) => new Sel(x, y, w, h, m);
 export type SelMode = "replace" | "add" | "subtract" | "intersect";
 export type SelTool = "rect" | "ellipse" | "lasso" | "poly";
 
@@ -37,7 +42,7 @@ export function clipRect(x0: number, y0: number, x1: number, y1: number, W: numb
 export function rectSel(x0: number, y0: number, x1: number, y1: number, W: number, H: number): Sel | null {
   const r = clipRect(Math.round(x0), Math.round(y0), Math.round(x1), Math.round(y1), W, H);
   if (!r) return null;
-  return { ...r, m: new Uint8Array(r.w * r.h).fill(255) };
+  return mk(r.x, r.y, r.w, r.h, new Uint8Array(r.w * r.h).fill(255));
 }
 
 /** a filled path (anti-aliased), drawn by `draw` in canvas px, inside the box (x0, y0)-(x1, y1) */
@@ -54,7 +59,7 @@ function pathSel(x0: number, y0: number, x1: number, y1: number, W: number, H: n
   const d = ctx.getImageData(0, 0, r.w, r.h).data;
   const m = new Uint8Array(r.w * r.h);
   for (let i = 0; i < m.length; i++) m[i] = d[i * 4 + 3];
-  return trimSel({ ...r, m });
+  return trimSel(mk(r.x, r.y, r.w, r.h, m));
 }
 
 export function ellipseSel(x0: number, y0: number, x1: number, y1: number, W: number, H: number): Sel | null {
@@ -72,7 +77,7 @@ export function polySel(pts: number[], W: number, H: number): Sel | null {
 }
 
 export function allSel(W: number, H: number): Sel {
-  return { x: 0, y: 0, w: W, h: H, m: new Uint8Array(W * H).fill(255) };
+  return mk(0, 0, W, H, new Uint8Array(W * H).fill(255));
 }
 
 /** value of the selection at canvas pixel (x, y) */
@@ -92,7 +97,7 @@ export function trimSel(s: Sel): Sel | null {
   const w = x1 - x0 + 1, h = y1 - y0 + 1;
   const m = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) m.set(s.m.subarray((y + y0) * s.w + x0, (y + y0) * s.w + x0 + w), y * w);
-  return { x: s.x + x0, y: s.y + y0, w, h, m };
+  return mk(s.x + x0, s.y + y0, w, h, m);
 }
 
 /** combines the current selection `a` with a new shape `b` */
@@ -104,25 +109,31 @@ export function combine(a: Sel | null, b: Sel | null, mode: SelMode): Sel | null
     const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
     const w = Math.max(a.x + a.w, b.x + b.w) - x, h = Math.max(a.y + a.h, b.y + b.h) - y;
     const m = new Uint8Array(w * h);
-    for (const s of [a, b]) {
-      for (let yy = 0; yy < s.h; yy++) {
-        const o = (yy + s.y - y) * w + s.x - x;
-        for (let xx = 0; xx < s.w; xx++) { const v = s.m[yy * s.w + xx]; if (v > m[o + xx]) m[o + xx] = v; }
-      }
+    // the first one is copied row by row, the second one takes the maximum
+    for (let yy = 0; yy < a.h; yy++) m.set(a.m.subarray(yy * a.w, (yy + 1) * a.w), (yy + a.y - y) * w + a.x - x);
+    const bm = b.m, bw = b.w;
+    for (let yy = 0; yy < b.h; yy++) {
+      const o = (yy + b.y - y) * w + b.x - x, r = yy * bw;
+      for (let xx = 0; xx < bw; xx++) { const v = bm[r + xx]; if (v > m[o + xx]) m[o + xx] = v; }
     }
-    return { x, y, w, h, m };
+    return mk(x, y, w, h, m);
   }
   if (!a) return null;
   if (mode === "subtract") {
     if (!b) return a;
     const m = new Uint8Array(a.m);
-    for (let yy = 0; yy < a.h; yy++) {
-      for (let xx = 0; xx < a.w; xx++) {
-        const v = selAt(b, xx + a.x, yy + a.y);
-        if (v) { const i = yy * a.w + xx; m[i] = Math.round((m[i] * (255 - v)) / 255); }
+    const x0 = Math.max(a.x, b.x), y0 = Math.max(a.y, b.y), x1 = Math.min(a.x + a.w, b.x + b.w), y1 = Math.min(a.y + a.h, b.y + b.h);
+    if (x1 <= x0 || y1 <= y0) return a;
+    const bm = b.m;
+    for (let y = y0; y < y1; y++) {
+      const ao = (y - a.y) * a.w - a.x, bo = (y - b.y) * b.w - b.x;
+      for (let x = x0; x < x1; x++) {
+        const v = bm[bo + x];
+        if (v === 255) m[ao + x] = 0;
+        else if (v) m[ao + x] = Math.round((m[ao + x] * (255 - v)) / 255);
       }
     }
-    return trimSel({ ...a, m });
+    return trimSel(mk(a.x, a.y, a.w, a.h, m));
   }
   // intersect
   if (!b) return null;
@@ -130,23 +141,25 @@ export function combine(a: Sel | null, b: Sel | null, mode: SelMode): Sel | null
   const w = Math.min(a.x + a.w, b.x + b.w) - x, h = Math.min(a.y + a.h, b.y + b.h) - y;
   if (w <= 0 || h <= 0) return null;
   const m = new Uint8Array(w * h);
-  for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) m[yy * w + xx] = Math.min(selAt(a, x + xx, y + yy), selAt(b, x + xx, y + yy));
-  return trimSel({ x, y, w, h, m });
+  const am = a.m, bm = b.m;
+  for (let yy = 0; yy < h; yy++) {
+    const ao = (yy + y - a.y) * a.w + x - a.x, bo = (yy + y - b.y) * b.w + x - b.x, o = yy * w;
+    for (let xx = 0; xx < w; xx++) { const u = am[ao + xx], v = bm[bo + xx]; m[o + xx] = u < v ? u : v; }
+  }
+  return trimSel(mk(x, y, w, h, m));
 }
 
 /** Ctrl+Shift+I */
 export function invertSel(s: Sel | null, W: number, H: number): Sel | null {
   if (!s) return allSel(W, H);
   const m = new Uint8Array(W * H).fill(255);
-  for (let y = 0; y < s.h; y++) {
-    const cy = y + s.y;
-    if (cy < 0 || cy >= H) continue;
-    for (let x = 0; x < s.w; x++) {
-      const cx = x + s.x;
-      if (cx >= 0 && cx < W) m[cy * W + cx] = 255 - s.m[y * s.w + x];
-    }
+  const sm = s.m, sw = s.w;
+  const x0 = Math.max(0, s.x), x1 = Math.min(W, s.x + s.w);
+  for (let y = Math.max(0, s.y); y < Math.min(H, s.y + s.h); y++) {
+    const o = y * W, r = (y - s.y) * sw - s.x;
+    for (let x = x0; x < x1; x++) m[o + x] = 255 - sm[r + x];
   }
-  return trimSel({ x: 0, y: 0, w: W, h: H, m });
+  return trimSel(mk(0, 0, W, H, m));
 }
 
 /** selection from the alpha of straight RGBA pixels at (x, y) (Ctrl+click on a layer thumbnail), clipped to the canvas */
@@ -154,35 +167,48 @@ export function selFromAlpha(p: { x: number; y: number; w: number; h: number; px
   const r = clipRect(p.x, p.y, p.x + p.w, p.y + p.h, W, H);
   if (!r) return null;
   const m = new Uint8Array(r.w * r.h);
-  for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) m[y * r.w + x] = p.px[((y + r.y - p.y) * p.w + x + r.x - p.x) * 4 + 3];
-  return trimSel({ ...r, m });
+  const px = p.px;
+  for (let y = 0; y < r.h; y++) {
+    const s = ((y + r.y - p.y) * p.w + r.x - p.x) * 4 + 3, o = y * r.w;
+    for (let x = 0; x < r.w; x++) m[o + x] = px[s + x * 4];
+  }
+  return trimSel(mk(r.x, r.y, r.w, r.h, m));
 }
 
 /** moves a selection (canvas size change) */
-export const shiftSel = (s: Sel | null, dx: number, dy: number): Sel | null => (s && (dx || dy) ? { ...s, x: s.x + dx, y: s.y + dy } : s);
+export const shiftSel = (s: Sel | null, dx: number, dy: number): Sel | null => (s && (dx || dy) ? mk(s.x + dx, s.y + dy, s.w, s.h, s.m) : s);
 
 /** Outline of the selection at 50 %: segments x0, y0, x1, y1 (canvas px, on pixel edges), adjacent runs merged.
  *  null when there are too many to draw every frame (the bounding box is drawn instead). */
 export function outline(s: Sel, max = 400000): Float32Array | null {
   const out: number[] = [];
-  const inside = (x: number, y: number) => x >= 0 && y >= 0 && x < s.w && y < s.h && s.m[y * s.w + x] >= 128;
+  const { w, h } = s;
+  // inside = >= 50 %, with a 1 px border of "outside" so the edges need no bounds checks
+  const W = w + 2;
+  const inside = new Uint8Array(W * (h + 2));
+  for (let y = 0; y < h; y++) {
+    const o = (y + 1) * W + 1, r = y * w;
+    for (let x = 0; x < w; x++) inside[o + x] = s.m[r + x] >= 128 ? 1 : 0;
+  }
   // horizontal edges: between row y - 1 and row y
-  for (let y = 0; y <= s.h; y++) {
+  for (let y = 0; y <= h; y++) {
+    const up = y * W + 1, dn = (y + 1) * W + 1;
     let start = -1;
-    for (let x = 0; x <= s.w; x++) {
-      const edge = x < s.w && inside(x, y - 1) !== inside(x, y);
-      if (edge && start < 0) start = x;
-      else if (!edge && start >= 0) { out.push(s.x + start, s.y + y, s.x + x, s.y + y); start = -1; }
+    for (let x = 0; x <= w; x++) {
+      const edge = x < w && inside[up + x] !== inside[dn + x];
+      if (edge) { if (start < 0) start = x; }
+      else if (start >= 0) { out.push(s.x + start, s.y + y, s.x + x, s.y + y); start = -1; }
     }
     if (out.length > max * 4) return null;
   }
   // vertical edges: between column x - 1 and column x
-  for (let x = 0; x <= s.w; x++) {
+  for (let x = 0; x <= w; x++) {
     let start = -1;
-    for (let y = 0; y <= s.h; y++) {
-      const edge = y < s.h && inside(x - 1, y) !== inside(x, y);
-      if (edge && start < 0) start = y;
-      else if (!edge && start >= 0) { out.push(s.x + x, s.y + start, s.x + x, s.y + y); start = -1; }
+    for (let y = 0; y <= h; y++) {
+      const i = (y + 1) * W + x;
+      const edge = y < h && inside[i] !== inside[i + 1];
+      if (edge) { if (start < 0) start = y; }
+      else if (start >= 0) { out.push(s.x + x, s.y + start, s.x + x, s.y + y); start = -1; }
     }
     if (out.length > max * 4) return null;
   }

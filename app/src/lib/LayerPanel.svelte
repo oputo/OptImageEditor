@@ -147,11 +147,21 @@
   function onRowDown(l: DocLayer, e: PointerEvent) {
     if (e.button !== 0 || renaming !== null || !L || !tab) return;
     if ((e.target as HTMLElement).closest("button, input")) return;
+    const cls = (e.target as HTMLElement).classList;
     // Ctrl+click on the thumbnail: select the layer's opaque pixels (+Shift add, +Alt subtract, +Shift+Alt intersect)
-    if ((e.ctrlKey || e.metaKey) && (e.target as HTMLElement).classList.contains("thumb")) {
+    if ((e.ctrlKey || e.metaKey) && cls.contains("thumb")) {
       vs.selectFromLayer(tab, l.id, modeOf(e));
       return;
     }
+    // mask thumbnail: click = edit the mask, Ctrl = selection from it, Shift = on / off, Alt = show it
+    if (cls.contains("mthumb") && l.mask) {
+      if (e.ctrlKey || e.metaKey) vs.selectFromMask(tab, l.id, modeOf(e));
+      else if (e.shiftKey) { vs.select(tab, [l.id]); update(l.id, { maskDisabled: !l.mask.disabled }); }
+      else if (e.altKey) { vs.select(tab, [l.id]); vs.showMask(tab, L.maskView === l.id ? null : l.id); }
+      else { vs.select(tab, [l.id]); vs.setMaskTarget(tab, true); }
+      return;
+    }
+    if (cls.contains("thumb") && !e.shiftKey) { vs.select(tab, [l.id]); vs.setMaskTarget(tab, false); }
     collapseTo = null;
     if (e.ctrlKey || e.metaKey) {
       const has = L.selection.includes(l.id);
@@ -278,9 +288,12 @@
             <span class="folder">▭</span>
           {:else}
             {#if r.clipped}<span class="clip" title="クリッピングマスク">↳</span>{/if}
-            <canvas class="thumb" use:thumb={l.thumb} title="Ctrl+クリック: 不透明部分を選択（+Shift 追加 / +Alt 除外）"></canvas>
+            <canvas class="thumb" class:target={!!l.mask && !L.maskTarget && L.selectedId === l.id} use:thumb={l.thumb} title="Ctrl+クリック: 不透明部分を選択（+Shift 追加 / +Alt 除外）"></canvas>
           {/if}
-          {#if l.mask && !l.children}<span class="maskmark" class:off={l.mask.disabled} title={l.mask.disabled ? "マスク（無効）" : "レイヤーマスク"}>◐</span>{/if}
+          {#if l.mask && !l.children && l.mask.thumb}
+            <canvas class="mthumb" class:target={L.maskTarget && L.selectedId === l.id} class:off={l.mask.disabled} class:viewing={L.maskView === l.id}
+              use:thumb={l.mask.thumb} title="レイヤーマスク{l.mask.disabled ? '（無効）' : ''}。クリック: マスクを編集対象に / Ctrl+クリック: 選択範囲に / Shift+クリック: 有効・無効 / Alt+クリック: マスクを表示"></canvas>
+          {:else if l.mask}<span class="maskmark" class:off={l.mask.disabled} title={l.mask.disabled ? "マスク（無効）" : "レイヤーマスク"}>◐</span>{/if}
           {#if renaming === l.id}
             <input class="rename" value={l.name} use:focusSelect
               onkeydown={(e) => { if (e.key === "Enter") finishRename(l, e.currentTarget, true); else if (e.key === "Escape") finishRename(l, e.currentTarget, false); e.stopPropagation(); }}
@@ -316,6 +329,19 @@
             <span class="lbl">塗り</span>
             <input type="range" min="0" max="100" value={pct(selected.fill)} oninput={(e) => updateSel({ fill: Number((e.currentTarget as HTMLInputElement).value) / 100 }, `fill:${L.selection.join(",")}`)} />
             <span class="val">{mixed("fill") ? "—" : `${pct(selected.fill)}%`}</span>
+          </div>
+        {/if}
+        {#if !selected.children}
+          <div class="prow">
+            <span class="lbl">マスク</span>
+            {#if selected.mask}
+              <button class="mb" class:on={L.maskTarget} onclick={() => tab && vs.setMaskTarget(tab, !L.maskTarget)} title="描画・消去の対象をマスクにする（マスクのサムネイルをクリックでも同じ）">編集</button>
+              <button class="mb" class:on={L.maskView === selected.id} onclick={() => tab && vs.showMask(tab, L.maskView === selected.id ? null : selected.id)} title="マスクを白黒で表示（Alt+サムネイル）">表示</button>
+              <button class="mb" onclick={() => tab && onmsg(vs.applyMask(tab) ?? "")} title="マスクを画素に適用して削除">適用</button>
+              <button class="mb" onclick={() => tab && onmsg(vs.deleteMask(tab) ?? "")} title="マスクを削除">削除</button>
+            {:else}
+              <button class="mb" onclick={(e) => tab && onmsg(vs.addMask(tab, e.altKey) ?? "")} title="レイヤーマスクを追加（選択範囲があればその形。Alt: 隠す）">追加</button>
+            {/if}
           </div>
         {/if}
         {#if selected.mask}
@@ -416,6 +442,12 @@
   .prow .val { width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
   .prow.chk { cursor: pointer; }
   .pwarn { color: #f0c040; font-size: 11px; }
+  .mthumb { width: 40px; height: 40px; flex: none; border: 1px solid #555; background: #000; image-rendering: pixelated; }
+  .mthumb.off { opacity: 0.4; outline: 2px solid #c33; outline-offset: -2px; }
+  .mthumb.viewing { box-shadow: 0 0 0 2px #f0c040; }
+  .thumb.target, .mthumb.target { border-color: #fff; box-shadow: 0 0 0 1px #fff; }
+  .mb { background: #3a3a3a; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; padding: 1px 7px; font: inherit; font-size: 11px; cursor: pointer; }
+  .mb.on { background: #2f4f73; border-color: var(--accent); color: #fff; }
   footer { border-top: 1px solid var(--border); padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
   footer button { background: #3a3a3a; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; padding: 2px 8px; font: inherit; cursor: pointer; }
   .dirty { color: #f0c040; font-size: 11px; }

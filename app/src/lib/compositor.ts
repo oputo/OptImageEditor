@@ -552,6 +552,36 @@ export class Compositor {
     return out;
   }
 
+  /** A layer mask read back from the GPU: w * h grey values. */
+  readMaskPixels(doc: LayerDoc, id: number, w: number, h: number): Uint8Array {
+    const gl = this.gl;
+    const out = new Uint8Array(w * h);
+    const tex = doc.gpu.get(id)?.mask;
+    if (!tex || w <= 0 || h <= 0) return out;
+    const rgba = new Uint8Array(w * h * 4);
+    const fb = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb);
+    for (let i = 0; i < out.length; i++) out[i] = rgba[i * 4];
+    return out;
+  }
+
+  /** Layer `id` gets the pixels of layer `src` and a new mask (w * h grey values; null: none / empty). */
+  setLayerMask(doc: LayerDoc, id: number, src: number, mask: Uint8Array | null, w: number, h: number) {
+    const gl = this.gl;
+    const g: GpuLayer = { tex: doc.gpu.get(src)?.tex ?? null, mask: null };
+    if (mask && w > 0 && h > 0) {
+      g.mask = this.texture(gl.R8, w, h);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RED, gl.UNSIGNED_BYTE, mask);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    }
+    doc.gpu.set(id, g);
+  }
+
   /** Frees the GPU data of layers that are neither in the tree nor in the undo history (`keep`). */
   releaseUnused(doc: LayerDoc, keep: Set<number>) {
     const gl = this.gl;

@@ -7,7 +7,7 @@
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
 import { buildPsd, isPsd, loadImage, loadLayers, SUPPORTED_EXT, type LoadedImage } from "./loader";
 import { Compositor, type LayerDoc } from "./compositor";
-import { LOCK_ALL, LOCK_TRANSPARENCY, cloneTree, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode } from "./psdDoc";
+import { LOCK_ALL, LOCK_TRANSPARENCY, cloneTree, maskThumbOf, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
@@ -16,8 +16,8 @@ import { recent } from "./recent.svelte";
 import { Annotations, flattenToCanvas, flattenToPng } from "./annotations.svelte";
 import { comfy, loadWorkflow, type Progress, type WorkflowKind } from "./comfy";
 import {
-  allSel, clearPixels, selAt, combine, ellipseSel, invertSel, maskPixels, polySel, rectSel, selFromAlpha, shiftSel,
-  type Sel, type SelMode, type SelTool,
+  Sel, allSel, clearPixels, selAt, trimSel, combine, ellipseSel, invertSel, maskPixels, polySel, rectSel, selFromAlpha, shiftSel,
+  type SelMode, type SelTool,
 } from "./selection.svelte";
 import { applyMask, crop, decode, editRegion, featheredPatch, fitMax, fitPixels, over, toPng, trim, type Pixels, type Rect } from "./ai";
 
@@ -88,6 +88,10 @@ export type LayersState = {
   /** layers (groups included) in the file on disk, in the post-order the source ids refer to */
   fileCount: number;
   canvas: Canvas;
+  /** edits act on the active layer's mask (its mask thumbnail was clicked) */
+  maskTarget: boolean;
+  /** layer whose mask is shown instead of the image (Alt+click on the mask thumbnail) */
+  maskView: number | null;
 };
 
 /** Undo history of a tab's layer tree (snapshots of the tree; pixels are not edited in 2-b). */
@@ -125,6 +129,8 @@ export class ViewerState {
   private docs = new Map<number, LayerDoc>();
   private compositePending = new Set<number>();
   private histories = new Map<number, History>();
+  /** selection undo of tabs without layers (reset when the tab shows another file: `key`) */
+  private selHistories = new Map<number, { key: string; undo: (Sel | null)[]; redo: (Sel | null)[] }>();
   /** paths whose original was already kept as .bak in this session */
   private backedUp = new Set<string>();
   /** tabs whose "not rendered" warning was already confirmed (asked once per tab) */
@@ -463,6 +469,7 @@ export class ViewerState {
     tab.layers = {
       status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, selection: [], stats: null, diff: null,
       dirty: false, undoCount: 0, redoCount: 0, saving: false, savePhase: null, saved: null, fileCount: 0, canvas: { w: 0, h: 0, ox: 0, oy: 0 },
+      maskTarget: false, maskView: null,
     };
     try {
       const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
@@ -517,6 +524,7 @@ export class ViewerState {
   layersChanged(tab: Tab) {
     const l = tab.layers;
     if (!l || l.status !== "ready") return;
+    if (l.maskView !== null && !this.locate(l.tree, l.maskView)) void this.showMask(tab, null);
     l.diff = null;
     if (!l.useLayers) this.setUseLayers(tab, true);
     if (this.compositePending.has(tab.id)) return;
@@ -634,7 +642,7 @@ export class ViewerState {
   private newLayerData(doc: LayerDoc, name: string, group: boolean): DocLayer {
     return {
       id: doc.nextId++, origId: null, dup: false, raster: false, background: false, locks: 0, name, kind: group ? "group" : "pixel", hidden: false, opacity: 1, fill: 1,
-      blendMode: group ? "pass through" : "normal", clipping: false, x: 0, y: 0, w: 0, h: 0, pixels: null, mask: null,
+      blendMode: group ? "pass through" : "normal", clipping: false, x: 0, y: 0, w: 0, h: 0, pixels: null, mask: null, maskEdited: false,
       thumb: null, children: group ? [] : null, open: true, warnings: [],
     };
   }
@@ -703,6 +711,7 @@ export class ViewerState {
   select(tab: Tab, ids: number[], active: number | null = ids[ids.length - 1] ?? null) {
     const l = tab.layers;
     if (!l) return;
+    if (active !== l.selectedId) l.maskTarget = false;
     l.selection = [...new Set(ids)];
     l.selectedId = active !== null && l.selection.includes(active) ? active : l.selection[l.selection.length - 1] ?? null;
   }
@@ -864,7 +873,7 @@ export class ViewerState {
       let ok = true;
       for (const x of ls) {
         const o = now.get(x.id);
-        if (o !== undefined) { x.origId = o; x.dup = false; x.raster = false; }
+        if (o !== undefined) { x.origId = o; x.dup = false; x.raster = false; x.maskEdited = false; }
         // a layer of the old file that is gone (deleted, or replaced by edited pixels) cannot be found in the new one
         else if (x.origId !== null) ok = false;
         if (x.children && !fix(x.children)) ok = false;
@@ -955,7 +964,7 @@ export class ViewerState {
     this.compositor!.setLayerPixels(doc, id, r.px, r.w, r.h);
     return {
       id, origId: null, dup: false, raster: true, background: false, locks: 0, name, kind: "pixel", hidden: false,
-      opacity: 1, fill: 1, blendMode: "normal", clipping: false, x: r.x, y: r.y, w: r.w, h: r.h, pixels: null, mask: null,
+      opacity: 1, fill: 1, blendMode: "normal", clipping: false, x: r.x, y: r.y, w: r.w, h: r.h, pixels: null, mask: null, maskEdited: false,
       thumb: thumbOf(r.px, r.w, r.h), children: null, open: true, warnings: [],
     };
   }
@@ -1127,8 +1136,29 @@ export class ViewerState {
       l.undoCount = h.undo.length;
       l.redoCount = h.redo.length;
     }
+    else {
+      // images without layers: an undo history of the selection only
+      let h = this.selHistories.get(tab.id);
+      if (!h || h.key !== tab.key) { h = { key: tab.key, undo: [], redo: [] }; this.selHistories.set(tab.id, h); }
+      h.undo.push(tab.sel);
+      if (h.undo.length > HISTORY_MAX) h.undo.shift();
+      h.redo = [];
+    }
     if (!s && tab.sel) tab.lastSel = tab.sel;
     tab.sel = s;
+  }
+
+  /** undo / redo of the selection of an image without layers (false: nothing to undo) */
+  travelSelection(tab: Tab, back: boolean): boolean {
+    const h = this.selHistories.get(tab.id);
+    if (!h || h.key !== tab.key) return false;
+    const from = back ? h.undo : h.redo, to = back ? h.redo : h.undo;
+    if (!from.length) return false;
+    to.push(tab.sel);
+    const s = from.pop()!;
+    if (!s && tab.sel) tab.lastSel = tab.sel;
+    tab.sel = s;
+    return true;
   }
 
   /** a shape drawn with a selection tool (canvas px), combined with the current selection */
@@ -1282,6 +1312,186 @@ export class ViewerState {
     const res = this.rasterLayer(doc, `レイヤー ${this.countLayers(l.tree) + 1}`, { ...at, w: d.w, h: d.h, px });
     this.insert(tab, res, "貼り付け");
     return `貼り付けました（${d.w} × ${d.h}）`;
+  }
+
+  // ---------------------------------------------------------------- layer masks (3-a follow-up)
+
+  /** a layer's mask on the CPU (canvas px; empty rectangle: everything is `defaultColor`) */
+  private maskOf(tab: Tab, node: DocLayer): { x: number; y: number; w: number; h: number; def: number; px: Uint8Array } {
+    const m = node.mask!;
+    const doc = this.docs.get(tab.id)!;
+    const px = m.w > 0 && m.h > 0 ? this.compositor!.readMaskPixels(doc, node.id, m.w, m.h) : new Uint8Array(0);
+    return { x: m.x, y: m.y, w: m.w, h: m.h, def: m.defaultColor, px };
+  }
+
+  /** a copy of `node` (new id) with mask `m` (null: no mask); its pixels are shared */
+  private withMask(tab: Tab, node: DocLayer, m: { x: number; y: number; w: number; h: number; def: number; px: Uint8Array } | null, disabled = false): DocLayer {
+    const doc = this.docs.get(tab.id)!;
+    const id = doc.nextId++;
+    this.compositor!.setLayerMask(doc, id, node.id, m && m.w > 0 && m.h > 0 ? m.px : null, m?.w ?? 0, m?.h ?? 0);
+    return {
+      ...cloneTree([node])[0], id, maskEdited: true,
+      mask: m ? { x: m.x, y: m.y, w: m.w, h: m.h, defaultColor: m.def, disabled, pixels: null, thumb: maskThumbOf(m.px, m.w, m.h, m.def) } : null,
+    };
+  }
+
+  private maskBlocker(node: DocLayer | null | undefined): string | null {
+    if (!node) return "レイヤーを選択してください";
+    if (node.children) return "グループのレイヤーマスクは未対応です";
+    if (node.mask?.withVector) return "ベクトルマスクのあるレイヤーのマスクは編集できません";
+    if (node.origId === null && !node.raster) return "空のレイヤーにはマスクを追加できません";
+    if ((node.locks >>> 0) & LOCK_ALL) return `「${node.name}」はロックされています`;
+    return null;
+  }
+
+  /** replaces the active layer with `make(node)` as one undo step and selects it */
+  private replaceActive(tab: Tab, node: DocLayer, next: DocLayer, maskTarget: boolean) {
+    this.edit(tab, null, (tree) => { const at = this.locate(tree, node.id)!; at.list.splice(at.index, 1, next); });
+    this.select(tab, [next.id]);
+    tab.layers!.maskTarget = maskTarget && !!next.mask;
+    if (tab.layers!.maskView === node.id) this.showMask(tab, next.mask ? next.id : null);
+  }
+
+  /** Adds a layer mask to the active layer: from the selection (`hide`: the selection hidden), else revealing
+   *  (`hide`: hiding) everything. */
+  addMask(tab: Tab, hide: boolean): string | null {
+    const l = tab.layers;
+    const node = l && this.locate(l.tree, l.selectedId)?.node;
+    const b = this.maskBlocker(node);
+    if (b) return b;
+    if (node!.mask) return "このレイヤーにはすでにマスクがあります";
+    const s = tab.sel;
+    const m = s
+      ? { x: s.x, y: s.y, w: s.w, h: s.h, def: hide ? 255 : 0, px: hide ? s.m.map((v) => 255 - v) : new Uint8Array(s.m) }
+      : { x: 0, y: 0, w: 0, h: 0, def: hide ? 0 : 255, px: new Uint8Array(0) };
+    this.replaceActive(tab, node!, this.withMask(tab, node!, m), true);
+    return null;
+  }
+
+  deleteMask(tab: Tab): string | null {
+    const l = tab.layers;
+    const node = l && this.locate(l.tree, l.selectedId)?.node;
+    if (!node?.mask) return "マスクがありません";
+    const b = this.maskBlocker(node);
+    if (b) return b;
+    this.replaceActive(tab, node, this.withMask(tab, node, null), false);
+    return null;
+  }
+
+  /** bakes the mask into the layer's pixels (pixel layers) */
+  applyMask(tab: Tab): string | null {
+    const l = tab.layers;
+    const node = l && this.locate(l.tree, l.selectedId)?.node;
+    if (!node?.mask) return "マスクがありません";
+    const b = this.maskBlocker(node) ?? this.pixelBlocker(node);
+    if (b) return b;
+    const m = this.maskOf(tab, node);
+    const src = this.layerPixels(tab, node);
+    const px = new Uint8Array(src.px);
+    for (let y = 0; y < src.h; y++) {
+      for (let x = 0; x < src.w; x++) {
+        const cx = x + src.x - m.x, cy = y + src.y - m.y;
+        const v = cx >= 0 && cy >= 0 && cx < m.w && cy < m.h ? m.px[cy * m.w + cx] : m.def;
+        const i = (y * src.w + x) * 4 + 3;
+        px[i] = Math.round((px[i] * v) / 255);
+      }
+    }
+    const withPx = this.withPixels(tab, node, { ...src, px });
+    const doc = this.docs.get(tab.id)!;
+    const id = doc.nextId++;
+    this.compositor!.setLayerMask(doc, id, withPx.id, null, 0, 0);
+    this.replaceActive(tab, node, { ...withPx, id, mask: null, maskEdited: true }, false);
+    return null;
+  }
+
+  /** Changes the active layer's mask: `f(value, selection value)` over the selection (or the whole mask). */
+  private editMask(tab: Tab, f: (v: number, s: number) => number): string | null {
+    const l = tab.layers;
+    const node = l && this.locate(l.tree, l.selectedId)?.node;
+    if (!node?.mask) return "マスクがありません";
+    const b = this.maskBlocker(node);
+    if (b) return b;
+    const m = this.maskOf(tab, node);
+    const c = l!.canvas;
+    const s = tab.sel;
+    // the new mask covers the old rectangle and the selection (an empty one: the selection only)
+    const has = m.w > 0 && m.h > 0;
+    const r = s ? (has ? { x0: Math.min(m.x, s.x), y0: Math.min(m.y, s.y), x1: Math.max(m.x + m.w, s.x + s.w), y1: Math.max(m.y + m.h, s.y + s.h) } : { x0: s.x, y0: s.y, x1: s.x + s.w, y1: s.y + s.h })
+      : has ? { x0: m.x, y0: m.y, x1: m.x + m.w, y1: m.y + m.h } : { x0: 0, y0: 0, x1: c.w, y1: c.h };
+    const w = r.x1 - r.x0, h = r.y1 - r.y0;
+    const px = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const cx = x + r.x0, cy = y + r.y0;
+        const mx = cx - m.x, my = cy - m.y;
+        const v = mx >= 0 && my >= 0 && mx < m.w && my < m.h ? m.px[my * m.w + mx] : m.def;
+        const sv = s ? selAt(s, cx, cy) : 255;
+        px[y * w + x] = sv ? Math.round(v + (f(v, sv) - v) * (sv / 255)) : v;
+      }
+    }
+    // outside the new rectangle: unchanged default, unless the whole mask was inverted
+    const def = s ? m.def : f(m.def, 255);
+    this.replaceActive(tab, node, this.withMask(tab, node, { x: r.x0, y: r.y0, w, h, def, px }, node.mask.disabled), true);
+    return null;
+  }
+
+  /** Delete on the mask: hides the selected part (black) */
+  hideInMask(tab: Tab) { return this.editMask(tab, () => 0); }
+  /** Ctrl+I on the mask: inverts it (in the selection) */
+  invertMask(tab: Tab) { return this.editMask(tab, (v) => 255 - v); }
+
+  /** the mask (not the pixels) of the active layer is what edits act on */
+  setMaskTarget(tab: Tab, on: boolean) {
+    const l = tab.layers;
+    const node = l && this.locate(l.tree, l.selectedId)?.node;
+    if (l) l.maskTarget = on && !!node?.mask;
+  }
+
+  /** Ctrl+click on a mask thumbnail: selection from the mask */
+  selectFromMask(tab: Tab, id: number, mode: SelMode) {
+    const l = tab.layers;
+    const node = l && this.locate(l.tree, id)?.node;
+    if (!l || !node?.mask) return;
+    const m = this.maskOf(tab, node);
+    const W = l.canvas.w, H = l.canvas.h;
+    const px = new Uint8Array(W * H).fill(m.def);
+    for (let y = Math.max(0, m.y); y < Math.min(H, m.y + m.h); y++) {
+      const o = y * W, r = (y - m.y) * m.w - m.x;
+      for (let x = Math.max(0, m.x); x < Math.min(W, m.x + m.w); x++) px[o + x] = m.px[r + x];
+    }
+    this.setSelection(tab, combine(tab.sel, trimSel(new Sel(0, 0, W, H, px)), mode));
+  }
+
+  /** Alt+click on a mask thumbnail: shows the mask (grey) instead of the image; again (or null): back */
+  private maskSet: TextureSet | null = null;
+  async showMask(tab: Tab, id: number | null) {
+    const l = tab.layers;
+    if (!l || !this.renderer) return;
+    if (this.maskSet) { this.renderer.dispose(this.maskSet); this.maskSet = null; }
+    const node = id !== null ? this.locate(l.tree, id)?.node : null;
+    if (!node?.mask) {
+      l.maskView = null;
+      if (this.activeId === tab.id) { const v = this.renderer.getView(); this.setUseLayers(tab, true); this.renderer.setView(v); }
+      return;
+    }
+    l.maskView = node.id;
+    const m = this.maskOf(tab, node);
+    const W = l.canvas.w, H = l.canvas.h;
+    const rgba = new Uint8ClampedArray(W * H * 4);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const mx = x - m.x, my = y - m.y;
+        const v = mx >= 0 && my >= 0 && mx < m.w && my < m.h ? m.px[my * m.w + mx] : m.def;
+        const o = (y * W + x) * 4;
+        rgba[o] = rgba[o + 1] = rgba[o + 2] = v; rgba[o + 3] = 255;
+      }
+    }
+    const { set } = await this.renderer.upload({ kind: "rgba", width: W, height: H, data: rgba, premultiplied: true });
+    if (l.maskView !== node.id || this.activeId !== tab.id) { this.renderer.dispose(set); return; }
+    this.maskSet = set;
+    const v = this.renderer.getView();
+    this.renderer.show(set);
+    this.renderer.setView(v);
   }
 
   // ---------------------------------------------------------------- AI (ComfyUI, phase D minimal)
@@ -1617,6 +1827,16 @@ export class ViewerState {
           blobs.push(px);
           offset += px.length;
         }
+        if (n.maskEdited) {
+          const d = byId.get(n.id)!;
+          if (d.mask) {
+            const m = d.mask;
+            const px = m.w > 0 && m.h > 0 ? this.compositor!.readMaskPixels(doc, d.id, m.w, m.h) : new Uint8Array(0);
+            (n as PlanNode & { maskPixels?: unknown }).maskPixels = { offset, x: m.x, y: m.y, w: m.w, h: m.h, defaultColor: m.defaultColor, disabled: m.disabled };
+            blobs.push(px);
+            offset += px.length;
+          }
+        }
         if (n.children) attach(n.children);
       }
     };
@@ -1679,7 +1899,7 @@ export class ViewerState {
       if (backup) this.backedUp.add(keyOf(target));
       // the file now holds exactly this tree: renumber the source ids the way the worker reads them (post-order)
       let n = 0;
-      const renumber = (ls: DocLayer[]) => { for (const x of ls) { if (x.children) renumber(x.children); x.origId = ++n; x.dup = false; x.raster = false; x.background = false; } };
+      const renumber = (ls: DocLayer[]) => { for (const x of ls) { if (x.children) renumber(x.children); x.origId = ++n; x.dup = false; x.raster = false; x.background = false; x.maskEdited = false; } };
       // a flattened image is saved without layer records: its background stays a layer made in the app
       const flat = l.tree.length === 1 && l.tree[0].background && !l.tree[0].children;
       if (flat) { l.tree[0].origId = null; l.tree[0].raster = true; } else renumber(l.tree);
