@@ -14,6 +14,8 @@ import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from ".
 import { confirmDialog, copyImageFallback, listFolderImages, savePsd, saveDialog, setWindowTitle, writeFile } from "./desktop";
 import { recent } from "./recent.svelte";
 import { Annotations, flattenToCanvas, flattenToPng } from "./annotations.svelte";
+import { comfy, loadWorkflow, type Progress, type WorkflowKind } from "./comfy";
+import { applyMask, crop, decode, editRegion, featheredPatch, fitMax, fitPixels, over, toPng, trim, type Pixels, type Rect } from "./ai";
 
 export type ImageMeta = Omit<LoadedImage, "image" | "release"> & {
   uploadMs: number;
@@ -90,6 +92,8 @@ const HISTORY_MAX = 100;
 
 /** Comparison of the active tab (A) with tab `bId` (B; may be the same tab). */
 export type Compare = { bId: number; mode: CompareMode; linked: boolean; fitB: boolean; split: number; showB: boolean };
+
+const KIND_DONE: Record<WorkflowKind, string> = { bg_remove: "背景を除去しました", edit: "編集しました" };
 
 const GPU_BUDGET = 2 * 1024 ** 3; // bytes, incl. mipmaps
 const KEEP_OTHER_TABS = 2;
@@ -1088,6 +1092,134 @@ export class ViewerState {
     this.select(tab, [res.id]);
     this.releaseUnused(tab);
     return null;
+  }
+
+  // ---------------------------------------------------------------- AI (ComfyUI, phase D minimal)
+
+  /** What an AI tool works on in `tab`. Background removal: the active layer (PSD with its layers loaded; the layer
+   *  composite when none is selected). Edit: what is shown (the layer composite), so the model sees the context;
+   *  its result goes on top. Images without layers: the image as shown. */
+  aiTarget(tab: Tab, kind: WorkflowKind): { label: string; layered: boolean; layerId: number | null } {
+    const l = tab.layers;
+    if (l?.status === "ready") {
+      const at = kind === "bg_remove" ? this.locate(l.tree, l.selectedId) : null;
+      return at ? { label: `レイヤー「${at.node.name}」`, layered: true, layerId: at.node.id } : { label: "表示レイヤーの合成", layered: true, layerId: null };
+    }
+    return { label: isPsd(tab.name) ? "PS の統合画像（レイヤーは F7 で読み込み）" : "画像全体", layered: false, layerId: null };
+  }
+
+  /** the rectangle annotation the edit works on: the selected one, else the last one drawn (canvas px, clipped) */
+  aiRect(tab: Tab): Rect | null {
+    const set = this.renderer?.activeSet;
+    const W = tab.layers?.status === "ready" ? tab.layers.canvas.w : set?.width ?? 0;
+    const H = tab.layers?.status === "ready" ? tab.layers.canvas.h : set?.height ?? 0;
+    const shapes = tab.annot.shapes;
+    const s = shapes.find((x) => x.id === tab.annot.selected && x.kind === "rect") ?? [...shapes].reverse().find((x) => x.kind === "rect");
+    if (!s) return null;
+    const [a, b, c, d] = s.pts;
+    const x0 = Math.max(0, Math.round(Math.min(a, c))), y0 = Math.max(0, Math.round(Math.min(b, d)));
+    const x1 = Math.min(W, Math.round(Math.max(a, c))), y1 = Math.min(H, Math.round(Math.max(b, d)));
+    return x1 - x0 >= 8 && y1 - y0 >= 8 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+  }
+
+  /** the pixels the AI tools start from (straight RGBA in canvas coordinates) */
+  private aiSource(tab: Tab, layerId: number | null): Pixels & { canvas: { w: number; h: number }; node: DocLayer | null } {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (l?.status === "ready" && doc) {
+      const canvas = { w: l.canvas.w, h: l.canvas.h };
+      const node = this.locate(l.tree, layerId)?.node ?? null;
+      if (!node) return { ...this.rasterize(doc, l.tree), canvas, node: null };
+      // the layer's content at 100 % (its mask applied), whatever its blend mode / opacity / visibility
+      const solo: DocLayer = { ...node, hidden: false, opacity: 1, fill: 1, clipping: false, blendMode: "normal" };
+      return { ...this.rasterize(doc, [solo]), canvas, node };
+    }
+    const set = this.renderer?.activeSet;
+    if (!set || !this.renderer) throw new Error("画像がありません");
+    if (set.hdr) throw new Error("EXR / HDR は未対応です");
+    const p = this.renderer.readSet(set); // premultiplied
+    for (let i = 0; i < p.length; i += 4) {
+      const a = p[i + 3];
+      if (a && a < 255) { p[i] = Math.min(255, (p[i] * 255) / a + 0.5); p[i + 1] = Math.min(255, (p[i + 1] * 255) / a + 0.5); p[i + 2] = Math.min(255, (p[i + 2] * 255) / a + 0.5); }
+    }
+    return { x: 0, y: 0, w: set.width, h: set.height, px: p, canvas: { w: set.width, h: set.height }, node: null };
+  }
+
+  /** Runs an AI tool on the active tab through ComfyUI. The result becomes a new layer above the source layer
+   *  (background removal hides the source; undo restores both), or opens in a new tab for images without layers.
+   *  Returns a message for the user. */
+  async runAi(
+    tab: Tab, kind: WorkflowKind, opts: { prompt?: string; seed?: number },
+    onProgress: (p: Progress) => void, signal: AbortSignal,
+  ): Promise<string> {
+    const target = this.aiTarget(tab, kind);
+    const src = this.aiSource(tab, target.layerId);
+    if (!src.w || !src.h) throw new Error("対象が空です（透明なレイヤー）");
+    const { wf, source } = await loadWorkflow(kind);
+    const stem = tab.name.replace(/\.[^.]+$/, "");
+    let result: Pixels;
+    let name: string;
+    if (kind === "bg_remove") {
+      // the model works at ~1024 px: sending more than 2048 px only costs time
+      const send = fitMax(src.w, src.h, 2048);
+      const png = await toPng(src, { size: send, white: true });
+      const [mask] = await comfy.run(wf, png, {}, "oie_input.png", onProgress, signal);
+      const m = await decode(mask, { w: src.w, h: src.h });
+      const masked = applyMask(src, m.px);
+      result = target.layered ? trim(masked) : masked; // a new tab keeps the image size
+      if (!trim(masked).w) throw new Error("背景除去の結果が空でした（前景が見つかりません）");
+      name = `${src.node?.name ?? stem} 背景除去`;
+    } else {
+      const prompt = (opts.prompt ?? "").trim();
+      if (!prompt) throw new Error("指示（プロンプト）を入力してください");
+      const rect = this.aiRect(tab);
+      // without a rectangle: the whole layer (its bounds) / image
+      const region = rect ? editRegion(rect, src.canvas) : { crop: { x: src.x, y: src.y, w: src.w, h: src.h }, margin: 0 };
+      const area = crop(src, region.crop);
+      const send = fitPixels(area.w, area.h, 1024 * 1024);
+      const png = await toPng(area, { size: send, white: true });
+      const [out] = await comfy.run(wf, png, { prompt, seed: opts.seed }, "oie_input.png", onProgress, signal);
+      const back = await decode(out, { w: area.w, h: area.h });
+      if (rect) {
+        result = featheredPatch(back.px, area, rect, src.canvas);
+      } else {
+        const full: Pixels = { ...area, px: new Uint8Array(back.px.buffer, back.px.byteOffset, back.px.byteLength) };
+        for (let i = 3; i < full.px.length; i += 4) full.px[i] = 255;
+        result = full;
+      }
+      name = `AI 編集: ${prompt.length > 24 ? prompt.slice(0, 24) + "…" : prompt}`;
+    }
+    const via = source ? `（ワークフロー: ${source}）` : "";
+
+    // layered document: a new layer
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (target.layered && l?.status === "ready" && doc && this.tabs.includes(tab)) {
+      const res = this.rasterLayer(doc, name, result);
+      const node = src.node;
+      if (node) {
+        res.blendMode = node.children && node.blendMode === "pass through" ? "normal" : node.blendMode;
+        res.opacity = node.opacity;
+        res.fill = node.children ? 1 : node.fill;
+        res.clipping = node.clipping;
+      }
+      this.edit(tab, null, (tree) => {
+        const at = node ? this.locate(tree, node.id) : null;
+        if (at) {
+          at.list.splice(at.index + 1, 0, res);
+          if (kind === "bg_remove") at.node.hidden = true;
+        } else {
+          tree.push(res);
+        }
+      });
+      this.select(tab, [res.id]);
+      return `${KIND_DONE[kind]}: 新しいレイヤー「${name}」${kind === "bg_remove" && node ? "（元のレイヤーは非表示）" : ""}${via}`;
+    }
+    // image without layers: the result in a new tab
+    const png = await toPng(kind === "bg_remove" ? result : over(src, result));
+    const fname = `${stem}_${kind === "bg_remove" ? "背景除去" : "AI編集"}.png`;
+    this.openFile(new File([png], fname, { type: "image/png" }));
+    return `${KIND_DONE[kind]}: 新しいタブ「${fname}」（書き出しで保存）${via}`;
   }
 
   // ---------------------------------------------------------------- annotations

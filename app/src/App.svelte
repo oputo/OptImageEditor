@@ -10,6 +10,7 @@
   import ExportDialog, { type ExportOptions } from "./lib/ExportDialog.svelte";
   import CanvasDialog from "./lib/CanvasDialog.svelte";
   import HelpOverlay from "./lib/HelpOverlay.svelte";
+  import AiPanel from "./lib/AiPanel.svelte";
   import { TOOL_KEY, annotTool, type Tool } from "./lib/annotations.svelte";
   import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
   import type { ChannelView, CompareMode } from "./lib/renderer";
@@ -129,6 +130,7 @@
   let exportDlg = $state<{ mode: "export" | "size"; w: number; h: number } | null>(null);
   let canvasDlg = $state<{ w: number; h: number } | null>(null);
   let showHelp = $state(false);
+  let showAi = $state(false);
 
   function openExport(mode: "export" | "size") {
     openMenu = null;
@@ -244,6 +246,7 @@
     else if (ctrl && e.altKey && !e.shiftKey && kk === "i") openExport("size");
     else if (ctrl && e.altKey && !e.shiftKey && kk === "c") openCanvas();
     else if (k === "F1") showHelp = !showHelp;
+    else if (k === "F8") showAi = !showAi;
     else if (ctrl && e.shiftKey && kk === "s" && active?.annot.shapes.length) saveAnnotated();
     else if (annotOn && ctrl && (kk === "z" || kk === "y")) { if (kk === "y" || e.shiftKey) active!.annot.redo(); else active!.annot.undo(); }
     else if (annotOn && !ctrl && (k === "Delete" || k === "Backspace") && active!.annot.selected !== null) active!.annot.remove(active!.annot.selected!);
@@ -390,6 +393,7 @@
   <button class:active={!!vs.compare} disabled={!active?.meta && !vs.compare} onclick={() => vs.toggleCompare()} title="比較表示 (C)">比較</button>
   <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => (annotTool.tool = annotTool.tool ? null : "pen")}
     title="注釈（ペン P / 直線 L / 矢印 A / 四角 U / テキスト T / 選択 V）。Ctrl+Shift+C で注釈込みの画像をコピー">注釈</button>
+  <button class:active={showAi} onclick={() => (showAi = !showAi)} title="AI（ComfyUI）: 背景除去 / 指示で編集 (F8)">AI</button>
   <div class="menu-wrap">
     <button class:active={openMenu === "view"} onclick={() => (openMenu = openMenu === "view" ? null : "view")} title="表示（ナビゲーター / 定規 / ガイド / グリッド / 回転）">表示 ▾</button>
     {#if openMenu === "view"}
@@ -521,6 +525,7 @@
   {/if}
   {#if canvasDlg}<CanvasDialog w0={canvasDlg.w} h0={canvasDlg.h} onapply={doCanvas} onclose={() => (canvasDlg = null)} />{/if}
   {#if showHelp}<HelpOverlay onclose={() => (showHelp = false)} />{/if}
+  {#if showAi}<AiPanel {vs} tab={active} onclose={() => (showAi = false)} onmsg={showToast} />{/if}
   {#if showStats && meta}
     <div class="stats">
       <pre>{statsText}</pre>
