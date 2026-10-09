@@ -207,23 +207,30 @@ impl Record {
         }
     }
 
-    /// A duplicated smart object gets its own instance id (like Ctrl+J in Photoshop); the embedded / linked file
-    /// it shows (the "placed" id) stays shared. The id is in "PlLd" (ASCII) and in the "SoLd" descriptor (UTF-16).
-    fn new_smart_object_instance(&mut self) {
-        let Some(old) = self.block(b"PlLd").and_then(|b| {
+    /// ids of the embedded / linked files this layer shows (smart objects): "PlLd" unique id and "SoLd"/"SoLE" Idnt
+    fn linked_file_ids(&self) -> Vec<String> {
+        let mut ids = vec![];
+        for b in &self.blocks {
             let d = &b.data;
-            if d.len() < 9 || &d[0..4] != b"plcL" { return None; }
-            let n = d[8] as usize;
-            (d.len() >= 9 + n).then(|| d[9..9 + n].to_vec())
-        }) else { return };
-        if old.is_empty() { return; }
-        let new = random_uuid_like(&old);
-        let old16: Vec<u8> = old.iter().flat_map(|&c| [0u8, c]).collect();
-        let new16: Vec<u8> = new.iter().flat_map(|&c| [0u8, c]).collect();
-        for b in &mut self.blocks {
-            if &b.key == b"PlLd" { replace_all(&mut b.data, &old, &new); }
-            if &b.key == b"SoLd" || &b.key == b"SoLE" { replace_all(&mut b.data, &old16, &new16); }
+            if &b.key == b"PlLd" && d.len() >= 9 && &d[0..4] == b"plcL" {
+                let n = d[8] as usize;
+                if d.len() >= 9 + n { ids.push(String::from_utf8_lossy(&d[9..9 + n]).into_owned()); }
+            }
+            if &b.key == b"SoLd" || &b.key == b"SoLE" {
+                // descriptor item: "Idnt" + "TEXT" + u32 length (chars incl. the terminating 0) + UTF-16BE
+                if let Some(i) = d.windows(8).position(|w| w == b"IdntTEXT") {
+                    let o = i + 8;
+                    if o + 4 <= d.len() {
+                        let n = u32::from_be_bytes(d[o..o + 4].try_into().unwrap()) as usize;
+                        if o + 4 + n * 2 <= d.len() {
+                            let units: Vec<u16> = d[o + 4..o + 4 + n * 2].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+                            ids.push(String::from_utf16_lossy(&units));
+                        }
+                    }
+                }
+            }
         }
+        ids
     }
 
     fn divider() -> Record {
@@ -248,46 +255,6 @@ impl Record {
     }
 }
 
-fn replace_all(data: &mut [u8], from: &[u8], to: &[u8]) {
-    if from.is_empty() || from.len() != to.len() { return; }
-    let mut i = 0;
-    while i + from.len() <= data.len() {
-        if &data[i..i + from.len()] == from {
-            data[i..i + from.len()].copy_from_slice(to);
-            i += from.len();
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// new random id with the same shape as `like` (hex digits replaced, separators kept)
-fn random_uuid_like(like: &[u8]) -> Vec<u8> {
-    use std::hash::{BuildHasher, Hasher};
-    let mut bits = 0u64;
-    let mut left = 0;
-    let mut seed = 0u64;
-    like.iter()
-        .map(|&c| {
-            if !c.is_ascii_hexdigit() { return c; }
-            if left == 0 {
-                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-                h.write_u64(seed);
-                h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-                bits = h.finish();
-                seed = seed.wrapping_add(bits | 1);
-                left = 16;
-            }
-            let v = (bits & 15) as u8;
-            bits >>= 4;
-            left -= 1;
-            let upper = c.is_ascii_uppercase();
-            let ch = b"0123456789abcdef"[v as usize];
-            if upper { ch.to_ascii_uppercase() } else { ch }
-        })
-        .collect()
-}
-
 fn read_blocks(r: &mut Reader, end: usize, psb: bool) -> Result<Vec<Block>, String> {
     let mut out = vec![];
     while r.p + 12 <= end {
@@ -298,6 +265,10 @@ fn read_blocks(r: &mut Reader, end: usize, psb: bool) -> Result<Vec<Block>, Stri
         let len = r.len(long)? as usize;
         let data = r.bytes(len)?.to_vec();
         out.push(Block { sig, key, data });
+        // some writers pad a block of odd length without counting the padding: skip it
+        while r.p < end && r.p + 4 <= end && &r.b[r.p..r.p + 4] != b"8BIM" && &r.b[r.p..r.p + 4] != b"8B64" && r.b[r.p] == 0 {
+            r.p += 1;
+        }
     }
     r.p = end;
     Ok(out)
@@ -663,7 +634,8 @@ impl<'a> Builder<'a> {
                     let id = self.new_layer_id();
                     rec.set_block(b"lyid", id, false);
                 }
-                if q.dup { rec.new_smart_object_instance(); }
+                // a duplicated smart object keeps its id: the id is the key of its embedded file in the global
+                // "lnk2" block (layers sharing a file share the id, like Ctrl+J in Photoshop)
                 self.apply(&mut rec, q)?;
                 self.out.push((rec, data));
             }
@@ -827,6 +799,78 @@ fn extra_rows(f: &mut File, src: &Source, first: usize) -> Result<Vec<Vec<u8>>, 
     Ok(out)
 }
 
+/// Global additional layer info rewritten for the saved layers: embedded / linked files ("lnk2", "lnkD", "lnk3",
+/// "lnkE") that no remaining layer uses are dropped (Photoshop does the same when it saves; a document whose
+/// linked-file list names files of deleted layers is suspected to make Photoshop fail to open it). Everything else is
+/// copied as is. Returns segments to write (copy from the source / bytes) and their total length.
+enum Seg { Copy(u64, u64), Bytes(Vec<u8>) }
+
+fn plan_tagged(f: &mut File, src: &Source, used: &std::collections::HashSet<String>) -> Result<(Vec<Seg>, u64), String> {
+    let (start, end) = src.tagged;
+    let whole = || (vec![Seg::Copy(start, end - start)], end - start);
+    let psb = src.psb;
+    let mut segs = vec![];
+    let mut total = 0u64;
+    let mut pos = start;
+    let sig_at = |f: &mut File, at: u64| -> bool {
+        at + 4 <= end && read_at(f, at, 4).map(|b| &b == b"8BIM" || &b == b"8B64").unwrap_or(false)
+    };
+    while pos + 12 <= end {
+        let head = read_at(f, pos, 8)?;
+        if &head[0..4] != b"8BIM" && &head[0..4] != b"8B64" { return Ok(whole()); }
+        let key: [u8; 4] = head[4..8].try_into().unwrap();
+        let long = psb && PSB_LONG_KEYS.iter().any(|k| **k == key);
+        let ll: u64 = if long { 8 } else { 4 };
+        let len = read_len_at(f, pos + 8, long)?;
+        let data = pos + 8 + ll;
+        // padding after the data is not counted in the length: find where the next block starts
+        let mut next = None;
+        for pad in [(4 - len % 4) % 4, (2 - len % 2) % 2, 0] {
+            let at = data + len + pad;
+            if at >= end || sig_at(f, at) { next = Some(at.min(end)); break; }
+        }
+        let Some(next) = next else { return Ok(whole()) };
+        let is_link = matches!(&key, b"lnk2" | b"lnkD" | b"lnk3" | b"lnkE");
+        if !is_link || len == 0 {
+            segs.push(Seg::Copy(pos, next - pos));
+            total += next - pos;
+            pos = next;
+            continue;
+        }
+        // entries: u64 size, then `size` bytes (padded to 4): type(4) version(4) pascal id ...
+        let mut kept: Vec<(u64, u64)> = vec![];
+        let mut e = data;
+        let mut dropped = 0;
+        while e + 8 < data + len {
+            let size = read_len_at(f, e, true)?;
+            let span = 8 + ((size + 3) & !3);
+            if e + span > data + len + 3 { return Ok(whole()); }
+            let h = read_at(f, e + 8, 9 + 255.min((data + len - e - 17) as usize))?;
+            let n = h[8] as usize;
+            let id = String::from_utf8_lossy(&h[9..9 + n.min(h.len() - 9)]).into_owned();
+            if used.contains(&id) { kept.push((e, span.min(data + len - e))); } else { dropped += 1; }
+            e += span;
+        }
+        if dropped == 0 {
+            segs.push(Seg::Copy(pos, next - pos));
+            total += next - pos;
+            pos = next;
+            continue;
+        }
+        let new_len: u64 = kept.iter().map(|k| k.1).sum();
+        let mut hdr = head.clone();
+        put_len(&mut hdr, new_len, long);
+        segs.push(Seg::Bytes(hdr.clone()));
+        total += hdr.len() as u64;
+        for (o, n) in kept { segs.push(Seg::Copy(o, n)); total += n; }
+        let pad = (4 - new_len % 4) % 4;
+        if pad > 0 { segs.push(Seg::Bytes(vec![0; pad as usize])); total += pad; }
+        pos = next;
+    }
+    if pos < end { segs.push(Seg::Copy(pos, end - pos)); total += end - pos; }
+    Ok((segs, total))
+}
+
 fn copy_range(src: &mut File, off: u64, len: u64, w: &mut impl Write) -> Result<(), String> {
     src.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
     let n = std::io::copy(&mut (&*src).take(len), w).map_err(|e| e.to_string())?;
@@ -902,7 +946,8 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         let mut li_len = if out.is_empty() { 0 } else { recs.len() as u64 + data_len };
         let li_pad = (4 - li_len % 4) % 4;
         li_len += li_pad;
-        let tagged_len = src.tagged.1 - src.tagged.0;
+        let used: std::collections::HashSet<String> = out.iter().flat_map(|(r, _)| r.linked_file_ids()).collect();
+        let (tagged_segs, tagged_len) = plan_tagged(&mut f, &src, &used)?;
         let lm_len = if flattened || (out.is_empty() && src.records.is_empty() && src.global_mask.is_empty() && tagged_len == 0) {
             0
         } else {
@@ -931,7 +976,12 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
             }
             wr(&mut o, &(src.global_mask.len() as u32).to_be_bytes())?;
             wr(&mut o, &src.global_mask)?;
-            copy_range(&mut f, src.tagged.0, tagged_len, &mut o)?;
+            for sgm in &tagged_segs {
+                match sgm {
+                    Seg::Copy(off, n) => copy_range(&mut f, *off, *n, &mut o)?,
+                    Seg::Bytes(b) => wr(&mut o, b)?,
+                }
+            }
         }
 
         // merged image: RLE
