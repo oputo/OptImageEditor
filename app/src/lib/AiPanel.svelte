@@ -40,7 +40,7 @@
   $effect(() => { const k = kind; overridePath(k).then((p) => { if (k === kind) override = p; }); });
 
   const target = $derived(tab?.meta ? vs.aiTarget(tab, kind) : null);
-  const rect = $derived.by(() => { void tab?.annot.version; return tab?.meta ? vs.aiRect(tab) : null; });
+  const rect = $derived.by(() => { void tab?.annot.version; void tab?.sel; return tab?.meta ? vs.aiRect(tab) : null; });
 
   let running = $state(false);
   let progress = $state<Progress | null>(null);
@@ -122,7 +122,7 @@
   <div class="kv"><span>対象</span><b>{target?.label ?? "（画像を開いてください）"}</b></div>
   {#if kind === "edit"}
     <div class="kv"><span>範囲</span>
-      {#if rect}<b>四角の注釈 {rect.w} × {rect.h}</b>{:else}<b>全体</b><span class="hint">注釈の四角 (U) で範囲を指定</span>{/if}
+      {#if rect}<b>{tab?.sel ? "選択範囲" : "四角の注釈"} {rect.w} × {rect.h}</b>{:else}<b>全体</b><span class="hint">選択範囲 (M / L) か注釈の四角 (U) で指定</span>{/if}
     </div>
     <textarea bind:value={prompt} rows="3" placeholder="例: 看板の文字を消す / 空を夕焼けにする（英語の方が安定）" disabled={running}></textarea>
     {#if prompts.length}

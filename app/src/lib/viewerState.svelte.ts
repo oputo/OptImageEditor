@@ -7,7 +7,7 @@
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
 import { buildPsd, isPsd, loadImage, loadLayers, SUPPORTED_EXT, type LoadedImage } from "./loader";
 import { Compositor, type LayerDoc } from "./compositor";
-import { LOCK_ALL, cloneTree, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode } from "./psdDoc";
+import { LOCK_ALL, LOCK_TRANSPARENCY, cloneTree, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
@@ -15,6 +15,10 @@ import { confirmDialog, copyImageFallback, listFolderImages, savePsd, saveDialog
 import { recent } from "./recent.svelte";
 import { Annotations, flattenToCanvas, flattenToPng } from "./annotations.svelte";
 import { comfy, loadWorkflow, type Progress, type WorkflowKind } from "./comfy";
+import {
+  allSel, clearPixels, selAt, combine, ellipseSel, invertSel, maskPixels, polySel, rectSel, selFromAlpha, shiftSel,
+  type Sel, type SelMode, type SelTool,
+} from "./selection.svelte";
 import { applyMask, crop, decode, editRegion, featheredPatch, fitMax, fitPixels, over, toPng, trim, type Pixels, type Rect } from "./ai";
 
 export type ImageMeta = Omit<LoadedImage, "image" | "release"> & {
@@ -47,6 +51,9 @@ export type Tab = {
   layers: LayersState | null;
   /** annotations drawn over the image (reset when the tab shows another file) */
   annot: Annotations;
+  /** selection (canvas px; reset when the tab shows another file) and the last one removed (Ctrl+Shift+D) */
+  sel: Sel | null;
+  lastSel: Sel | null;
   loading: boolean;
   error: string | null;
   token: number;
@@ -86,7 +93,7 @@ export type LayersState = {
 /** Undo history of a tab's layer tree (snapshots of the tree; pixels are not edited in 2-b). */
 /** Canvas of a layered document: size, and how far the file's layers have moved (canvas size changes not saved yet). */
 export type Canvas = { w: number; h: number; ox: number; oy: number };
-type Snapshot = { tree: DocLayer[]; canvas: Canvas };
+type Snapshot = { tree: DocLayer[]; canvas: Canvas; sel: Sel | null };
 type History = { undo: Snapshot[]; redo: Snapshot[]; lastKey: string | null; lastTime: number };
 const HISTORY_MAX = 100;
 
@@ -160,7 +167,7 @@ export class ViewerState {
       const id = ++this.seq;
       this.tabs.push({
         id, key: keyOf(path), path, file: null, name: baseName(path),
-        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, annot: new Annotations(), loading: false, error: null, token: 0,
+        folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, annot: new Annotations(), sel: null, lastSel: null, loading: false, error: null, token: 0,
       });
       lastId = id;
       // folder listing in the background (needed for ← / →)
@@ -181,7 +188,7 @@ export class ViewerState {
     const id = ++this.seq;
     this.tabs.push({
       id, key: `file:${id}`, path: null, file, name: file.name,
-      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, annot: new Annotations(), loading: false, error: null, token: 0,
+      folder: [], folderIndex: -1, meta: null, view: null, orient: null, guides: { v: [], h: [] }, layer: 0, layers: null, annot: new Annotations(), sel: null, lastSel: null, loading: false, error: null, token: 0,
     });
     this.activate(id);
   }
@@ -272,6 +279,8 @@ export class ViewerState {
     tab.folderIndex = i;
     tab.layer = 0;
     tab.annot = new Annotations();
+    tab.sel = null;
+    tab.lastSel = null;
     this.dropLayers(tab);
     if (this.renderer?.hasImage) tab.orient = { rotation: this.renderer.rotation, flipX: this.renderer.flipX };
     tab.view = null;
@@ -571,7 +580,7 @@ export class ViewerState {
     const h = this.hist(tab);
     const now = performance.now();
     if (!(key && h.lastKey === key && (mergeAlways || now - h.lastTime < 1000))) {
-      h.undo.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas } });
+      h.undo.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas }, sel: tab.sel });
       if (h.undo.length > HISTORY_MAX) h.undo.shift();
       h.redo = [];
     }
@@ -595,9 +604,10 @@ export class ViewerState {
     const from = back ? h.undo : h.redo, to = back ? h.redo : h.undo;
     const snap = from.pop();
     if (!snap) return;
-    to.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas } });
+    to.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas }, sel: tab.sel });
     l.tree = snap.tree;
     l.canvas = { ...snap.canvas };
+    if (tab.sel !== snap.sel) { if (!snap.sel && tab.sel) tab.lastSel = tab.sel; tab.sel = snap.sel; }
     this.select(tab, l.selection.filter((id) => this.locate(snap.tree, id)), l.selectedId);
     h.lastKey = null;
     l.dirty = true;
@@ -682,6 +692,7 @@ export class ViewerState {
       };
       walk(tree);
       l.canvas = { w, h, ox: c.ox + dx, oy: c.oy + dy };
+      tab.sel = shiftSel(tab.sel, dx, dy);
     });
     return null;
   }
@@ -854,7 +865,8 @@ export class ViewerState {
       for (const x of ls) {
         const o = now.get(x.id);
         if (o !== undefined) { x.origId = o; x.dup = false; x.raster = false; }
-        else if (!(x.raster || x.origId === null)) ok = false;
+        // a layer of the old file that is gone (deleted, or replaced by edited pixels) cannot be found in the new one
+        else if (x.origId !== null) ok = false;
         if (x.children && !fix(x.children)) ok = false;
       }
       return ok;
@@ -1094,6 +1106,184 @@ export class ViewerState {
     return null;
   }
 
+  // ---------------------------------------------------------------- selection (phase 3-a)
+
+  /** canvas size of `tab` (layered: the document canvas; else the image shown) */
+  canvasOf(tab: Tab): { w: number; h: number } {
+    if (tab.layers?.status === "ready") return { w: tab.layers.canvas.w, h: tab.layers.canvas.h };
+    return { w: tab.meta?.width ?? 0, h: tab.meta?.height ?? 0 };
+  }
+
+  /** Sets the selection. Layered documents: one undo step (not a document change by itself). */
+  setSelection(tab: Tab, s: Sel | null) {
+    if (s === tab.sel) return;
+    const l = tab.layers;
+    if (l?.status === "ready") {
+      const h = this.hist(tab);
+      h.undo.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas }, sel: tab.sel });
+      if (h.undo.length > HISTORY_MAX) h.undo.shift();
+      h.redo = [];
+      h.lastKey = null;
+      l.undoCount = h.undo.length;
+      l.redoCount = h.redo.length;
+    }
+    if (!s && tab.sel) tab.lastSel = tab.sel;
+    tab.sel = s;
+  }
+
+  /** a shape drawn with a selection tool (canvas px), combined with the current selection */
+  selectShape(tab: Tab, tool: SelTool, pts: number[], mode: SelMode) {
+    const { w: W, h: H } = this.canvasOf(tab);
+    if (!W || !H) return;
+    const shape = tool === "rect" ? rectSel(pts[0], pts[1], pts[2], pts[3], W, H)
+      : tool === "ellipse" ? ellipseSel(pts[0], pts[1], pts[2], pts[3], W, H)
+      : polySel(pts, W, H);
+    this.setSelection(tab, combine(tab.sel, shape, mode));
+  }
+
+  selectAll(tab: Tab) { const c = this.canvasOf(tab); if (c.w && c.h) this.setSelection(tab, allSel(c.w, c.h)); }
+  deselect(tab: Tab) { this.setSelection(tab, null); }
+  reselect(tab: Tab) { if (tab.lastSel && !tab.sel) this.setSelection(tab, tab.lastSel); }
+  invertSelection(tab: Tab) { const c = this.canvasOf(tab); if (c.w && c.h) this.setSelection(tab, invertSel(tab.sel, c.w, c.h)); }
+
+  /** a layer's content at 100 % (its mask applied) as straight RGBA in canvas px */
+  private soloPixels(tab: Tab, node: DocLayer) {
+    const doc = this.docs.get(tab.id)!;
+    return this.rasterize(doc, [{ ...node, hidden: false, opacity: 1, fill: 1, clipping: false, blendMode: "normal" }]);
+  }
+
+  /** Ctrl+click on a layer thumbnail: selection from the layer's opaque pixels */
+  selectFromLayer(tab: Tab, id: number, mode: SelMode) {
+    const l = tab.layers;
+    const node = l && this.locate(l.tree, id)?.node;
+    if (!l || l.status !== "ready" || !node) return;
+    const p = this.soloPixels(tab, node);
+    this.setSelection(tab, combine(tab.sel, selFromAlpha(p, l.canvas.w, l.canvas.h), mode));
+  }
+
+  /** raw pixels of a (non-group) layer, straight RGBA in canvas px (without its mask) */
+  private layerPixels(tab: Tab, node: DocLayer) {
+    const doc = this.docs.get(tab.id)!;
+    return { x: node.x, y: node.y, w: node.w, h: node.h, px: this.compositor!.readLayerPixels(doc, node.id, node.w, node.h) };
+  }
+
+  /** why the active layer's pixels cannot be changed (null: they can) */
+  private pixelBlocker(node: DocLayer | null | undefined): string | null {
+    if (!node) return "レイヤーを選択してください";
+    if (node.children) return "グループの画素は変更できません。レイヤーを選択してください";
+    if (node.kind !== "pixel") return `「${node.name}」はピクセルレイヤーではないため変更できません（${node.kind === "smart" ? "スマートオブジェクト" : node.kind === "text" ? "テキスト" : "塗りつぶし・調整"}）`;
+    if (pixelsLocked(node)) return `「${node.name}」はロックされています`;
+    if ((node.locks >>> 0) & LOCK_TRANSPARENCY && !node.background) return `「${node.name}」は透明部分がロックされています`;
+    return null;
+  }
+
+  /** a copy of `node` with new pixels (new id: the old pixels stay for undo; the layer mask is kept). Saved with the
+   *  original layer record and these pixels. */
+  private withPixels(tab: Tab, node: DocLayer, p: { x: number; y: number; w: number; h: number; px: Uint8Array }): DocLayer {
+    const doc = this.docs.get(tab.id)!;
+    const id = doc.nextId++;
+    this.compositor!.setLayerPixels(doc, id, p.px, p.w, p.h, doc.gpu.get(node.id)?.mask ?? null);
+    return { ...cloneTree([node])[0], id, raster: true, x: p.x, y: p.y, w: p.w, h: p.h, thumb: thumbOf(p.px, p.w, p.h) };
+  }
+
+  /** Ctrl+J / Ctrl+Shift+J with a selection: the selected part of the active layer as a new layer above it
+   *  (`cut`: removed from the layer). Returns a message when it cannot. */
+  layerViaSelection(tab: Tab, cut: boolean): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    const node = l && this.locate(l.tree, l.selectedId)?.node;
+    if (!l || !doc || !tab.sel) return null;
+    if (!node) return "レイヤーを選択してください";
+    if (node.children) return "グループからはコピーできません";
+    if (cut) { const b = this.pixelBlocker(node); if (b) return b; }
+    const src = this.layerPixels(tab, node);
+    const part = trim(maskPixels(src, tab.sel));
+    if (!part.w) return "選択範囲に画素がありません";
+    const res = this.rasterLayer(doc, `レイヤー ${this.countLayers(l.tree) + 1}`, part);
+    res.blendMode = node.blendMode; res.opacity = node.opacity; res.fill = node.fill;
+    const edited = cut ? this.withPixels(tab, node, { ...src, px: clearPixels(src, tab.sel, node.background) }) : null;
+    this.edit(tab, null, (tree) => {
+      const at = this.locate(tree, node.id)!;
+      if (edited) at.list.splice(at.index, 1, edited);
+      at.list.splice(at.index + 1, 0, res);
+    });
+    this.select(tab, [res.id]);
+    return null;
+  }
+
+  /** Delete with a selection: clears the selected part of the active layer (a background layer: white) */
+  clearSelection(tab: Tab): string | null {
+    const l = tab.layers;
+    const node = l && this.locate(l.tree, l.selectedId)?.node;
+    if (!l || !tab.sel) return null;
+    const b = this.pixelBlocker(node);
+    if (b) return b;
+    const src = this.layerPixels(tab, node!);
+    const edited = this.withPixels(tab, node!, { ...src, px: clearPixels(src, tab.sel, node!.background) });
+    this.edit(tab, null, (tree) => { const at = this.locate(tree, node!.id)!; at.list.splice(at.index, 1, edited); });
+    this.select(tab, [edited.id]);
+    return null;
+  }
+
+  /** what Ctrl+C copies: the selected part (or all) of the active layer, or of the image without layers */
+  private copySource(tab: Tab): { x: number; y: number; w: number; h: number; px: Uint8Array } | string {
+    const l = tab.layers;
+    let src: { x: number; y: number; w: number; h: number; px: Uint8Array };
+    if (l?.status === "ready") {
+      const node = this.locate(l.tree, l.selectedId)?.node;
+      if (!node) return "レイヤーを選択してください";
+      src = node.children ? this.soloPixels(tab, node) : this.layerPixels(tab, node);
+    } else {
+      const set = this.renderer?.activeSet;
+      if (!set || !this.renderer || this.active !== tab) return "画像がありません";
+      if (set.hdr) return "EXR / HDR はコピーできません";
+      const p = this.renderer.readSet(set);
+      for (let i = 0; i < p.length; i += 4) {
+        const a = p[i + 3];
+        if (a && a < 255) for (let c = 0; c < 3; c++) p[i + c] = Math.min(255, (p[i + c] * 255) / a + 0.5);
+      }
+      src = { x: 0, y: 0, w: set.width, h: set.height, px: p };
+    }
+    const out = tab.sel ? trim(maskPixels(src, tab.sel)) : src;
+    return out.w ? out : "選択範囲に画素がありません";
+  }
+
+  /** where the last copy came from (a paste of the same size goes back there) */
+  private lastCopy: { x: number; y: number; w: number; h: number } | null = null;
+
+  /** Ctrl+C / Ctrl+X: copies to the system clipboard as PNG (`cut`: also clears it from the layer) */
+  async copySelection(tab: Tab, cut = false): Promise<string> {
+    if (cut) { const b = this.pixelBlocker(tab.layers && this.locate(tab.layers.tree, tab.layers.selectedId)?.node); if (b || !tab.sel) return b ?? "切り取りには選択範囲が必要です"; }
+    const p = this.copySource(tab);
+    if (typeof p === "string") return p;
+    this.lastCopy = { x: p.x, y: p.y, w: p.w, h: p.h };
+    const blob = toPng(p);
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    } catch (e) {
+      console.warn("navigator.clipboard.write failed, using the native clipboard", e);
+      const ok = await copyImageFallback(p.w, p.h, new Uint8ClampedArray(p.px.buffer as ArrayBuffer, p.px.byteOffset, p.px.byteLength));
+      if (!ok) throw e;
+    }
+    if (cut) { const m = this.clearSelection(tab); if (m) return m; }
+    return `${cut ? "切り取り" : "コピー"}しました（${p.w} × ${p.h}）`;
+  }
+
+  /** Ctrl+V on a document with layers: the image as a new layer above the active one (where it was copied from when
+   *  it has the same size, else centred) */
+  async pasteAsLayer(tab: Tab, blob: Blob): Promise<string | null> {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc) return null;
+    const d = await decode(blob);
+    const px = new Uint8Array(d.px.buffer, d.px.byteOffset, d.px.byteLength);
+    const c = this.lastCopy;
+    const at = c && c.w === d.w && c.h === d.h ? { x: c.x, y: c.y } : { x: Math.round((l.canvas.w - d.w) / 2), y: Math.round((l.canvas.h - d.h) / 2) };
+    const res = this.rasterLayer(doc, `レイヤー ${this.countLayers(l.tree) + 1}`, { ...at, w: d.w, h: d.h, px });
+    this.insert(tab, res, "貼り付け");
+    return `貼り付けました（${d.w} × ${d.h}）`;
+  }
+
   // ---------------------------------------------------------------- AI (ComfyUI, phase D minimal)
 
   /** What an AI tool works on in `tab`. Background removal: the active layer (PSD with its layers loaded; the layer
@@ -1108,8 +1298,14 @@ export class ViewerState {
     return { label: isPsd(tab.name) ? "PS の統合画像（レイヤーは F7 で読み込み）" : "画像全体", layered: false, layerId: null };
   }
 
-  /** the rectangle annotation the edit works on: the selected one, else the last one drawn (canvas px, clipped) */
+  /** the region the edit works on: the selection's bounds, else the rectangle annotation (the selected one, else
+   *  the last one drawn); canvas px, clipped */
   aiRect(tab: Tab): Rect | null {
+    if (tab.sel) {
+      const c = this.canvasOf(tab), s = tab.sel;
+      const x0 = Math.max(0, s.x), y0 = Math.max(0, s.y), x1 = Math.min(c.w, s.x + s.w), y1 = Math.min(c.h, s.y + s.h);
+      return x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+    }
     const set = this.renderer?.activeSet;
     const W = tab.layers?.status === "ready" ? tab.layers.canvas.w : set?.width ?? 0;
     const H = tab.layers?.status === "ready" ? tab.layers.canvas.h : set?.height ?? 0;
@@ -1172,6 +1368,7 @@ export class ViewerState {
     } else {
       const prompt = (opts.prompt ?? "").trim();
       if (!prompt) throw new Error("指示（プロンプト）を入力してください");
+      const sel = tab.sel;
       const rect = this.aiRect(tab);
       // without a rectangle: the whole layer (its bounds) / image
       const region = rect ? editRegion(rect, src.canvas) : { crop: { x: src.x, y: src.y, w: src.w, h: src.h }, margin: 0 };
@@ -1182,6 +1379,8 @@ export class ViewerState {
       const back = await decode(out, { w: area.w, h: area.h });
       if (rect) {
         result = featheredPatch(back.px, area, rect, src.canvas);
+        // a selection: its own (anti-aliased) edge instead of the feathered rectangle
+        if (sel) for (let y = 0; y < rect.h; y++) for (let x = 0; x < rect.w; x++) result.px[(y * rect.w + x) * 4 + 3] = selAt(sel, x + rect.x, y + rect.y);
       } else {
         const full: Pixels = { ...area, px: new Uint8Array(back.px.buffer, back.px.byteOffset, back.px.byteLength) };
         for (let i = 3; i < full.px.length; i += 4) full.px[i] = 255;

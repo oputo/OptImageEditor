@@ -5,6 +5,7 @@
   // double click to rename, clipping mask, save.
   import { BLEND_LABEL, BLEND_MODES, LOCK_ALL, LOCK_PIXELS, LOCK_POSITION, LOCK_TRANSPARENCY, type DocLayer, type LayerBlendMode } from "./psdDoc";
   import type { Tab, ViewerState } from "./viewerState.svelte";
+  import { modeOf } from "./selection.svelte";
 
   let { vs, tab, onsave, onmsg }: { vs: ViewerState; tab: Tab | null; onsave: (saveAs: boolean) => void; onmsg: (text: string) => void } = $props();
 
@@ -146,6 +147,11 @@
   function onRowDown(l: DocLayer, e: PointerEvent) {
     if (e.button !== 0 || renaming !== null || !L || !tab) return;
     if ((e.target as HTMLElement).closest("button, input")) return;
+    // Ctrl+click on the thumbnail: select the layer's opaque pixels (+Shift add, +Alt subtract, +Shift+Alt intersect)
+    if ((e.ctrlKey || e.metaKey) && (e.target as HTMLElement).classList.contains("thumb")) {
+      vs.selectFromLayer(tab, l.id, modeOf(e));
+      return;
+    }
     collapseTo = null;
     if (e.ctrlKey || e.metaKey) {
       const has = L.selection.includes(l.id);
@@ -272,7 +278,7 @@
             <span class="folder">▭</span>
           {:else}
             {#if r.clipped}<span class="clip" title="クリッピングマスク">↳</span>{/if}
-            <canvas class="thumb" use:thumb={l.thumb}></canvas>
+            <canvas class="thumb" use:thumb={l.thumb} title="Ctrl+クリック: 不透明部分を選択（+Shift 追加 / +Alt 除外）"></canvas>
           {/if}
           {#if l.mask && !l.children}<span class="maskmark" class:off={l.mask.disabled} title={l.mask.disabled ? "マスク（無効）" : "レイヤーマスク"}>◐</span>{/if}
           {#if renaming === l.id}

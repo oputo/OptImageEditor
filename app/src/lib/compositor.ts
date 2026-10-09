@@ -524,9 +524,9 @@ export class Compositor {
   // ---------------------------------------------------------------- pixels made in the app (phase 2-c)
 
   /** Gives layer `id` new pixels (straight RGBA, w x h; the layer rectangle is on the DocLayer). */
-  setLayerPixels(doc: LayerDoc, id: number, rgba: Uint8Array | Uint8ClampedArray, w: number, h: number) {
+  setLayerPixels(doc: LayerDoc, id: number, rgba: Uint8Array | Uint8ClampedArray, w: number, h: number, mask: WebGLTexture | null = null) {
     const gl = this.gl;
-    const g: GpuLayer = { tex: null, mask: null };
+    const g: GpuLayer = { tex: null, mask };
     if (w > 0 && h > 0) {
       g.tex = this.texture(gl.RGBA8, w, h);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);

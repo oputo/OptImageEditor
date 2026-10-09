@@ -11,9 +11,14 @@
     FONT_SIZES, WIDTHS, annotTool, constrain, drawSelection, drawShape, shapeAt, translate,
     type Annotations, type Shape,
   } from "./annotations.svelte";
+  import { modeOf, outline, selTool, type Sel, type SelMode, type SelTool } from "./selection.svelte";
 
-  let { renderer = $bindable(), guides = null, annot = null, labels = null, oncursor, onsplit }: {
+  let { renderer = $bindable(), guides = null, annot = null, sel = null, labels = null, oncursor, onsplit, onselshape }: {
     renderer?: Renderer;
+    /** selection of the shown image (marching ants) */
+    sel?: Sel | null;
+    /** a shape drawn with a selection tool (image px; empty `pts`: a click without dragging) */
+    onselshape?: (tool: SelTool, pts: number[], mode: SelMode) => void;
     guides?: Guides | null;
     /** annotations of the shown image (drawn and edited while an annotation tool is active) */
     annot?: Annotations | null;
@@ -47,7 +52,8 @@
     | { kind: "guide"; axis: "v" | "h"; index: number }
     | { kind: "split" }
     | { kind: "draw"; shape: Shape; x0: number; y0: number }
-    | { kind: "move"; shape: Shape; x: number; y: number; moved: boolean };
+    | { kind: "move"; shape: Shape; x: number; y: number; moved: boolean }
+    | { kind: "sel"; tool: "rect" | "ellipse" | "lasso"; mode: SelMode; pts: number[]; square: boolean };
   let drag: Drag | null = null;
   let hot: { axis: "v" | "h"; index: number } | null = $state(null); // guide under the mouse / being dragged
 
@@ -57,6 +63,28 @@
   /** text being typed: position in css px and image px */
   let textEdit = $state<{ cx: number; cy: number; ix: number; iy: number; size: number; color: string; value: string; replace: Shape | null } | null>(null);
   const guidesOn = () => opt.extras && opt.guides && !!guides;
+  /** selection tool in use (not while comparing / annotating) */
+  const selecting = () => !!selTool.tool && !!onselshape && !renderer?.compare && !annotating();
+  /** polygon being clicked (image px) and the mouse position for its rubber band */
+  let poly = $state<{ pts: number[]; mode: SelMode } | null>(null);
+  let polyMouse: [number, number] | null = null;
+  // marching ants: the outline of the selection, as a path in image px (made once per selection)
+  const selPath = $derived.by(() => {
+    if (!sel) return null;
+    const segs = outline(sel);
+    const p = new Path2D();
+    if (!segs) { p.rect(sel.x, sel.y, sel.w, sel.h); return p; }
+    for (let i = 0; i < segs.length; i += 4) { p.moveTo(segs[i], segs[i + 1]); p.lineTo(segs[i + 2], segs[i + 3]); }
+    return p;
+  });
+  // the ants march while there is a selection (or a polygon being drawn)
+  $effect(() => {
+    if (!sel && !poly) return;
+    const t = setInterval(() => renderer?.requestDraw(), 120);
+    return () => clearInterval(t);
+  });
+  // the polygon is dropped when the tool changes
+  $effect(() => { if (selTool.tool !== "poly") untrack(() => { if (poly) { poly = null; renderer?.requestDraw(); } }); });
 
   onMount(() => {
     const r = new Renderer(canvas);
@@ -70,6 +98,18 @@
     const ro = new ResizeObserver(() => r.resize());
     ro.observe(canvas);
     r.resize();
+    // polygon keys go first (capture): Enter closes, Esc cancels, Backspace removes the last point
+    const polyKey = (e: KeyboardEvent) => {
+      if (!poly) return;
+      if (e.key === "Enter") finishPoly();
+      else if (e.key === "Escape") poly = null;
+      else if (e.key === "Backspace" || e.key === "Delete") { poly.pts = poly.pts.slice(0, -2); if (!poly.pts.length) poly = null; }
+      else return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      renderer?.requestDraw();
+    };
+    window.addEventListener("keydown", polyKey, true);
     const kd = (e: KeyboardEvent) => {
       if (e.code === "Space") spaceDown = true;
       if (e.code === "KeyR" && !e.ctrlKey && !e.metaKey && !e.altKey) rDown = true;
@@ -86,6 +126,7 @@
       off();
       ro.disconnect();
       window.removeEventListener("keydown", kd);
+      window.removeEventListener("keydown", polyKey, true);
       window.removeEventListener("keyup", ku);
       window.removeEventListener("blur", blur);
       r.clear();
@@ -124,6 +165,7 @@
     if (!r.hasImage) return;
     const panes = r.panes();
     if (opt.extras) for (const p of panes) drawExtras(ctx, p, dpr, r.imageWidth, r.imageHeight);
+    if (!r.compare && panes.length) drawSelectionAnts(ctx, panes[0], dpr);
     if (annot && !r.compare && panes.length) drawAnnotations(ctx, panes[0], dpr);
     if (r.compare) drawCompareChrome(ctx, r, panes, dpr);
     if (showRulers) drawRulers(r, dpr);
@@ -139,6 +181,51 @@
     if (drag?.kind === "draw") drawShape(ctx, drag.shape);
     const sel = drag?.kind === "move" ? drag.shape : annot!.shapes.find((s) => s.id === annot!.selected);
     if (sel && annotTool.tool === "select") drawSelection(ctx, sel, 1 / p.view.scale);
+    ctx.restore();
+  }
+
+  /** marching ants of the selection and of the shape being drawn with a selection tool */
+  function drawSelectionAnts(ctx: CanvasRenderingContext2D, p: Pane, dpr: number) {
+    const s = p.view.scale;
+    const live = new Path2D();
+    let hasLive = false;
+    if (drag?.kind === "sel") {
+      const q = drag.pts;
+      hasLive = true;
+      if (drag.tool === "lasso") { live.moveTo(q[0], q[1]); for (let i = 2; i < q.length; i += 2) live.lineTo(q[i], q[i + 1]); }
+      else {
+        const [x0, y0, x1, y1] = q;
+        if (drag.tool === "rect") live.rect(Math.round(Math.min(x0, x1)), Math.round(Math.min(y0, y1)), Math.round(Math.abs(x1 - x0)), Math.round(Math.abs(y1 - y0)));
+        else live.ellipse((x0 + x1) / 2, (y0 + y1) / 2, Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2, 0, 0, Math.PI * 2);
+      }
+    } else if (poly) {
+      hasLive = true;
+      const q = poly.pts;
+      live.moveTo(q[0], q[1]);
+      for (let i = 2; i < q.length; i += 2) live.lineTo(q[i], q[i + 1]);
+      if (polyMouse) live.lineTo(polyMouse[0], polyMouse[1]);
+    }
+    if (!selPath && !hasLive) return;
+    ctx.save();
+    setMatrix(ctx, p.matrix, dpr);
+    ctx.lineWidth = 1 / s;
+    const offset = ((performance.now() / 60) % 8) / s;
+    for (const path of [selPath, hasLive ? live : null]) {
+      if (!path) continue;
+      ctx.setLineDash([]);
+      ctx.strokeStyle = "#ffffff";
+      ctx.stroke(path);
+      ctx.setLineDash([4 / s, 4 / s]);
+      ctx.lineDashOffset = -offset;
+      ctx.strokeStyle = "#000000";
+      ctx.stroke(path);
+    }
+    if (poly) {
+      // the first point: click it to close
+      ctx.setLineDash([]);
+      ctx.strokeStyle = "#fff";
+      ctx.strokeRect(poly.pts[0] - 3 / s, poly.pts[1] - 3 / s, 6 / s, 6 / s);
+    }
     ctx.restore();
   }
 
@@ -381,6 +468,9 @@
     if (e.button === 0 && !rDown && !spaceDown && annotating()) {
       e.preventDefault(); // no focus change: a text box opened here keeps the focus
       if (!annotDown(e, cx, cy, pane)) return;
+    } else if (e.button === 0 && !rDown && !spaceDown && selecting()) {
+      e.preventDefault();
+      if (!selDown(e, cx, cy, pane)) return;
     } else if (e.button === 0 && rDown) {
       const pcx = pane.ox + pane.view.vw / 2, pcy = pane.oy + pane.view.vh / 2;
       drag = { kind: "rotate", view: pane.view, cx: pcx, cy: pcy, start: Math.atan2(cy - pcy, cx - pcx), startRot: pane.view.rotation };
@@ -398,6 +488,61 @@
     canvas.setPointerCapture(e.pointerId);
     e.preventDefault();
     updateCursor(cx, cy);
+  }
+
+  /** Starts a selection shape. Returns false when nothing needs a pointer capture (polygon clicks). */
+  function selDown(e: PointerEvent, cx: number, cy: number, pane: Pane): boolean {
+    const [ix, iy] = applyInverse(pane.matrix, cx, cy);
+    const tool = selTool.tool!;
+    if (tool === "poly") {
+      if (!poly) { poly = { pts: [ix, iy], mode: modeOf(e) }; renderer?.requestDraw(); return false; }
+      const near = Math.hypot(ix - poly.pts[0], iy - poly.pts[1]) * pane.view.scale < 7;
+      if (near || e.detail >= 2) { finishPoly(); return false; }
+      poly.pts = [...poly.pts, ix, iy];
+      renderer?.requestDraw();
+      return false;
+    }
+    drag = { kind: "sel", tool, mode: modeOf(e), pts: tool === "lasso" ? [ix, iy] : [ix, iy, ix, iy], square: false };
+    return true;
+  }
+
+  function finishPoly() {
+    const p = poly;
+    poly = null;
+    polyMouse = null;
+    if (!p) return;
+    onselshape?.("poly", p.pts.length >= 6 ? p.pts : [], p.mode);
+    renderer?.requestDraw();
+  }
+
+  function selMove(e: PointerEvent, cx: number, cy: number) {
+    const pane = renderer?.panes()[0];
+    if (!pane || drag?.kind !== "sel") return;
+    const [ix, iy] = applyInverse(pane.matrix, cx, cy);
+    if (drag.tool === "lasso") {
+      const n = drag.pts.length;
+      if (Math.hypot(ix - drag.pts[n - 2], iy - drag.pts[n - 1]) * pane.view.scale >= 1.5) drag.pts = [...drag.pts, ix, iy];
+    } else {
+      let [x, y] = [ix, iy];
+      if (e.shiftKey) {
+        // square / circle
+        const dx = x - drag.pts[0], dy = y - drag.pts[1], d = Math.max(Math.abs(dx), Math.abs(dy));
+        x = drag.pts[0] + Math.sign(dx || 1) * d;
+        y = drag.pts[1] + Math.sign(dy || 1) * d;
+      }
+      drag.pts = [drag.pts[0], drag.pts[1], x, y];
+    }
+    renderer?.requestDraw();
+  }
+
+  function selUp() {
+    if (drag?.kind !== "sel") return;
+    const d = drag;
+    const scale = renderer?.panes()[0]?.view.scale ?? 1;
+    const q = d.pts;
+    const tiny = d.tool === "lasso" ? q.length < 6 : Math.abs(q[2] - q[0]) * scale < 2 && Math.abs(q[3] - q[1]) * scale < 2;
+    onselshape?.(d.tool, tiny ? [] : q, d.mode);
+    renderer?.requestDraw();
   }
 
   /** Starts drawing / selecting with the annotation tool. Returns false when nothing needs a pointer capture. */
@@ -513,6 +658,12 @@
     mouse = [cx, cy];
     if (drag?.kind === "draw" || drag?.kind === "move") {
       annotMove(e, cx, cy);
+    } else if (drag?.kind === "sel") {
+      selMove(e, cx, cy);
+    } else if (poly) {
+      const pane = r.panes()[0];
+      if (pane) { polyMouse = applyInverse(pane.matrix, cx, cy) as [number, number]; r.requestDraw(); }
+      updateCursor(cx, cy);
     } else if (drag?.kind === "pan") {
       drag.view.panBy(e.clientX - drag.x, e.clientY - drag.y);
       drag.x = e.clientX;
@@ -548,6 +699,7 @@
       hot = null;
     }
     if (drag?.kind === "draw" || drag?.kind === "move") annotUp();
+    if (drag?.kind === "sel") selUp();
     drag = null;
     const [cx, cy] = local(e);
     updateCursor(cx, cy);
@@ -574,6 +726,7 @@
       return;
     }
     if (drag?.kind === "rotate" || rDown) { cursorClass = "rotate"; return; }
+    if ((selecting() || drag?.kind === "sel") && !spaceDown) { cursorClass = "draw"; return; }
     if (drag?.kind === "guide") { cursorClass = drag.axis === "v" ? "col" : "row"; return; }
     if (drag?.kind === "split" || (!spaceDown && onSplitHandle(cx))) { cursorClass = "col"; return; }
     const g = spaceDown ? null : guideAt(cx, cy);

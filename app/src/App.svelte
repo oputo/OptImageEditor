@@ -12,6 +12,7 @@
   import HelpOverlay from "./lib/HelpOverlay.svelte";
   import AiPanel from "./lib/AiPanel.svelte";
   import { TOOL_KEY, annotTool, type Tool } from "./lib/annotations.svelte";
+  import { SEL_ICON, SEL_LABEL, selTool, type SelMode, type SelTool } from "./lib/selection.svelte";
   import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
   import type { ChannelView, CompareMode } from "./lib/renderer";
   import type { Renderer } from "./lib/renderer";
@@ -164,6 +165,32 @@
   // ---- annotations
   const annotOn = $derived(annotTool.tool !== null && !!active?.meta && !vs.compare);
   const TOOL_BY_KEY = Object.fromEntries(Object.entries(TOOL_KEY).map(([t, k]) => [k, t as Tool]));
+  // one tool at a time: a selection tool or an annotation tool
+  function setSelTool(t: SelTool | null) {
+    selTool.tool = t;
+    if (t === "rect" || t === "ellipse") selTool.marquee = t;
+    if (t === "lasso" || t === "poly") selTool.lasso = t;
+    if (t) annotTool.tool = null;
+  }
+  function setAnnotTool(t: Tool | null) {
+    annotTool.tool = t;
+    if (t) selTool.tool = null;
+  }
+
+  // ---- 3-a: selection
+  function onSelShape(tool: SelTool, pts: number[], mode: SelMode) {
+    const t = active;
+    if (!t) return;
+    if (!pts.length) { if (mode === "replace") vs.deselect(t); return; }
+    vs.selectShape(t, tool, pts, mode);
+  }
+  function msg(m: string | null | undefined) { if (m) showToast(m); }
+  async function copySel(cut: boolean) {
+    const t = active;
+    if (!t?.meta) return;
+    try { msg(await vs.copySelection(t, cut)); }
+    catch (e) { showToast(`コピーできませんでした: ${e instanceof Error ? e.message : String(e)}`); }
+  }
 
   function copyAnnotated() {
     if (!active?.meta) return;
@@ -189,7 +216,9 @@
     const file = Array.from(e.clipboardData?.files ?? []).find((f) => f.type.startsWith("image/"));
     if (!file) { showToast("クリップボードに画像がありません"); return; }
     e.preventDefault();
-    vs.openPasted(file);
+    // a document with layers: a new layer (Photoshop); otherwise a new tab
+    if (active?.layers?.status === "ready") vs.pasteAsLayer(active, file).then(msg).catch((err) => showToast(`貼り付けられませんでした: ${err}`));
+    else vs.openPasted(file);
   }
 
   function toggleFlip() { if (renderer?.hasImage) renderer.setFlip(!renderer.flipX); }
@@ -229,6 +258,8 @@
     // typing in a text / number field: only Ctrl shortcuts and function keys
     const t = e.target as HTMLElement;
     if (((t.tagName === "INPUT" && (t as HTMLInputElement).type !== "checkbox") || t.tagName === "SELECT") && !ctrl && !/^F\d+$/.test(k)) return;
+    // text editing keys stay with the text field
+    if ((t.tagName === "INPUT" || t.tagName === "TEXTAREA") && ctrl && ["a", "c", "x", "v", "z", "y"].includes(kk)) return;
     let handled = true;
     const cmp = vs.compare;
     if (exportDlg || canvasDlg) return; // the dialog handles its keys
@@ -239,8 +270,19 @@
     else if (cmp && !ctrl && !e.altKey && (kk === "1" || kk === "2" || kk === "3")) vs.updateCompare({ mode: (["side", "swipe", "toggle"] as const)[Number(kk) - 1] });
     else if (cmp && !ctrl && !e.altKey && kk === "x") vs.updateCompare({ mode: "toggle", showB: cmp.mode === "toggle" ? !cmp.showB : true });
     else if (k === "Escape" && annotOn) { if (active!.annot.selected !== null) active!.annot.selected = null; else annotTool.tool = null; }
+    else if (k === "Escape" && selTool.tool) setSelTool(null);
+    else if (!ctrl && !e.altKey && kk === "m" && active?.meta && !cmp && !annotOn) setSelTool(e.shiftKey ? (selTool.marquee === "rect" ? "ellipse" : "rect") : selTool.marquee);
+    else if (!ctrl && !e.altKey && kk === "l" && active?.meta && !cmp && !annotOn) setSelTool(e.shiftKey ? (selTool.lasso === "lasso" ? "poly" : "lasso") : selTool.lasso);
+    else if (ctrl && !e.shiftKey && !e.altKey && kk === "a") { if (active?.meta) vs.selectAll(active); }
+    else if (ctrl && !e.shiftKey && !e.altKey && kk === "d") { if (active) vs.deselect(active); }
+    else if (ctrl && e.shiftKey && !e.altKey && kk === "d") { if (active) vs.reselect(active); }
+    else if (ctrl && e.shiftKey && !e.altKey && kk === "i") { if (active?.meta) vs.invertSelection(active); }
+    else if (ctrl && !e.shiftKey && !e.altKey && kk === "c") copySel(false);
+    else if (ctrl && !e.shiftKey && !e.altKey && kk === "x") copySel(true);
+    else if (ctrl && !e.altKey && kk === "j" && active?.sel) layerKey((t) => msg(vs.layerViaSelection(t, e.shiftKey)));
+    else if (!ctrl && (k === "Delete" || k === "Backspace") && active?.sel && !annotOn) layerKey((t) => msg(vs.clearSelection(t)));
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
-    else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) annotTool.tool = TOOL_BY_KEY[kk];
+    else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) setAnnotTool(TOOL_BY_KEY[kk]);
     else if (ctrl && e.shiftKey && kk === "c") copyAnnotated();
     else if (ctrl && e.altKey && e.shiftKey && kk === "w") openExport("export");
     else if (ctrl && e.altKey && !e.shiftKey && kk === "i") openExport("size");
@@ -391,7 +433,12 @@
   <span class="sep"></span>
   <button class:active={opt.layersPanel} onclick={() => (opt.layersPanel = !opt.layersPanel)} title="レイヤーパネル (F7)">レイヤー</button>
   <button class:active={!!vs.compare} disabled={!active?.meta && !vs.compare} onclick={() => vs.toggleCompare()} title="比較表示 (C)">比較</button>
-  <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => (annotTool.tool = annotTool.tool ? null : "pen")}
+  <div class="seg seltools" title="選択ツール（M: 長方形 / 楕円形、L: なげなわ / 多角形、Shift で切り替え）。Shift: 追加 / Alt: 除外 / Shift+Alt: 交差">
+    {#each ["rect", "ellipse", "lasso", "poly"] as const as st (st)}
+      <button class:on={selTool.tool === st} disabled={!active?.meta || !!vs.compare} title={SEL_LABEL[st]} onclick={() => setSelTool(selTool.tool === st ? null : st)}>{SEL_ICON[st]}</button>
+    {/each}
+  </div>
+  <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => setAnnotTool(annotTool.tool ? null : "pen")}
     title="注釈（ペン P / 直線 L / 矢印 A / 四角 U / テキスト T / 選択 V）。Ctrl+Shift+C で注釈込みの画像をコピー">注釈</button>
   <button class:active={showAi} onclick={() => (showAi = !showAi)} title="AI（ComfyUI）: 背景除去 / 指示で編集 (F8)">AI</button>
   <div class="menu-wrap">
@@ -494,7 +541,7 @@
   ondrop={onHtmlDrop}
 >
   {#if annotOn}<AnnotBar annot={active?.annot ?? null} oncopy={copyAnnotated} onsave={saveAnnotated} />{/if}
-  <Viewer bind:renderer guides={active?.guides ?? null} annot={active?.annot ?? null} oncursor={onCursor}
+  <Viewer bind:renderer guides={active?.guides ?? null} annot={active?.annot ?? null} sel={active?.sel ?? null} onselshape={onSelShape} oncursor={onCursor}
     labels={vs.compare && active ? { a: active.name, b: vs.compareTab?.name ?? "" } : null}
     onsplit={(v) => vs.updateCompare({ split: v })} />
   {#if vs.compare && vs.compareTab?.loading}<div class="busy">B を読み込み中…</div>{/if}
@@ -562,6 +609,7 @@
       <span class="coord">x {Math.floor(cursor[0])}  y {Math.floor(cursor[1])}</span>
       {#if pixel}<span class="coord px">{fmtPixel(pixel)}</span>{/if}
     {/if}
+    {#if active.sel}<button class="chip" title="クリックで選択を解除 (Ctrl+D)" onclick={() => vs.deselect(active)}>選択 {active.sel.w} × {active.sel.h}</button>{/if}
     {#if rotation !== 0}<button class="chip" title="クリックで 0° に戻す (Esc)" onclick={() => renderer?.rotateTo(0)}>回転 {rotation.toFixed(1).replace(/\.0$/, "")}°</button>{/if}
     {#if flipX}<button class="chip" title="クリックで反転を解除 (Shift+H)" onclick={toggleFlip}>左右反転</button>{/if}
     <span>{(vs.zoom * 100).toFixed(vs.zoom < 0.1 ? 1 : 0)}%</span>
@@ -659,6 +707,7 @@
   .evv { width: 56px; font-variant-numeric: tabular-nums; color: var(--text); }
   .layer-sel { background: #1e1e1e; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; font: inherit; font-size: 12px; padding: 0 4px; max-width: 220px; }
   .chip { background: #2f4f73; border: 1px solid var(--accent); color: #fff; border-radius: 9px; padding: 0 8px; font-size: 11px; line-height: 16px; }
+  .seltools button { padding: 2px 7px; min-width: 28px; }
   .workspace { flex: 1; min-height: 0; display: flex; }
   .stage { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
   .stage.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }

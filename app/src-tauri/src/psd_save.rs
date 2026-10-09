@@ -543,13 +543,29 @@ enum Data {
     Empty,
     /// encoded channel image data (made here)
     Bytes(Vec<u8>),
+    /// new colour channels (made here) followed by ranges copied from the file (the layer mask channels)
+    Mixed(Vec<u8>, Vec<(u64, u64)>),
+}
+
+impl Data {
+    fn len(&self, rec: &Record) -> u64 {
+        match self {
+            Data::Copy(_, n) => *n,
+            Data::Bytes(v) => v.len() as u64,
+            Data::Mixed(v, r) => v.len() as u64 + r.iter().map(|x| x.1).sum::<u64>(),
+            Data::Empty => rec.channels.iter().map(|c| c.1).sum(),
+        }
+    }
 }
 
 /// Channel image data of a raster layer: (channels with their lengths, data), RLE per channel.
 fn encode_layer(px: &[u8], w: usize, h: usize, psb: bool) -> (Vec<(i16, u64)>, Vec<u8>) {
     // always with a transparency channel: a layer record without one made Photoshop fail to open the file
     // ("program error"); a background-only document is written without layer records instead (see `save`)
-    let ids: &[i16] = &[-1, 0, 1, 2];
+    encode_channels(px, w, h, psb, &[-1, 0, 1, 2])
+}
+
+fn encode_channels(px: &[u8], w: usize, h: usize, psb: bool, ids: &[i16]) -> (Vec<(i16, u64)>, Vec<u8>) {
     let mut chans = vec![];
     let mut data = vec![];
     for &id in ids {
@@ -698,6 +714,46 @@ impl<'a> Builder<'a> {
                 }
                 self.apply(&mut rec, q)?;
                 self.out.push((rec, data));
+            } else if q.raster && src_index.is_some() {
+                // a layer of the file with new pixels (edited in the app): its record (name, effects, smart data,
+                // mask ...) stays, the colour / transparency channels are replaced, the mask channels are copied
+                let p = q.pixels.as_ref().ok_or("raster layer without pixels")?;
+                let (w, h) = (p.w as usize, p.h as usize);
+                let start = p.offset as usize;
+                let end = start + w * h * 4;
+                if end > self.pixels.len() { return err("raster layer pixels out of range"); }
+                let mut rec = self.src.records[src_index.unwrap()].clone();
+                if let Some(s) = self.shift { rec.shift(s); }
+                // the file's channels: their data lies one after the other from data_off
+                let mut off = rec.data_off;
+                let mut keep = vec![];
+                let mut keep_ranges = vec![];
+                let has_alpha = rec.channels.iter().any(|c| c.0 == -1);
+                for &(id, len) in &rec.channels {
+                    if id < -1 { keep.push((id, len)); keep_ranges.push((off, len)); }
+                    off += len;
+                }
+                let ids: &[i16] = if has_alpha { &[-1, 0, 1, 2] } else { &[0, 1, 2] };
+                let (mut chans, bytes) = if w > 0 && h > 0 {
+                    encode_channels(&self.pixels[start..end], w, h, self.src.psb, ids)
+                } else {
+                    // empty: compression 0, no rows
+                    (ids.iter().map(|&i| (i, 2u64)).collect(), ids.iter().flat_map(|_| [0u8, 0u8]).collect())
+                };
+                chans.extend(keep);
+                rec.channels = chans;
+                let mut rect = [0u8; 16];
+                rect[0..4].copy_from_slice(&p.y.to_be_bytes());
+                rect[4..8].copy_from_slice(&p.x.to_be_bytes());
+                rect[8..12].copy_from_slice(&(p.y + p.h as i32).to_be_bytes());
+                rect[12..16].copy_from_slice(&(p.x + p.w as i32).to_be_bytes());
+                rec.rect = rect;
+                if q.dup {
+                    let id = self.new_layer_id();
+                    rec.set_block(b"lyid", id, false);
+                }
+                self.apply(&mut rec, q)?;
+                self.out.push((rec, Data::Mixed(bytes, keep_ranges)));
             } else if q.raster {
                 let p = q.pixels.as_ref().ok_or("raster layer without pixels")?;
                 let (w, h) = (p.w as usize, p.h as usize);
@@ -1094,7 +1150,7 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         let count = out.len() as i16;
         recs.extend_from_slice(&(if transparency { -count } else { count }).to_be_bytes());
         for (r, _) in &out { serialize_record(r, psb, &mut recs); }
-        let data_len: u64 = out.iter().map(|(r, d)| match d { Data::Copy(_, n) => *n, Data::Bytes(v) => v.len() as u64, Data::Empty => r.channels.iter().map(|c| c.1).sum() }).sum();
+        let data_len: u64 = out.iter().map(|(r, d)| d.len(r)).sum();
         let mut li_len = if out.is_empty() { 0 } else { recs.len() as u64 + data_len };
         let li_pad = (4 - li_len % 4) % 4;
         li_len += li_pad;
@@ -1118,6 +1174,10 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
                     match d {
                         Data::Copy(off, n) => copy_range(&mut f, *off, *n, &mut o)?,
                         Data::Bytes(v) => wr(&mut o, v)?,
+                        Data::Mixed(v, ranges) => {
+                            wr(&mut o, v)?;
+                            for &(off, n) in ranges { copy_range(&mut f, off, n, &mut o)?; }
+                        }
                         Data::Empty => {
                             // each channel: compression 0, no pixels
                             for c in &r.channels { wr(&mut o, &vec![0u8; c.1 as usize])?; }
