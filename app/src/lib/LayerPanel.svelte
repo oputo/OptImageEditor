@@ -60,20 +60,47 @@
   function update(id: number, patch: Parameters<ViewerState["updateLayer"]>[2], key: string | null = null) {
     if (tab) vs.updateLayer(tab, id, patch, key);
   }
+  /** property change for every selected layer */
+  function updateSel(patch: Parameters<ViewerState["updateLayer"]>[2], key: string | null = null) {
+    if (tab) vs.updateSelected(tab, patch, key);
+  }
+  const selNodes = $derived((L?.selection ?? []).map((id) => find(id)).filter((x): x is DocLayer => !!x));
+  /** the selected layers disagree on `k` (shown as "—") */
+  const mixed = (k: "blendMode" | "opacity" | "fill" | "clipping") =>
+    !!selected && selNodes.some((x) => (k === "fill" || k === "clipping" ? !x.children : true) && x[k] !== selected[k]);
+  const isSel = (id: number) => !!L && (L.selection.includes(id) || (!L.selection.length && L.selectedId === id));
+
+  // ---- eye: click toggles; press + drag over other rows gives them the same state (one undo step)
+  let eyeDrag: { hidden: boolean; key: string } | null = null;
+  let eyeSeq = 0;
+  function eyeDown(l: DocLayer, e: PointerEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    if (e.button !== 0 || !tab) return;
+    if (e.altKey) { toggleEye(l, e); return; }
+    solo = null;
+    eyeDrag = { hidden: !l.hidden, key: `eye:${++eyeSeq}` };
+    vs.setHiddenDrag(tab, l.id, eyeDrag.hidden, eyeDrag.key);
+  }
+  function eyeEnter(l: DocLayer, e: PointerEvent) {
+    if (!eyeDrag || !tab) return;
+    if (!(e.buttons & 1)) { eyeDrag = null; return; }
+    if (l.hidden !== eyeDrag.hidden) vs.setHiddenDrag(tab, l.id, eyeDrag.hidden, eyeDrag.key);
+  }
 
   // Alt+click on an eye: show only this layer (again: restore)
   let solo: { id: number; saved: Map<number, boolean> } | null = null;
   function toggleEye(target: DocLayer, e: MouseEvent) {
     if (!tab || !L) return;
-    const id = target.id, alt = e.altKey;
+    const id = target.id;
+    void e;
     vs.edit(tab, null, (tree) => {
       const all: DocLayer[] = [];
       const walk = (ls: DocLayer[]) => { for (const x of ls) { all.push(x); if (x.children) walk(x.children); } };
       walk(tree);
       const l = all.find((x) => x.id === id);
       if (!l) return;
-      if (!alt) { l.hidden = !l.hidden; solo = null; return; }
-      if (solo?.id === id) {
+        if (solo?.id === id) {
         for (const x of all) x.hidden = solo.saved.get(x.id) ?? x.hidden;
         solo = null;
         return;
@@ -112,10 +139,36 @@
   let drag = $state<{ id: number; y0: number; active: boolean; drop: Drop | null } | null>(null);
   let listEl: HTMLDivElement | undefined = $state();
 
+  // ---- selection: click = only this, Ctrl+click = add / remove, Shift+click = range (panel order)
+  let anchor: number | null = null;
+  let collapseTo: number | null = null; // a click (no drag) on a multi-selected row selects only it
+
   function onRowDown(l: DocLayer, e: PointerEvent) {
-    if (e.button !== 0 || renaming !== null) return;
+    if (e.button !== 0 || renaming !== null || !L || !tab) return;
     if ((e.target as HTMLElement).closest("button, input")) return;
-    if (L) L.selectedId = l.id;
+    collapseTo = null;
+    if (e.ctrlKey || e.metaKey) {
+      const has = L.selection.includes(l.id);
+      const base = L.selection.length ? L.selection : L.selectedId !== null ? [L.selectedId] : [];
+      vs.select(tab, has ? base.filter((x) => x !== l.id) : [...base, l.id], has ? null : l.id);
+      anchor = l.id;
+      return;
+    }
+    if (e.shiftKey && anchor !== null) {
+      const ids = rows.map((r) => r.l.id);
+      const a = ids.indexOf(anchor), b = ids.indexOf(l.id);
+      if (a >= 0 && b >= 0) {
+        vs.select(tab, ids.slice(Math.min(a, b), Math.max(a, b) + 1), l.id);
+        return;
+      }
+    }
+    anchor = l.id;
+    if (L.selection.includes(l.id) && L.selection.length > 1) {
+      vs.select(tab, L.selection, l.id); // keep the selection for dragging them together
+      collapseTo = l.id;
+    } else {
+      vs.select(tab, [l.id]);
+    }
     // pointer capture only once the drag starts: capturing on down would retarget click / dblclick to the list
     drag = { id: l.id, y0: e.clientY, active: false, drop: null };
   }
@@ -147,6 +200,8 @@
   function onListUp() {
     const d = drag;
     drag = null;
+    if (d && !d.active && collapseTo !== null && tab) vs.select(tab, [collapseTo]);
+    collapseTo = null;
     if (!d?.active || !d.drop || !tab) return;
     vs.move(tab, d.id, d.drop.id, d.drop.where);
   }
@@ -204,13 +259,14 @@
       {#each rows as r (r.l.id)}
         {@const l = r.l}
         {@const dr = drag?.active && drag.drop?.id === l.id ? drag.drop.where : null}
-        <div class="row" class:sel={L.selectedId === l.id} class:dim={l.hidden} class:src={drag?.active && drag.id === l.id}
+        <div class="row" class:sel={isSel(l.id)} class:act={L.selectedId === l.id && L.selection.length > 1} class:dim={l.hidden}
+          class:src={drag?.active && (drag.id === l.id || (L.selection.includes(drag.id) && L.selection.includes(l.id)))}
           class:d-above={dr === "above"} class:d-below={dr === "below"} class:d-inside={dr === "inside"}
-          data-id={l.id} role="option" aria-selected={L.selectedId === l.id} tabindex="-1"
+          data-id={l.id} role="option" aria-selected={isSel(l.id)} tabindex="-1"
           style:padding-left="{4 + r.depth * 14}px"
-          onpointerdown={(e) => onRowDown(l, e)} onkeydown={() => {}}>
+          onpointerdown={(e) => onRowDown(l, e)} onpointerenter={(e) => eyeEnter(l, e)} onkeydown={() => {}}>
           <button class="eye" title="表示 / 非表示（Alt+クリック: このレイヤーだけ表示）"
-            onclick={(e) => { e.stopPropagation(); toggleEye(l, e); }}>{l.hidden ? "" : "●"}</button>
+            onpointerdown={(e) => eyeDown(l, e)} onclick={(e) => e.stopPropagation()}>{l.hidden ? "" : "●"}</button>
           {#if l.children}
             <button class="exp" title={l.open ? "閉じる" : "開く"} onclick={(e) => { e.stopPropagation(); l.open = !l.open; }}>{l.open ? "▾" : "▸"}</button>
             <span class="folder">▭</span>
@@ -238,28 +294,29 @@
       <div class="props">
         <div class="prow">
           <span class="lbl">描画モード</span>
-          <select value={selected.blendMode} onchange={(e) => { update(selected.id, { blendMode: (e.currentTarget as HTMLSelectElement).value as LayerBlendMode }); (e.currentTarget as HTMLSelectElement).blur(); }}>
+          <select value={selected.blendMode} onchange={(e) => { const v = (e.currentTarget as HTMLSelectElement).value; if (v) updateSel({ blendMode: v as LayerBlendMode }); (e.currentTarget as HTMLSelectElement).blur(); }}>
+            {#if mixed("blendMode")}<option value="" selected>—</option>{/if}
             {#if selected.children}<option value="pass through">{BLEND_LABEL["pass through"]}</option>{/if}
             {#each BLEND_MODES as m (m)}<option value={m}>{BLEND_LABEL[m]}</option>{/each}
           </select>
         </div>
         <div class="prow">
           <span class="lbl">不透明度</span>
-          <input type="range" min="0" max="100" value={pct(selected.opacity)} oninput={(e) => update(selected.id, { opacity: Number((e.currentTarget as HTMLInputElement).value) / 100 }, `opacity:${selected.id}`)} />
-          <span class="val">{pct(selected.opacity)}%</span>
+          <input type="range" min="0" max="100" value={pct(selected.opacity)} oninput={(e) => updateSel({ opacity: Number((e.currentTarget as HTMLInputElement).value) / 100 }, `opacity:${L.selection.join(",")}`)} />
+          <span class="val">{mixed("opacity") ? "—" : `${pct(selected.opacity)}%`}</span>
         </div>
         {#if !selected.children}
           <div class="prow">
             <span class="lbl">塗り</span>
-            <input type="range" min="0" max="100" value={pct(selected.fill)} oninput={(e) => update(selected.id, { fill: Number((e.currentTarget as HTMLInputElement).value) / 100 }, `fill:${selected.id}`)} />
-            <span class="val">{pct(selected.fill)}%</span>
+            <input type="range" min="0" max="100" value={pct(selected.fill)} oninput={(e) => updateSel({ fill: Number((e.currentTarget as HTMLInputElement).value) / 100 }, `fill:${L.selection.join(",")}`)} />
+            <span class="val">{mixed("fill") ? "—" : `${pct(selected.fill)}%`}</span>
           </div>
         {/if}
         {#if selected.mask}
-          <label class="prow chk"><input type="checkbox" checked={!selected.mask.disabled} onchange={(e) => update(selected.id, { maskDisabled: !(e.currentTarget as HTMLInputElement).checked })} />レイヤーマスクを使う</label>
+          <label class="prow chk"><input type="checkbox" checked={!selected.mask.disabled} onchange={(e) => updateSel({ maskDisabled: !(e.currentTarget as HTMLInputElement).checked })} />レイヤーマスクを使う</label>
         {/if}
         {#if !selected.children}
-          <label class="prow chk" title="下のレイヤーでクリッピング (Ctrl+Alt+G)"><input type="checkbox" checked={selected.clipping} onchange={(e) => update(selected.id, { clipping: (e.currentTarget as HTMLInputElement).checked })} />クリッピングマスク</label>
+          <label class="prow chk" title="下のレイヤーでクリッピング (Ctrl+Alt+G)"><input type="checkbox" checked={selected.clipping} indeterminate={mixed("clipping")} onchange={(e) => updateSel({ clipping: (e.currentTarget as HTMLInputElement).checked })} />クリッピングマスク</label>
         {/if}
         <div class="prow">
           <span class="lbl">ロック</span>
@@ -284,7 +341,7 @@
         <button class:on={mergeMenu} onclick={() => (mergeMenu = !mergeMenu)} title="結合・統合">結合▾</button>
         {#if mergeMenu}
           <div class="mmenu" role="menu">
-            <button role="menuitem" disabled={!selected} onclick={() => merge("down")}>{selected?.children ? "グループを結合" : "下のレイヤーと結合"}<kbd>Ctrl+E</kbd></button>
+            <button role="menuitem" disabled={!selected} onclick={() => merge("down")}>{(L.selection.length > 1) ? "選択したレイヤーを結合" : selected?.children ? "グループを結合" : "下のレイヤーと結合"}<kbd>Ctrl+E</kbd></button>
             <button role="menuitem" onclick={() => merge("visible")}>表示レイヤーを結合<kbd>Ctrl+Shift+E</kbd></button>
             <button role="menuitem" onclick={() => merge("flatten")}>画像を統合</button>
           </div>
@@ -332,6 +389,7 @@
   .row { display: flex; align-items: center; gap: 4px; height: 46px; padding-right: 6px; border-bottom: 1px solid #333; cursor: default; }
   .row:hover { background: #333; }
   .row.sel { background: #2f4f73; }
+  .row.act { box-shadow: inset 3px 0 0 var(--accent); }
   .row.dim .name, .row.dim .thumb { opacity: 0.5; }
   .eye { width: 22px; height: 22px; flex: none; background: transparent; border: 1px solid #555; border-radius: 3px; color: var(--text); font-size: 10px; padding: 0; cursor: pointer; }
   .exp { width: 16px; flex: none; background: transparent; border: none; color: var(--text); padding: 0; cursor: pointer; }

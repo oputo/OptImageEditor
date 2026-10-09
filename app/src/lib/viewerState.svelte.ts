@@ -59,7 +59,10 @@ export type LayersState = {
   tree: DocLayer[];
   count: number;
   useLayers: boolean;
+  /** the active layer (shown in the properties); always part of `selection` when set */
   selectedId: number | null;
+  /** selected layers (Ctrl / Shift + click) */
+  selection: number[];
   /** load / composite timings for the stats panel */
   stats: { readMs: number; decodeMs: number; uploadMs: number; compositeMs: number; passes: number } | null;
   /** difference to the stored composite (computed on request) */
@@ -441,7 +444,7 @@ export class ViewerState {
     if (tab.layers || !this.renderer || !isPsd(tab.name)) return;
     const token = tab.token;
     tab.layers = {
-      status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, stats: null, diff: null,
+      status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, selection: [], stats: null, diff: null,
       dirty: false, undoCount: 0, redoCount: 0, saving: false, savePhase: null, saved: null, fileCount: 0,
     };
     try {
@@ -539,12 +542,12 @@ export class ViewerState {
 
   /** Applies `mutate` to the layer tree as one undoable step. Steps with the same `key` within 1 s are merged
    *  (dragging a slider is one step). */
-  edit(tab: Tab, key: string | null, mutate: (tree: DocLayer[]) => void) {
+  edit(tab: Tab, key: string | null, mutate: (tree: DocLayer[]) => void, mergeAlways = false) {
     const l = tab.layers;
     if (!l || l.status !== "ready") return;
     const h = this.hist(tab);
     const now = performance.now();
-    if (!(key && h.lastKey === key && now - h.lastTime < 1000)) {
+    if (!(key && h.lastKey === key && (mergeAlways || now - h.lastTime < 1000))) {
       h.undo.push(cloneTree(l.tree));
       if (h.undo.length > HISTORY_MAX) h.undo.shift();
       h.redo = [];
@@ -571,6 +574,7 @@ export class ViewerState {
     if (!snap) return;
     to.push(cloneTree(l.tree));
     l.tree = snap;
+    this.select(tab, l.selection.filter((id) => this.locate(snap, id)), l.selectedId);
     h.lastKey = null;
     l.dirty = true;
     l.undoCount = h.undo.length;
@@ -614,7 +618,7 @@ export class ViewerState {
       const at = this.locate(tree, tab.layers!.selectedId);
       if (at) at.list.splice(at.index + 1, 0, node); else tree.push(node);
     });
-    tab.layers!.selectedId = node.id;
+    this.select(tab, [node.id]);
     void label;
   }
 
@@ -630,63 +634,137 @@ export class ViewerState {
     this.insert(tab, this.newLayerData(doc, `グループ ${this.countLayers(tab.layers.tree) + 1}`, true), "新規グループ");
   }
 
-  /** Ctrl+J: copy of the selected layer (or group) above it */
+  // ---------------------------------------------------------------- selection
+
+  /** Selects `ids` (the last one becomes the active layer). */
+  select(tab: Tab, ids: number[], active: number | null = ids[ids.length - 1] ?? null) {
+    const l = tab.layers;
+    if (!l) return;
+    l.selection = [...new Set(ids)];
+    l.selectedId = active !== null && l.selection.includes(active) ? active : l.selection[l.selection.length - 1] ?? null;
+  }
+
+  /** the selected layers without the ones inside a selected group, bottom -> top (file order) */
+  selectedRoots(tab: Tab): DocLayer[] {
+    const l = tab.layers;
+    if (!l) return [];
+    // the active layer outside the selection (set directly) wins: the selection is stale then
+    const ids = l.selectedId !== null && !l.selection.includes(l.selectedId) ? [l.selectedId] : l.selection;
+    const sel = new Set(ids);
+    const out: DocLayer[] = [];
+    const walk = (ls: DocLayer[], inside: boolean) => {
+      for (const x of ls) {
+        const picked = !inside && sel.has(x.id);
+        if (x.children) walk(x.children, inside || picked);
+        if (picked) out.push(x); // after its children: file (post-) order
+      }
+    };
+    walk(l.tree, false);
+    return out;
+  }
+
+  private copyLayer(doc: LayerDoc, src: DocLayer): DocLayer {
+    const c = { ...cloneTree([src])[0], id: doc.nextId++, dup: src.origId !== null, children: null as DocLayer[] | null };
+    const g = doc.gpu.get(src.id);
+    if (g) doc.gpu.set(c.id, g); // share the textures (pixels are not edited yet)
+    c.children = src.children ? src.children.map((x) => this.copyLayer(doc, x)) : null;
+    return c;
+  }
+
+  /** Ctrl+J: copies of the selected layers (or groups), each above its source */
   duplicate(tab: Tab) {
     const doc = this.docs.get(tab.id);
-    const l = tab.layers;
-    const at = l && this.locate(l.tree, l.selectedId);
-    if (!doc || !l || !at) return;
-    const copy = (src: DocLayer): DocLayer => {
-      const c = { ...cloneTree([src])[0], id: doc.nextId++, dup: src.origId !== null, children: null as DocLayer[] | null };
-      const g = doc.gpu.get(src.id);
-      if (g) doc.gpu.set(c.id, g); // share the textures (pixels are not edited yet)
-      c.children = src.children ? src.children.map(copy) : null;
-      return c;
-    };
-    const c = copy(at.node);
-    c.name = `${at.node.name} のコピー`;
-    this.insert(tab, c, "複製");
+    const roots = this.selectedRoots(tab);
+    if (!doc || !roots.length) return;
+    const copies = roots.map((r) => ({ src: r.id, c: { ...this.copyLayer(doc, r), name: `${r.name} のコピー` } }));
+    this.edit(tab, null, (tree) => {
+      for (const { src, c } of copies) {
+        const at = this.locate(tree, src);
+        if (at) at.list.splice(at.index + 1, 0, c);
+      }
+    });
+    this.select(tab, copies.map((x) => x.c.id));
   }
 
   deleteSelected(tab: Tab) {
     const l = tab.layers;
-    const at = l && this.locate(l.tree, l.selectedId);
-    if (!l || !at) return;
-    const next = at.list[at.index - 1] ?? at.list[at.index + 1] ?? at.parent;
-    this.edit(tab, null, () => { at.list.splice(at.index, 1); });
-    l.selectedId = next?.id ?? null;
+    const roots = this.selectedRoots(tab);
+    if (!l || !roots.length) return;
+    const gone = new Set(roots.map((r) => r.id));
+    // afterwards select the layer below the lowest deleted one (or above it, or its group)
+    const first = this.locate(l.tree, roots[0].id)!;
+    const cand = [...first.list.slice(0, first.index).reverse(), ...first.list.slice(first.index + 1)].find((x) => !gone.has(x.id)) ?? first.parent;
+    this.edit(tab, null, (tree) => {
+      for (const r of roots) { const at = this.locate(tree, r.id); if (at) at.list.splice(at.index, 1); }
+    });
+    this.select(tab, cand && this.locate(l.tree, cand.id) ? [cand.id] : []);
   }
 
-  /** Ctrl+G: puts the selected layer into a new group */
+  /** Ctrl+G: puts the selected layers into a new group (at the place of the topmost one) */
   groupSelected(tab: Tab) {
     const doc = this.docs.get(tab.id);
     const l = tab.layers;
-    if (!doc || !l || l.selectedId === null) return;
+    const roots = this.selectedRoots(tab);
+    if (!doc || !l || !roots.length) return;
     const g = this.newLayerData(doc, `グループ ${this.countLayers(l.tree) + 1}`, true);
+    const top = roots[roots.length - 1];
     this.edit(tab, null, (tree) => {
-      const at = this.locate(tree, l.selectedId)!;
-      const [node] = at.list.splice(at.index, 1, g);
-      node.clipping = false;
-      g.children = [node];
+      const at = this.locate(tree, top.id)!;
+      at.list.splice(at.index, 1, g);
+      const kids: DocLayer[] = [];
+      for (const r of roots) {
+        if (r.id !== top.id) { const a = this.locate(tree, r.id); if (a) a.list.splice(a.index, 1); }
+        r.clipping = false;
+        kids.push(r);
+      }
+      g.children = kids;
     });
-    l.selectedId = g.id;
+    this.select(tab, [g.id]);
   }
 
-  /** Moves layer `id` above / below / into (top of) layer `target`. */
+  /** Moves layer `id` — or, when it is selected, all selected layers — above / below / into (top of) `target`. */
   move(tab: Tab, id: number, target: number, where: "above" | "below" | "inside") {
     const l = tab.layers;
-    if (!l || id === target) return;
-    const src = this.locate(l.tree, id);
-    if (!src) return;
-    // not into itself or its own descendants
-    if (src.node.children && this.locate(src.node.children, target)) return;
+    if (!l) return;
+    const inSel = l.selection.includes(id);
+    const moving = inSel ? this.selectedRoots(tab) : [this.locate(l.tree, id)?.node].filter((x): x is DocLayer => !!x);
+    if (!moving.length) return;
+    // not onto / into a moved layer
+    for (const m of moving) {
+      if (m.id === target) return;
+      if (m.children && this.locate(m.children, target)) return;
+    }
     this.edit(tab, null, (tree) => {
-      const s = this.locate(tree, id)!;
-      const [node] = s.list.splice(s.index, 1);
+      for (const m of moving) { const a = this.locate(tree, m.id); if (a) a.list.splice(a.index, 1); }
       const t = this.locate(tree, target)!;
-      if (where === "inside" && t.node.children) t.node.children.push(node);
-      else t.list.splice(where === "above" ? t.index + 1 : t.index, 0, node);
+      if (where === "inside" && t.node.children) t.node.children.push(...moving);
+      else t.list.splice(where === "above" ? t.index + 1 : t.index, 0, ...moving);
     });
+  }
+
+  /** Changes properties of all selected layers (same `key` within 1 s = one undo step). */
+  updateSelected(tab: Tab, patch: Parameters<ViewerState["updateLayer"]>[2], key: string | null = null) {
+    const l = tab.layers;
+    if (!l) return;
+    const ids = l.selectedId !== null && !l.selection.includes(l.selectedId) ? [l.selectedId] : l.selection;
+    this.edit(tab, key, (tree) => {
+      for (const id of ids) {
+        const at = this.locate(tree, id);
+        if (!at) continue;
+        const { maskDisabled, ...rest } = patch;
+        // groups have no fill / clipping of their own here
+        const r: Partial<DocLayer> = { ...rest };
+        if (at.node.children) { delete r.fill; delete r.clipping; if (r.blendMode === undefined) delete r.blendMode; }
+        else if (r.blendMode === "pass through") delete r.blendMode;
+        Object.assign(at.node, r);
+        if (maskDisabled !== undefined && at.node.mask) at.node.mask.disabled = maskDisabled;
+      }
+    });
+  }
+
+  /** Eye drag: sets `hidden` of layer `id`; all calls with the same `key` are one undo step. */
+  setHiddenDrag(tab: Tab, id: number, hidden: boolean, key: string) {
+    this.edit(tab, key, (tree) => { const at = this.locate(tree, id); if (at) at.node.hidden = hidden; }, true);
   }
 
   /** Changes properties of layer `id` (same `key` within 1 s = one undo step, e.g. while dragging a slider). */
@@ -739,11 +817,20 @@ export class ViewerState {
 
   /** Toggles a lock flag of layer `id` (LOCK_ALL replaces the others, as in Photoshop). */
   toggleLock(tab: Tab, id: number, flag: number) {
-    const at = tab.layers && this.locate(tab.layers.tree, id);
-    if (!at) return;
-    const cur = at.node.locks >>> 0;
-    const next = flag === LOCK_ALL ? (cur & LOCK_ALL ? 0 : LOCK_ALL) : ((cur & ~LOCK_ALL) ^ flag) >>> 0;
-    this.updateLayer(tab, id, { locks: next >>> 0 });
+    const l = tab.layers;
+    const at = l && this.locate(l.tree, id);
+    if (!l || !at) return;
+    // the active layer decides on / off; every selected layer gets the same
+    const on = ((at.node.locks >>> 0) & flag) === 0;
+    const ids = l.selection.includes(id) ? l.selection : [id];
+    this.edit(tab, null, (tree) => {
+      for (const x of ids) {
+        const a = this.locate(tree, x);
+        if (!a) continue;
+        const cur = a.node.locks >>> 0;
+        a.node.locks = (flag === LOCK_ALL ? (on ? LOCK_ALL : 0) : on ? ((cur & ~LOCK_ALL) | flag) : cur & ~flag) >>> 0;
+      }
+    });
   }
 
   /** why `nodes` (their visible parts) cannot be merged: unrendered content would be lost */
@@ -826,6 +913,7 @@ export class ViewerState {
     const doc = this.docs.get(tab.id);
     const at = l && this.locate(l.tree, l.selectedId);
     if (!l || !doc || !at) return "レイヤーを選択してください";
+    if (this.selectedRoots(tab).length > 1) return this.mergeSelected(tab);
     if (at.node.children) return this.mergeGroup(tab);
     const node = at.node, lower = at.list[at.index - 1];
     if (!lower) return "下にレイヤーがありません";
@@ -846,7 +934,32 @@ export class ViewerState {
       const a = this.locate(tree, node.id)!;
       a.list.splice(a.index - 1, 2, res);
     });
-    l.selectedId = res.id;
+    this.select(tab, [res.id]);
+    this.releaseUnused(tab);
+    return null;
+  }
+
+  /** Ctrl+E with several layers selected: merges them into one layer at the place of the topmost one
+   *  (PS "Merge Layers"; hidden ones are discarded). */
+  mergeSelected(tab: Tab): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    const roots = this.selectedRoots(tab);
+    if (!l || !doc || roots.length < 2) return "結合するレイヤーを 2 つ以上選んでください";
+    if (roots.some((r) => pixelsLocked(r))) return "ロックされているレイヤーは結合できません";
+    const blocked = this.mergeBlocker(roots);
+    if (blocked) return blocked;
+    if (roots.every((r) => r.hidden)) return "選んだレイヤーがすべて非表示です";
+    const top = roots[roots.length - 1];
+    const list = roots.map((r) => ({ ...r, blendMode: r.children && r.blendMode === "pass through" ? "normal" as const : r.blendMode }));
+    const r = this.rasterize(doc, list);
+    const res = this.rasterLayer(doc, top.name, r);
+    this.edit(tab, null, (tree) => {
+      const at = this.locate(tree, top.id)!;
+      at.list.splice(at.index, 1, res);
+      for (const x of roots) { if (x.id === top.id) continue; const a = this.locate(tree, x.id); if (a) a.list.splice(a.index, 1); }
+    });
+    this.select(tab, [res.id]);
     this.releaseUnused(tab);
     return null;
   }
@@ -872,7 +985,7 @@ export class ViewerState {
       const a = this.locate(tree, g.id)!;
       a.list.splice(a.index, 1, res);
     });
-    l.selectedId = res.id;
+    this.select(tab, [res.id]);
     this.releaseUnused(tab);
     return null;
   }
@@ -901,7 +1014,7 @@ export class ViewerState {
       }
       tree.splice(0, tree.length, ...out);
     });
-    l.selectedId = res.id;
+    this.select(tab, [res.id]);
     this.releaseUnused(tab);
     return null;
   }
@@ -921,7 +1034,7 @@ export class ViewerState {
     const res = this.rasterLayer(doc, "背景", r);
     res.background = true;
     this.edit(tab, null, (tree) => { tree.splice(0, tree.length, res); });
-    l.selectedId = res.id;
+    this.select(tab, [res.id]);
     this.releaseUnused(tab);
     return null;
   }
