@@ -7,7 +7,7 @@
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
 import { buildPsd, isPsd, loadImage, loadLayers, SUPPORTED_EXT, type LoadedImage } from "./loader";
 import { Compositor, type LayerDoc } from "./compositor";
-import { LOCK_ALL, LOCK_TRANSPARENCY, THUMB, cloneTree, maskThumbOf, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode } from "./psdDoc";
+import { LOCK_ALL, LOCK_TRANSPARENCY, THUMB, cloneTree, maskThumbOf, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode, type PsdDocData } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
@@ -469,7 +469,11 @@ export class ViewerState {
 
   /** Loads the layer tree of a PSD tab (whole file + decode in the worker + GPU upload). */
   async loadLayers(tab: Tab) {
-    if (tab.layers || !this.renderer || !isPsd(tab.name)) return;
+    if (tab.layers || !this.renderer) return;
+    const psd = isPsd(tab.name);
+    // PNG / JPG / WebP: the image as shown becomes the only layer (8-bit images only)
+    const flatSet = psd ? null : this.cache.get(cacheKey(tab))?.set;
+    if (!psd && (!flatSet || flatSet.hdr)) return;
     const token = tab.token;
     tab.layers = {
       status: "loading", error: null, tree: [], count: 0, useLayers: false, selectedId: null, selection: [], stats: null, diff: null,
@@ -477,8 +481,7 @@ export class ViewerState {
       maskTarget: false, maskView: null,
     };
     try {
-      const src: FileSource = tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!);
-      const data = await loadLayers(src);
+      const data = flatSet ? this.flatDoc(flatSet) : await loadLayers(tab.file ? new BrowserFileSource(tab.file) : await TauriFileSource.open(tab.path!));
       if (token !== tab.token || !tab.layers || this.tabs.indexOf(tab) < 0) return; // navigated away / closed
       this.compositor ??= new Compositor(this.renderer);
       const t0 = performance.now();
@@ -489,12 +492,35 @@ export class ViewerState {
       Object.assign(tab.layers, {
         status: "ready", tree: data.layers, count: data.count, fileCount: data.count,
         canvas: { w: data.width, h: data.height, ox: 0, oy: 0 },
+        // a flat image's only layer is selected (ready to paint)
+        ...(flatSet ? { selectedId: 1, selection: [1] } : {}),
         stats: { readMs: data.readMs, decodeMs: data.decodeMs, uploadMs, compositeMs: doc.lastMs, passes: doc.passes },
       });
     } catch (e) {
       if (tab.layers) Object.assign(tab.layers, { status: "error", error: e instanceof Error ? e.message : String(e) });
       console.error(e);
     }
+  }
+
+  /** A layer document from a flat image: one layer ("背景" when opaque, else "レイヤー 0"), made in the app. */
+  private flatDoc(set: TextureSet): PsdDocData & { readMs: number } {
+    const t0 = performance.now();
+    const p = this.renderer!.readSet(set); // premultiplied
+    let opaque = true;
+    for (let i = 3; i < p.length; i += 4) {
+      const a = p[i];
+      if (a === 255) continue;
+      opaque = false;
+      if (a) { p[i - 3] = Math.min(255, (p[i - 3] * 255) / a + 0.5); p[i - 2] = Math.min(255, (p[i - 2] * 255) / a + 0.5); p[i - 1] = Math.min(255, (p[i - 1] * 255) / a + 0.5); }
+    }
+    const w = set.width, h = set.height;
+    const px = new Uint8ClampedArray(p.buffer, p.byteOffset, p.byteLength);
+    const layer: DocLayer = {
+      id: 1, origId: null, dup: false, raster: true, background: opaque, locks: 0, name: opaque ? "背景" : "レイヤー 0", kind: "pixel",
+      hidden: false, opacity: 1, fill: 1, blendMode: "normal", clipping: false, x: 0, y: 0, w, h, pixels: px, mask: null, maskEdited: false,
+      thumb: thumbOf(px, w, h), children: null, open: true, warnings: [],
+    };
+    return { width: w, height: h, bitsPerChannel: 8, layers: [layer], count: 0, decodeMs: performance.now() - t0, readMs: 0 };
   }
 
   /** Frees a tab's layer data (GPU) and goes back to the stored composite. */
@@ -1550,7 +1576,7 @@ export class ViewerState {
   paintBegin(tab: Tab, x: number, y: number, pressure: number, eraser: boolean, line: boolean): string | null {
     const l = tab.layers;
     const doc = this.docs.get(tab.id);
-    if (!l || l.status !== "ready" || !doc || !this.compositor) return isPsd(tab.name) ? "描くにはレイヤーを読み込んでください（F7）" : "描けるのはレイヤーを読み込んだ PSD だけです（PNG / JPG は今後対応）";
+    if (!l || l.status !== "ready" || !doc || !this.compositor) return l?.status === "loading" ? "レイヤーを準備中です" : "描くにはレイヤーを読み込んでください（F7）";
     let node = this.locate(l.tree, l.selectedId)?.node;
     const mask = l.maskTarget && !!node?.mask;
     const b = this.paintBlocker(node, mask);
@@ -1720,7 +1746,7 @@ export class ViewerState {
    *  background colour */
   fillSelection(tab: Tab, which: "fg" | "bg"): string | null {
     const l = tab.layers;
-    if (!l || l.status !== "ready") return isPsd(tab.name) ? "塗りつぶすにはレイヤーを読み込んでください（F7）" : "塗りつぶせるのはレイヤーを読み込んだ PSD だけです";
+    if (!l || l.status !== "ready") return "塗りつぶすにはレイヤーを読み込んでください（F7）";
     const node = this.locate(l.tree, l.selectedId)?.node;
     const color = which === "fg" ? paint.fg : paint.bg;
     const [r, g, b] = hexToRgb(color).map((v) => Math.round(v * 255));
@@ -1759,16 +1785,18 @@ export class ViewerState {
     return null;
   }
 
-  /** the colour of the image shown at canvas px (x, y) as #rrggbb (eyedropper) */
-  pickColor(x: number, y: number): string | null {
+  /** the colour of the image shown at canvas px (x, y) as #rrggbb (eyedropper; `size`: average of a square) */
+  pickColor(x: number, y: number, size = 1): string | null {
     const r = this.renderer, set = r?.activeSet;
     if (!r || !set) return null;
-    const p = r.readPixel(set, x, y);
-    if (!p) return null;
-    const v = p.values;
-    if (p.float) return rgbToHex(Math.pow(Math.min(1, v[0]), 1 / 2.2) * 255, Math.pow(Math.min(1, v[1]), 1 / 2.2) * 255, Math.pow(Math.min(1, v[2]), 1 / 2.2) * 255);
-    const a = v[3] || 255;
-    return rgbToHex((v[0] * 255) / a, (v[1] * 255) / a, (v[2] * 255) / a);
+    if (set.hdr) {
+      const p = r.readPixel(set, x, y);
+      if (!p) return null;
+      const g = (v: number) => Math.pow(Math.max(0, Math.min(1, v)), 1 / 2.2) * 255;
+      return rgbToHex(g(p.values[0]), g(p.values[1]), g(p.values[2]));
+    }
+    const v = r.readAverage(set, x, y, Math.max(1, size));
+    return v ? rgbToHex(v[0], v[1], v[2]) : null;
   }
 
   // ---------------------------------------------------------------- AI (ComfyUI, phase D minimal)
@@ -2130,6 +2158,47 @@ export class ViewerState {
     return { req, rgba };
   }
 
+  /** Writes the layer composite as PNG / JPEG / WebP to `target` (the first overwrite of a file keeps a .bak). */
+  private async saveFlat(tab: Tab, target: string): Promise<boolean> {
+    const l = tab.layers!;
+    const doc = this.docs.get(tab.id)!;
+    l.saving = true;
+    l.savePhase = "書き出し";
+    try {
+      const t0 = performance.now();
+      const set = this.compositor!.render(doc, l.tree);
+      const p = this.renderer!.readSet(set);
+      const ext = target.split(".").pop()!.toLowerCase();
+      const type = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "webp" ? "image/webp" : "image/png";
+      for (let i = 0; i < p.length; i += 4) {
+        const a = p[i + 3];
+        if (type === "image/jpeg") { const k = 255 - a; p[i] += k; p[i + 1] += k; p[i + 2] += k; p[i + 3] = 255; } // on white
+        else if (a && a < 255) for (let c = 0; c < 3; c++) p[i + c] = Math.min(255, (p[i + c] * 255) / a + 0.5);
+      }
+      const c = new OffscreenCanvas(set.width, set.height);
+      c.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(p.buffer as ArrayBuffer, p.byteOffset, p.byteLength), set.width, set.height), 0, 0);
+      const blob = await c.convertToBlob({ type, quality: type === "image/png" ? undefined : 0.95 });
+      const data = await blob.arrayBuffer();
+      const same = keyOf(target) === keyOf(tab.path!);
+      const backup = same && !this.backedUp.has(keyOf(target));
+      await writeFile(target, data, backup);
+      if (backup) this.backedUp.add(keyOf(target));
+      l.dirty = false;
+      l.saved = { ms: performance.now() - t0, bytes: data.byteLength, path: target };
+      if (!same) { tab.path = target; tab.key = keyOf(target); tab.name = baseName(target); recent.add(target); }
+      const old = this.cache.get(cacheKey(tab));
+      if (old && this.renderer!.activeSet !== old.set) { this.cache.delete(cacheKey(tab)); this.renderer!.dispose(old.set); this.cacheVersion++; }
+      void TauriFileSource.open(target).then((src) => this.decodeAndUpload(src, cacheKey(tab)))
+        .then((e) => { tab.meta = { ...e.meta, fromCache: true, totalMs: 0 }; this.enforceCache(); })
+        .catch((e) => console.warn("re-reading the saved image failed", e));
+      this.updateTitle();
+      return true;
+    } finally {
+      l.saving = false;
+      l.savePhase = null;
+    }
+  }
+
   /** things the compositor does not draw (they are missing from the composite written to the file) */
   private unrendered(tree: DocLayer[]): string[] {
     const out = new Set<string>();
@@ -2144,7 +2213,22 @@ export class ViewerState {
     const l = tab.layers;
     if (!l || l.status !== "ready" || !this.renderer || l.saving) return false;
     let target: string | null = tab.path;
-    if (tab.path && saveAs) target = await saveDialog(tab.path);
+    const flatSource = !isPsd(tab.name);
+    if (flatSource && tab.path) {
+      // a PNG / JPG / WebP opened as a layered document
+      const dir = tab.path.slice(0, Math.max(tab.path.lastIndexOf("\\"), tab.path.lastIndexOf("/")) + 1);
+      const stem = tab.name.replace(/\.[^.]+$/, "");
+      if (saveAs) {
+        target = await saveDialog(`${dir}${stem}.psd`, [
+          { name: "Photoshop（レイヤーを保持）", extensions: ["psd", "psb"] }, { name: "PNG", extensions: ["png"] },
+          { name: "JPEG", extensions: ["jpg", "jpeg"] }, { name: "WebP", extensions: ["webp"] },
+        ]);
+        if (!target) return false;
+      } else if (this.countLayers(l.tree) > 1 && !(await confirmDialog(
+        `「${tab.name}」に上書きすると、レイヤーは統合されます（レイヤーを残すには Ctrl+Shift+S で PSD として保存）。統合して上書きしますか？`,
+      ))) return false;
+      if (!isPsd(target!)) return this.saveFlat(tab, target!);
+    } else if (tab.path && saveAs) target = await saveDialog(tab.path);
     if (tab.path && !target) return false;
     const missing = this.unrendered(l.tree);
     if (missing.length && !this.warnedUnrendered.has(tab.id) && !(await confirmDialog(

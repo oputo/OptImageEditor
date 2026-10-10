@@ -77,7 +77,7 @@ pub struct PixelRef {
     pub h: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveRequest {
     pub src: String,
@@ -1163,8 +1163,45 @@ fn copy_range(src: &mut File, off: u64, len: u64, w: &mut impl Write) -> Result<
 
 fn is_psb_path(p: &str) -> bool { p.to_ascii_lowercase().ends_with(".psb") }
 
+/// A blank document (no layers, black composite) to start from when the source is not a PSD (a PNG / JPG opened
+/// as a layered document): every layer of the plan is then made in the app.
+fn write_blank(path: &Path, w: u32, h: u32, psb: bool) -> Result<(), String> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"8BPS");
+    v.extend_from_slice(&(if psb { 2u16 } else { 1u16 }).to_be_bytes());
+    v.extend_from_slice(&[0; 6]);
+    v.extend_from_slice(&3u16.to_be_bytes());
+    v.extend_from_slice(&h.to_be_bytes());
+    v.extend_from_slice(&w.to_be_bytes());
+    v.extend_from_slice(&8u16.to_be_bytes());
+    v.extend_from_slice(&3u16.to_be_bytes());
+    v.extend_from_slice(&0u32.to_be_bytes()); // colour mode data
+    v.extend_from_slice(&0u32.to_be_bytes()); // image resources
+    if psb { v.extend_from_slice(&0u64.to_be_bytes()) } else { v.extend_from_slice(&0u32.to_be_bytes()) } // layer and mask info
+    let mut row = Vec::new();
+    pack_bits(&vec![0u8; w as usize], &mut row);
+    v.extend_from_slice(&1u16.to_be_bytes());
+    for _ in 0..h * 3 { if psb { v.extend_from_slice(&(row.len() as u32).to_be_bytes()) } else { v.extend_from_slice(&(row.len() as u16).to_be_bytes()) } }
+    for _ in 0..h * 3 { v.extend_from_slice(&row); }
+    std::fs::write(path, v).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn is_psd_file(p: &str) -> bool {
+    let mut b = [0u8; 4];
+    File::open(p).and_then(|mut f| { use std::io::Read; f.read_exact(&mut b) }).is_ok() && &b == b"8BPS"
+}
+
 /// Writes the edited document to `req.dst` (via `<dst>.tmp`). `rgba`: premultiplied composite, width * height * 4.
+/// A source that is not a PSD (PNG / JPG) starts from a blank document.
 pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult, String> {
+    if !is_psd_file(&req.src) {
+        let blank = PathBuf::from(format!("{}.blank.tmp", req.dst));
+        write_blank(&blank, req.width, req.height, is_psb_path(&req.dst))?;
+        let r = SaveRequest { src: blank.display().to_string(), ..req.clone() };
+        let out = save(&r, rgba, pixels);
+        let _ = std::fs::remove_file(&blank);
+        return out;
+    }
     let t0 = std::time::Instant::now();
     let (w, h) = (req.width as usize, req.height as usize);
     if rgba.len() != w * h * 4 { return err(format!("composite size {} != {}x{}x4", rgba.len(), w, h)); }

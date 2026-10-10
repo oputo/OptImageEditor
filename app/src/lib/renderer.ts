@@ -613,6 +613,34 @@ export class Renderer {
     return values ? { values, float: set.hdr } : null;
   }
 
+  /** Average colour of the square of `size` px centred on (x, y) (8-bit images): straight RGBA 0..255, or null. */
+  readAverage(set: TextureSet, x: number, y: number, size: number): [number, number, number, number] | null {
+    if (set.hdr) return null;
+    const r = Math.floor(size / 2);
+    const x0 = Math.max(0, Math.floor(x) - r), y0 = Math.max(0, Math.floor(y) - r);
+    const x1 = Math.min(set.width, Math.floor(x) + r + 1), y1 = Math.min(set.height, Math.floor(y) + r + 1);
+    if (x1 <= x0 || y1 <= y0) return null;
+    const gl = this.gl;
+    const sum = [0, 0, 0, 0];
+    let n = 0;
+    for (const t of set.tiles) {
+      const ax = Math.max(x0, t.x), ay = Math.max(y0, t.y), bx = Math.min(x1, t.x + t.w), by = Math.min(y1, t.y + t.h);
+      if (bx <= ax || by <= ay) continue;
+      const fb = gl.createFramebuffer()!;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t.tex, 0);
+      const px = new Uint8Array((bx - ax) * (by - ay) * 4);
+      gl.readPixels(ax - t.x, ay - t.y, bx - ax, by - ay, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(fb);
+      for (let i = 0; i < px.length; i += 4) { sum[0] += px[i]; sum[1] += px[i + 1]; sum[2] += px[i + 2]; sum[3] += px[i + 3]; n++; }
+    }
+    if (!n) return null;
+    const a = sum[3] / n;
+    // premultiplied average -> straight
+    return a > 0 ? [sum[0] / n * 255 / a, sum[1] / n * 255 / a, sum[2] / n * 255 / a, a] : [0, 0, 0, 0];
+  }
+
   /** Small image of `set` (longest side `size` px, transparency on a checkerboard) for the navigator. Cached on the set. */
   thumbnail(set: TextureSet, size = 256): HTMLCanvasElement | null {
     if (set.thumb) return set.thumb;

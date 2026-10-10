@@ -6,6 +6,7 @@
   import { BLEND_LABEL, BLEND_MODES, LOCK_ALL, LOCK_PIXELS, LOCK_POSITION, LOCK_TRANSPARENCY, type DocLayer, type LayerBlendMode } from "./psdDoc";
   import type { Tab, ViewerState } from "./viewerState.svelte";
   import { modeOf } from "./selection.svelte";
+  import { isPsd } from "./loader";
 
   let { vs, tab, onsave, onmsg }: { vs: ViewerState; tab: Tab | null; onsave: (saveAs: boolean) => void; onmsg: (text: string) => void } = $props();
 
@@ -255,7 +256,7 @@
       {#if L.dirty}<span class="dirty" title="未保存の変更があります (Ctrl+S で保存)">●</span>{/if}
       <span class="spacer"></span>
       <div class="seg" title="表示する画像 (F4)">
-        <button class:on={!L.useLayers} onclick={() => tab && vs.setUseLayers(tab, false)}>PS の統合画像</button>
+        <button class:on={!L.useLayers} onclick={() => tab && vs.setUseLayers(tab, false)}>{tab && isPsd(tab.name) ? "PS の統合画像" : "元の画像"}</button>
         <button class:on={L.useLayers} onclick={() => tab && vs.setUseLayers(tab, true)}>レイヤー合成</button>
       </div>
     {/if}
@@ -264,7 +265,7 @@
   {#if !tab}
     <div class="msg">画像を開いてください</div>
   {:else if !L}
-    <div class="msg">PSD / PSB のレイヤーを表示します</div>
+    <div class="msg">{tab.meta?.hdr ? "EXR / HDR はレイヤー編集に未対応です" : "レイヤーを準備しています…"}</div>
   {:else if L.status === "loading"}
     <div class="msg"><span class="spin"></span> レイヤーを読み込み中…</div>
   {:else if L.status === "error"}

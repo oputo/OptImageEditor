@@ -6,48 +6,59 @@ export const PAINT_LABEL: Record<PaintTool, string> = { brush: "ブラシ", eras
 export const PAINT_ICON: Record<PaintTool, string> = { brush: "🖌", eraser: "⌫", eyedropper: "💧" };
 const KEY = "oie.paint";
 
-type Saved = { fg: string; bg: string; size: number; hardness: number; opacity: number; pressureSize: boolean; pressureOpacity: boolean; eraserSize: number };
+/** settings of one tool (the eyedropper's diameter is its sample size; it has no hardness / opacity) */
+export type ToolParams = { size: number; hardness: number; opacity: number };
+const DEFAULTS: Record<PaintTool, ToolParams> = {
+  brush: { size: 30, hardness: 0.8, opacity: 1 },
+  eraser: { size: 60, hardness: 0.8, opacity: 1 },
+  eyedropper: { size: 1, hardness: 1, opacity: 1 },
+};
+type Saved = { fg: string; bg: string; params: Partial<Record<PaintTool, Partial<ToolParams>>>; pressureSize: boolean; pressureOpacity: boolean };
 
 class PaintState {
   tool = $state<PaintTool | null>(null);
   fg = $state("#000000");
   bg = $state("#ffffff");
-  /** diameter in image px */
-  size = $state(30);
-  eraserSize = $state(60);
-  /** 0..1 (share of the radius that is fully opaque) */
-  hardness = $state(0.8);
-  /** 0..1 */
-  opacity = $state(1);
+  /** per tool: diameter (image px), hardness 0..1 (share of the radius that is fully opaque), opacity 0..1 */
+  params = $state<Record<PaintTool, ToolParams>>(structuredClone(DEFAULTS));
   pressureSize = $state(true);
   pressureOpacity = $state(false);
 
   constructor() {
     try {
-      const s: Partial<Saved> = JSON.parse(localStorage.getItem(KEY) ?? "{}");
+      const s: Partial<Saved> & { size?: number; eraserSize?: number; hardness?: number; opacity?: number } = JSON.parse(localStorage.getItem(KEY) ?? "{}");
       if (s.fg) this.fg = s.fg;
       if (s.bg) this.bg = s.bg;
-      if (s.size) this.size = s.size;
-      if (s.eraserSize) this.eraserSize = s.eraserSize;
-      if (typeof s.hardness === "number") this.hardness = s.hardness;
-      if (typeof s.opacity === "number") this.opacity = s.opacity;
+      for (const t of Object.keys(DEFAULTS) as PaintTool[]) Object.assign(this.params[t], s.params?.[t] ?? {});
+      // settings saved before the tools had their own (3-b, bf22fcc)
+      if (!s.params) {
+        if (s.size) this.params.brush.size = s.size;
+        if (s.eraserSize) this.params.eraser.size = s.eraserSize;
+        if (typeof s.hardness === "number") this.params.brush.hardness = this.params.eraser.hardness = s.hardness;
+        if (typeof s.opacity === "number") this.params.brush.opacity = this.params.eraser.opacity = s.opacity;
+      }
       if (typeof s.pressureSize === "boolean") this.pressureSize = s.pressureSize;
       if (typeof s.pressureOpacity === "boolean") this.pressureOpacity = s.pressureOpacity;
     } catch { /* storage unavailable */ }
   }
 
   save() {
-    const s: Saved = { fg: this.fg, bg: this.bg, size: this.size, hardness: this.hardness, opacity: this.opacity, pressureSize: this.pressureSize, pressureOpacity: this.pressureOpacity, eraserSize: this.eraserSize };
+    const s: Saved = { fg: this.fg, bg: this.bg, params: $state.snapshot(this.params), pressureSize: this.pressureSize, pressureOpacity: this.pressureOpacity };
     try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* storage unavailable */ }
   }
 
-  /** diameter of the current tool */
-  get diameter() { return this.tool === "eraser" ? this.eraserSize : this.size; }
+  /** the settings of the current tool (the brush's when no tool is active) */
+  get cur(): ToolParams { return this.params[this.tool ?? "brush"]; }
+  get diameter() { return this.cur.size; }
   set diameter(v: number) {
-    const d = Math.max(1, Math.min(5000, Math.round(v)));
-    if (this.tool === "eraser") this.eraserSize = d; else this.size = d;
+    const max = this.tool === "eyedropper" ? 101 : 5000;
+    this.cur.size = Math.max(1, Math.min(max, Math.round(v)));
     this.save();
   }
+  get hardness() { return this.cur.hardness; }
+  set hardness(v: number) { this.cur.hardness = Math.max(0, Math.min(1, v)); this.save(); }
+  get opacity() { return this.cur.opacity; }
+  set opacity(v: number) { this.cur.opacity = Math.max(0.01, Math.min(1, v)); this.save(); }
 
   swap() { [this.fg, this.bg] = [this.bg, this.fg]; this.save(); }
   reset() { this.fg = "#000000"; this.bg = "#ffffff"; this.save(); }

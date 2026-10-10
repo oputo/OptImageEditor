@@ -79,7 +79,8 @@
   $effect(() => {
     const t = active;
     const key = t?.key;
-    if (!(opt.layersPanel && t?.meta && !t.layers && isPsd(t.name))) return;
+    // PSD: its layers; PNG / JPG / WebP: the image as one layer (also when a paint tool is picked)
+    if (!((opt.layersPanel || paint.tool) && t?.meta && !t.layers && !t.meta.hdr)) return;
     const timer = setTimeout(() => { if (vs.active === t && t.key === key) vs.loadLayers(t); }, 400);
     return () => clearTimeout(timer);
   });
@@ -113,7 +114,7 @@
   async function save(saveAs: boolean) {
     const t = active;
     const l = t?.layers;
-    if (!t || l?.status !== "ready") { showToast("保存できるのはレイヤーを読み込んだ PSD だけです（F7 でレイヤーパネルを開く）"); return; }
+    if (!t || l?.status !== "ready") { showToast("保存するにはレイヤーを読み込んでください（F7 でレイヤーパネルを開く）。画像のままの書き出しは Ctrl+Alt+Shift+W"); return; }
     if (!saveAs && !l.dirty) { showToast("変更はありません"); return; }
     try {
       if (await vs.save(t, saveAs)) showToast(`保存しました: ${t.name}（${(l.saved!.ms / 1000).toFixed(1)} 秒）`);
@@ -127,7 +128,7 @@
   function layerKey(f: (t: NonNullable<typeof active>) => void) {
     const t = active;
     if (t?.layers?.status === "ready") f(t);
-    else if (t && isPsd(t.name)) showToast("レイヤーの編集はレイヤーパネル (F7) を開いてから");
+    else if (t?.meta) showToast("レイヤーの編集はレイヤーパネル (F7) を開いてから");
   }
 
   // ---- 2-d: export / image size / canvas size / shortcut list
@@ -155,7 +156,7 @@
   function openCanvas() {
     openMenu = null;
     const l = active?.layers;
-    if (l?.status !== "ready") { showToast(active && isPsd(active.name) ? "カンバスサイズはレイヤーを読み込んでから（F7）" : "カンバスサイズは PSD のみです"); return; }
+    if (l?.status !== "ready") { showToast("カンバスサイズはレイヤーを読み込んでから（F7）"); return; }
     canvasDlg = { w: l.canvas.w, h: l.canvas.h };
   }
   function doCanvas(w: number, h: number, anchor: number) {
@@ -191,7 +192,7 @@
   function onPaint(phase: "start" | "move" | "end" | "pick", x: number, y: number, pressure: number, e: PointerEvent): boolean | void {
     const t = active;
     if (!t) return false;
-    if (phase === "pick") { const c = vs.pickColor(x, y); if (c) { paint.fg = c; paint.save(); } return; }
+    if (phase === "pick") { const c = vs.pickColor(x, y, paint.params.eyedropper.size); if (c) { paint.fg = c; paint.save(); } return; }
     if (phase === "start") {
       const m = vs.paintBegin(t, x, y, pressure, paint.tool === "eraser", e.shiftKey);
       if (m) { showToast(m); return false; }
@@ -314,13 +315,13 @@
     else if (!ctrl && !e.altKey && !e.shiftKey && !annotOn && (kk === "b" || kk === "e" || kk === "i") && active?.meta && !cmp) setPaintTool(kk === "b" ? "brush" : kk === "e" ? "eraser" : "eyedropper");
     else if (!ctrl && !e.altKey && !annotOn && kk === "x" && !cmp) paint.swap();
     else if (!ctrl && !e.altKey && !annotOn && kk === "d" && !cmp) paint.reset();
-    else if (!ctrl && !e.altKey && paint.tool && paint.tool !== "eyedropper" && BRACKET[k] !== undefined) {
+    else if (!ctrl && !e.altKey && paint.tool && BRACKET[k] !== undefined) {
       // by the character, not the physical key: "[" sits elsewhere on a Japanese (JIS) keyboard
       const up = BRACKET[k];
-      if (e.shiftKey) { paint.hardness = Math.max(0, Math.min(1, Math.round(paint.hardness * 4 + (up ? 1 : -1)) / 4)); paint.save(); }
+      if (e.shiftKey) { if (paint.tool !== "eyedropper") paint.hardness = Math.round(paint.hardness * 4 + (up ? 1 : -1)) / 4; }
       else paint.diameter = stepSize(paint.diameter, up);
     }
-    else if (!ctrl && !e.altKey && !e.shiftKey && paint.tool && paint.tool !== "eyedropper" && /^[0-9]$/.test(kk) && !cmp) { paint.opacity = kk === "0" ? 1 : Number(kk) / 10; paint.save(); }
+    else if (!ctrl && !e.altKey && !e.shiftKey && paint.tool && paint.tool !== "eyedropper" && /^[0-9]$/.test(kk) && !cmp) paint.opacity = kk === "0" ? 1 : Number(kk) / 10;
     else if ((e.altKey || ctrl) && !e.shiftKey && (k === "Delete" || k === "Backspace") && active?.meta) layerKey((t) => msg(vs.fillSelection(t, e.altKey ? "fg" : "bg")));
     else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) setAnnotTool(TOOL_BY_KEY[kk]);
     else if (ctrl && e.shiftKey && kk === "c") copyAnnotated();

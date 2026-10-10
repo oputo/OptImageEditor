@@ -57,6 +57,7 @@
     | { kind: "draw"; shape: Shape; x0: number; y0: number }
     | { kind: "move"; shape: Shape; x: number; y: number; moved: boolean }
     | { kind: "paint" }
+    | { kind: "adjust"; cx: number; cy: number; d0: number; h0: number; o0: number; opacity: boolean }
     | { kind: "pick" }
     | { kind: "sel"; tool: "rect" | "ellipse" | "lasso"; mode: SelMode; pts: number[]; shiftAtStart: boolean; shiftReleased: boolean };
   let drag: Drag | null = null;
@@ -150,7 +151,7 @@
     void annot?.version;
     void annot?.selected;
     void annotTool.tool;
-    void [paint.tool, paint.size, paint.eraserSize];
+    void [paint.tool, paint.diameter];
     renderer?.requestDraw();
   });
 
@@ -176,7 +177,8 @@
     const panes = r.panes();
     if (opt.extras) for (const p of panes) drawExtras(ctx, p, dpr, r.imageWidth, r.imageHeight);
     if (!r.compare && panes.length) drawSelectionAnts(ctx, panes[0], dpr);
-    if (painting() && mouse && paint.tool !== "eyedropper" && !spaceDown && panes.length) drawBrushCursor(ctx, panes[0], dpr);
+    if (drag?.kind === "adjust" && panes.length) drawAdjust(ctx, panes[0], dpr, drag);
+    else if (painting() && mouse && paint.tool !== "eyedropper" && !spaceDown && panes.length) drawBrushCursor(ctx, panes[0], dpr);
     if (annot && !r.compare && panes.length) drawAnnotations(ctx, panes[0], dpr);
     if (r.compare) drawCompareChrome(ctx, r, panes, dpr);
     if (showRulers) drawRulers(r, dpr);
@@ -208,6 +210,34 @@
     ctx.lineWidth = 1;
     ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
     ctx.stroke();
+    ctx.restore();
+  }
+
+  /** right-drag on the canvas: the brush at its new size around the start point, and the values */
+  function drawAdjust(ctx: CanvasRenderingContext2D, p: Pane, dpr: number, d: { cx: number; cy: number; opacity: boolean }) {
+    const rad = Math.max(1, (paint.diameter / 2) * p.view.scale);
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (paint.tool !== "eyedropper") {
+      // the soft part of the brush as a gradient
+      const g = ctx.createRadialGradient(d.cx, d.cy, rad * Math.min(paint.hardness, 0.999), d.cx, d.cy, rad);
+      g.addColorStop(0, `rgba(255, 60, 60, ${0.5 * paint.opacity})`);
+      g.addColorStop(1, "rgba(255, 60, 60, 0)");
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(d.cx, d.cy, rad, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.beginPath(); ctx.arc(d.cx, d.cy, rad, 0, Math.PI * 2);
+    ctx.lineWidth = 3; ctx.strokeStyle = "rgba(0, 0, 0, 0.6)"; ctx.stroke();
+    ctx.lineWidth = 1; ctx.strokeStyle = "#fff"; ctx.stroke();
+    const text = paint.tool === "eyedropper" ? `範囲 ${paint.diameter}px`
+      : `直径 ${paint.diameter}px　${d.opacity ? `不透明度 ${Math.round(paint.opacity * 100)}%` : `硬さ ${Math.round(paint.hardness * 100)}%`}`;
+    ctx.font = "12px 'Segoe UI', 'Yu Gothic UI', sans-serif";
+    const w = ctx.measureText(text).width + 14;
+    ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
+    ctx.beginPath(); ctx.roundRect(d.cx - w / 2, d.cy + rad + 8, w, 22, 4); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, d.cx - w / 2 + 7, d.cy + rad + 19);
     ctx.restore();
   }
 
@@ -495,6 +525,9 @@
     if (e.button === 0 && !rDown && !spaceDown && annotating()) {
       e.preventDefault(); // no focus change: a text box opened here keeps the focus
       if (!annotDown(e, cx, cy, pane)) return;
+    } else if (e.button === 2 && painting()) {
+      // right-drag (a pen's side button): left / right = diameter, up / down = hardness (Shift: opacity)
+      drag = { kind: "adjust", cx, cy, d0: paint.diameter, h0: paint.hardness, o0: paint.opacity, opacity: e.shiftKey };
     } else if (e.button === 0 && !rDown && !spaceDown && painting()) {
       e.preventDefault();
       const [ix, iy] = applyInverse(pane.matrix, cx, cy);
@@ -697,6 +730,15 @@
     mouse = [cx, cy];
     if (drag?.kind === "draw" || drag?.kind === "move") {
       annotMove(e, cx, cy);
+    } else if (drag?.kind === "adjust") {
+      const pane = r.panes()[0];
+      const s = pane?.view.scale ?? 1;
+      paint.diameter = drag.d0 + ((cx - drag.cx) * 2) / s;
+      if (paint.tool !== "eyedropper") {
+        const dv = -(cy - drag.cy) / 150;
+        if (drag.opacity) paint.opacity = drag.o0 + dv; else paint.hardness = drag.h0 + dv;
+      }
+      r.requestDraw();
     } else if (drag?.kind === "paint" || drag?.kind === "pick") {
       const pane = r.panes()[0];
       if (pane) {
@@ -804,6 +846,7 @@
     onpointerup={onPointerUp}
     onpointercancel={onPointerUp}
     onpointerleave={onLeave}
+    oncontextmenu={(e) => e.preventDefault()}
   ></canvas>
   <canvas bind:this={overlay} class="overlay"></canvas>
   {#if textEdit}
