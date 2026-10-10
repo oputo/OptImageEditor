@@ -480,7 +480,18 @@ export class Compositor {
     return this.renderInto(doc, layers, this.createOutput(doc.data.width, doc.data.height));
   }
 
-  private renderInto(doc: LayerDoc, layers: DocLayer[], output: TextureSet): TextureSet {
+  /** Renders only `rect` (document px) of the document into its output (painting: once per frame, no GPU sync). */
+  renderRect(doc: LayerDoc, layers: DocLayer[], rect: { x: number; y: number; w: number; h: number }): TextureSet {
+    const { width: W, height: H } = doc.data;
+    if (!doc.output) return this.render(doc, layers);
+    void W; void H;
+    return this.renderInto(doc, layers, doc.output, rect);
+  }
+
+  /** the WebGL context (shared with the renderer and the painter) */
+  get context() { return this.gl; }
+
+  private renderInto(doc: LayerDoc, layers: DocLayer[], output: TextureSet, rect: { x: number; y: number; w: number; h: number } | null = null): TextureSet {
     const gl = this.gl;
     const t0 = performance.now();
     this.doc = doc;
@@ -491,6 +502,14 @@ export class Compositor {
     gl.disable(gl.BLEND);
     gl.bindVertexArray(this.vao);
     for (const t of output.tiles) {
+      if (rect) {
+        // only the part of the tile inside `rect`: every pass works per pixel, so a scissor is enough
+        const x0 = Math.max(rect.x, t.x), y0 = Math.max(rect.y, t.y);
+        const x1 = Math.min(rect.x + rect.w, t.x + t.w), y1 = Math.min(rect.y + rect.h, t.y + t.h);
+        if (x1 <= x0 || y1 <= y0) continue;
+        gl.enable(gl.SCISSOR_TEST);
+        gl.scissor(x0 - t.x, y0 - t.y, x1 - x0, y1 - y0);
+      }
       this.origin = [t.x, t.y];
       this.size = [t.w, t.h];
       let acc = this.clear();
@@ -511,12 +530,15 @@ export class Compositor {
       gl.bindTexture(gl.TEXTURE_2D, t.tex);
       gl.generateMipmap(gl.TEXTURE_2D);
     }
+    gl.disable(gl.SCISSOR_TEST);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindVertexArray(null);
     gl.activeTexture(gl.TEXTURE0);
-    const px = new Uint8Array(4);
-    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); // GPU sync for the timing
-    doc.lastMs = performance.now() - t0;
+    if (!rect) {
+      const px = new Uint8Array(4);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); // GPU sync for the timing
+      doc.lastMs = performance.now() - t0;
+    }
     this.renderer.requestDraw();
     return output;
   }
@@ -549,6 +571,31 @@ export class Compositor {
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, out);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.deleteFramebuffer(fb);
+    return out;
+  }
+
+  /** A small preview of a layer's pixels or mask (GPU-scaled, then read back): RGBA tw x th (a mask: grey). */
+  readScaled(doc: LayerDoc, id: number, mask: boolean, w: number, h: number, tw: number, th: number): Uint8Array {
+    const gl = this.gl;
+    const out = new Uint8Array(tw * th * 4);
+    const g = doc.gpu.get(id);
+    const src = mask ? g?.mask : g?.tex;
+    if (!src || w <= 0 || h <= 0) return out;
+    const small = this.texture(gl.RGBA8, tw, th);
+    const rf = gl.createFramebuffer()!, df = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, rf);
+    gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, src, 0);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, df);
+    gl.framebufferTexture2D(gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, small, 0);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.blitFramebuffer(0, 0, w, h, 0, 0, tw, th, gl.COLOR_BUFFER_BIT, gl.LINEAR);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, df);
+    gl.readPixels(0, 0, tw, th, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(rf);
+    gl.deleteFramebuffer(df);
+    gl.deleteTexture(small);
+    if (mask) for (let i = 0; i < out.length; i += 4) { out[i + 1] = out[i + 2] = out[i]; out[i + 3] = 255; }
     return out;
   }
 

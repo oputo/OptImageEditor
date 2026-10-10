@@ -12,8 +12,11 @@
     type Annotations, type Shape,
   } from "./annotations.svelte";
   import { modeOf, outline, selTool, type Sel, type SelMode, type SelTool } from "./selection.svelte";
+  import { paint } from "./paint.svelte";
 
-  let { renderer = $bindable(), guides = null, annot = null, sel = null, labels = null, oncursor, onsplit, onselshape }: {
+  let { renderer = $bindable(), guides = null, annot = null, sel = null, labels = null, oncursor, onsplit, onselshape, onpaint }: {
+    /** paint tools: "start" returns false when the layer cannot be painted; "pick" samples a colour (eyedropper / Alt) */
+    onpaint?: (phase: "start" | "move" | "end" | "pick", x: number, y: number, pressure: number, e: PointerEvent) => boolean | void;
     renderer?: Renderer;
     /** selection of the shown image (marching ants) */
     sel?: Sel | null;
@@ -53,6 +56,8 @@
     | { kind: "split" }
     | { kind: "draw"; shape: Shape; x0: number; y0: number }
     | { kind: "move"; shape: Shape; x: number; y: number; moved: boolean }
+    | { kind: "paint" }
+    | { kind: "pick" }
     | { kind: "sel"; tool: "rect" | "ellipse" | "lasso"; mode: SelMode; pts: number[]; shiftAtStart: boolean; shiftReleased: boolean };
   let drag: Drag | null = null;
   let hot: { axis: "v" | "h"; index: number } | null = $state(null); // guide under the mouse / being dragged
@@ -63,6 +68,9 @@
   /** text being typed: position in css px and image px */
   let textEdit = $state<{ cx: number; cy: number; ix: number; iy: number; size: number; color: string; value: string; replace: Shape | null } | null>(null);
   const guidesOn = () => opt.extras && opt.guides && !!guides;
+  /** paint tool in use (not while comparing / annotating) */
+  const painting = () => !!paint.tool && !!onpaint && !renderer?.compare && !annotating();
+  const pressureOf = (e: PointerEvent) => (e.pointerType === "pen" ? e.pressure : 1);
   /** selection tool in use (not while comparing / annotating) */
   const selecting = () => !!selTool.tool && !!onselshape && !renderer?.compare && !annotating();
   /** polygon being clicked (image px) and the mouse position for its rubber band */
@@ -142,6 +150,7 @@
     void annot?.version;
     void annot?.selected;
     void annotTool.tool;
+    void [paint.tool, paint.size, paint.eraserSize];
     renderer?.requestDraw();
   });
 
@@ -167,6 +176,7 @@
     const panes = r.panes();
     if (opt.extras) for (const p of panes) drawExtras(ctx, p, dpr, r.imageWidth, r.imageHeight);
     if (!r.compare && panes.length) drawSelectionAnts(ctx, panes[0], dpr);
+    if (painting() && mouse && paint.tool !== "eyedropper" && !spaceDown && panes.length) drawBrushCursor(ctx, panes[0], dpr);
     if (annot && !r.compare && panes.length) drawAnnotations(ctx, panes[0], dpr);
     if (r.compare) drawCompareChrome(ctx, r, panes, dpr);
     if (showRulers) drawRulers(r, dpr);
@@ -182,6 +192,22 @@
     if (drag?.kind === "draw") drawShape(ctx, drag.shape);
     const sel = drag?.kind === "move" ? drag.shape : annot!.shapes.find((s) => s.id === annot!.selected);
     if (sel && annotTool.tool === "select") drawSelection(ctx, sel, 1 / p.view.scale);
+    ctx.restore();
+  }
+
+  /** the brush outline at the mouse */
+  function drawBrushCursor(ctx: CanvasRenderingContext2D, p: Pane, dpr: number) {
+    const rad = Math.max(1, (paint.diameter / 2) * p.view.scale);
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.beginPath();
+    ctx.arc(mouse![0], mouse![1], rad, 0, Math.PI * 2);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.6)";
+    ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+    ctx.stroke();
     ctx.restore();
   }
 
@@ -469,6 +495,12 @@
     if (e.button === 0 && !rDown && !spaceDown && annotating()) {
       e.preventDefault(); // no focus change: a text box opened here keeps the focus
       if (!annotDown(e, cx, cy, pane)) return;
+    } else if (e.button === 0 && !rDown && !spaceDown && painting()) {
+      e.preventDefault();
+      const [ix, iy] = applyInverse(pane.matrix, cx, cy);
+      if (paint.tool === "eyedropper" || e.altKey) { onpaint!("pick", ix, iy, 1, e); drag = { kind: "pick" }; }
+      else if (onpaint!("start", ix, iy, pressureOf(e), e) !== false) drag = { kind: "paint" };
+      else return;
     } else if (e.button === 0 && !rDown && !spaceDown && selecting()) {
       e.preventDefault();
       if (!selDown(e, cx, cy, pane)) return;
@@ -665,6 +697,18 @@
     mouse = [cx, cy];
     if (drag?.kind === "draw" || drag?.kind === "move") {
       annotMove(e, cx, cy);
+    } else if (drag?.kind === "paint" || drag?.kind === "pick") {
+      const pane = r.panes()[0];
+      if (pane) {
+        // every pen / mouse sample since the last event (smooth strokes at low frame rates)
+        const evs = (e.getCoalescedEvents?.() ?? []).length ? e.getCoalescedEvents() : [e];
+        const rect = canvas.getBoundingClientRect();
+        for (const ce of evs) {
+          const [ix, iy] = applyInverse(pane.matrix, ce.clientX - rect.left, ce.clientY - rect.top);
+          onpaint!(drag.kind === "paint" ? "move" : "pick", ix, iy, pressureOf(ce), ce);
+        }
+      }
+      r.requestDraw();
     } else if (drag?.kind === "sel") {
       selMove(e, cx, cy);
     } else if (poly) {
@@ -693,7 +737,7 @@
       const pk = pick(cx, cy);
       if (pk) oncursor?.([pk.ix, pk.iy]);
     }
-    if (showRulers) r.requestDraw(); // ruler mouse marker
+    if (showRulers || painting()) r.requestDraw(); // ruler mouse marker / brush outline
   }
 
   function onPointerUp(e: PointerEvent) {
@@ -707,6 +751,7 @@
     }
     if (drag?.kind === "draw" || drag?.kind === "move") annotUp();
     if (drag?.kind === "sel") selUp();
+    if (drag?.kind === "paint") { const [cx, cy] = local(e); const pane = renderer?.panes()[0]; const [ix, iy] = pane ? applyInverse(pane.matrix, cx, cy) : [0, 0]; onpaint?.("end", ix, iy, 0, e); }
     drag = null;
     const [cx, cy] = local(e);
     updateCursor(cx, cy);
@@ -717,7 +762,7 @@
     mouse = null;
     oncursor?.(null);
     if (hot) hot = null;
-    if (showRulers) renderer?.requestDraw();
+    if (showRulers || painting()) renderer?.requestDraw();
   }
 
   function updateCursor(cx: number, cy: number) {
@@ -734,6 +779,7 @@
     }
     if (drag?.kind === "rotate" || rDown) { cursorClass = "rotate"; return; }
     if ((selecting() || drag?.kind === "sel") && !spaceDown) { cursorClass = "draw"; return; }
+    if (painting() && !spaceDown) { cursorClass = paint.tool === "eyedropper" ? "pick" : "draw"; return; }
     if (drag?.kind === "guide") { cursorClass = drag.axis === "v" ? "col" : "row"; return; }
     if (drag?.kind === "split" || (!spaceDown && onSplitHandle(cx))) { cursorClass = "col"; return; }
     const g = spaceDown ? null : guideAt(cx, cy);
@@ -792,6 +838,7 @@
   .gl.row { cursor: row-resize; }
   .gl.rotate { cursor: crosshair; }
   .gl.draw { cursor: crosshair; }
+  .gl.pick { cursor: copy; }
   .gl.text { cursor: text; }
   .gl.move { cursor: move; }
   .annot-text {

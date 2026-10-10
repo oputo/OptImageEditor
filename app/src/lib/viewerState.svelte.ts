@@ -7,13 +7,15 @@
 // Everything else is freed; a tab whose texture was freed is decoded again when activated (~0.2 s).
 import { buildPsd, isPsd, loadImage, loadLayers, SUPPORTED_EXT, type LoadedImage } from "./loader";
 import { Compositor, type LayerDoc } from "./compositor";
-import { LOCK_ALL, LOCK_TRANSPARENCY, cloneTree, maskThumbOf, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode } from "./psdDoc";
+import { LOCK_ALL, LOCK_TRANSPARENCY, THUMB, cloneTree, maskThumbOf, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
 import { confirmDialog, copyImageFallback, listFolderImages, savePsd, saveDialog, setWindowTitle, writeFile } from "./desktop";
 import { recent } from "./recent.svelte";
 import { Annotations, flattenToCanvas, flattenToPng } from "./annotations.svelte";
+import { Painter, applyTiles, type PatchTile } from "./painter";
+import { hexToRgb, paint, rgbToHex } from "./paint.svelte";
 import { comfy, loadWorkflow, type Progress, type WorkflowKind } from "./comfy";
 import {
   Sel, allSel, clearPixels, selAt, trimSel, combine, ellipseSel, invertSel, maskPixels, polySel, rectSel, selFromAlpha, shiftSel,
@@ -97,7 +99,10 @@ export type LayersState = {
 /** Undo history of a tab's layer tree (snapshots of the tree; pixels are not edited in 2-b). */
 /** Canvas of a layered document: size, and how far the file's layers have moved (canvas size changes not saved yet). */
 export type Canvas = { w: number; h: number; ox: number; oy: number };
-type Snapshot = { tree: DocLayer[]; canvas: Canvas; sel: Sel | null };
+/** pixels changed in place by a stroke (layer `id`'s texture or mask), applied backwards / forwards by undo / redo */
+type Patch = { id: number; mask: boolean; tiles: PatchTile[]; bytes: number };
+/** `patch`: the pixel change from this state to the next one (strokes) */
+type Snapshot = { tree: DocLayer[]; canvas: Canvas; sel: Sel | null; patch?: Patch };
 type History = { undo: Snapshot[]; redo: Snapshot[]; lastKey: string | null; lastTime: number };
 const HISTORY_MAX = 100;
 
@@ -612,7 +617,9 @@ export class ViewerState {
     const from = back ? h.undo : h.redo, to = back ? h.redo : h.undo;
     const snap = from.pop();
     if (!snap) return;
-    to.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas }, sel: tab.sel });
+    if (this.stroke?.tab === tab) this.paintEnd();
+    to.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas }, sel: tab.sel, patch: snap.patch });
+    if (snap.patch) this.applyPatch(tab, snap.patch, back ? "before" : "after");
     l.tree = snap.tree;
     l.canvas = { ...snap.canvas };
     if (tab.sel !== snap.sel) { if (!snap.sel && tab.sel) tab.lastSel = tab.sel; tab.sel = snap.sel; }
@@ -1494,6 +1501,276 @@ export class ViewerState {
     this.renderer.setView(v);
   }
 
+  // ---------------------------------------------------------------- painting (phase 3-b)
+
+  private painter: Painter | null = null;
+  private stroke: {
+    tab: Tab; nodeId: number; mask: boolean; ox: number; oy: number;
+    /** last dab position (canvas px) and the distance left to the next dab */
+    last: [number, number]; carry: number;
+    /** the layer was replaced (expanded / unshared) at the start: the history step exists already */
+    replaced: boolean;
+    frame: number;
+    lastRect?: Rect | null;
+  } | null = null;
+  /** where the last stroke ended (Shift+click draws a straight line from there) */
+  private lastPaint: { tabId: number; nodeId: number; x: number; y: number } | null = null;
+  private static readonly PATCH_LIMIT = 1024 * 2 ** 20;
+
+  /** why `node` cannot be painted (null: it can) */
+  private paintBlocker(node: DocLayer | null | undefined, mask: boolean): string | null {
+    if (!node) return "レイヤーを選択してください";
+    if (node.hidden) return `「${node.name}」は非表示のため描けません`;
+    if (mask) return this.maskBlocker(node);
+    if (node.children) return "グループには描けません。レイヤーを選択してください";
+    if (node.kind !== "pixel") return `「${node.name}」はピクセルレイヤーではないため描けません（${node.kind === "smart" ? "スマートオブジェクト" : node.kind === "text" ? "テキスト" : "塗りつぶし・調整"}）`;
+    if (pixelsLocked(node)) return `「${node.name}」はロックされています`;
+    return null;
+  }
+
+  /** a texture used by another layer of the current tree (duplicates share them) */
+  private sharedTexture(tab: Tab, id: number, mask: boolean): boolean {
+    const doc = this.docs.get(tab.id)!;
+    const g = doc.gpu.get(id);
+    const t = mask ? g?.mask : g?.tex;
+    if (!t) return false;
+    let shared = false;
+    const walk = (ls: DocLayer[]) => {
+      for (const x of ls) {
+        if (x.id !== id) { const o = doc.gpu.get(x.id); if (o && (mask ? o.mask : o.tex) === t) shared = true; }
+        if (x.children) walk(x.children);
+      }
+    };
+    walk(tab.layers!.tree);
+    return shared;
+  }
+
+  /** Starts a brush / eraser stroke at canvas px (x, y). `line`: a straight line from the last stroke's end
+   *  (Shift+click). Returns a message when it cannot. */
+  paintBegin(tab: Tab, x: number, y: number, pressure: number, eraser: boolean, line: boolean): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc || !this.compositor) return isPsd(tab.name) ? "描くにはレイヤーを読み込んでください（F7）" : "描けるのはレイヤーを読み込んだ PSD だけです（PNG / JPG は今後対応）";
+    let node = this.locate(l.tree, l.selectedId)?.node;
+    const mask = l.maskTarget && !!node?.mask;
+    const b = this.paintBlocker(node, mask);
+    if (b) return b;
+    if (l.maskView !== null) void this.showMask(tab, null);
+    if (!l.useLayers) this.setUseLayers(tab, true);
+    const C = { x: 0, y: 0, w: l.canvas.w, h: l.canvas.h };
+    // the target must cover the canvas and must not be shared with another layer: otherwise a copy (one history step)
+    let replaced = false;
+    if (mask) {
+      const m = node!.mask!;
+      const covers = m.w > 0 && m.x <= 0 && m.y <= 0 && m.x + m.w >= C.w && m.y + m.h >= C.h;
+      if (!covers || this.sharedTexture(tab, node!.id, true)) {
+        const cur = this.maskOf(tab, node!);
+        const x0 = cur.w ? Math.min(0, cur.x) : 0, y0 = cur.w ? Math.min(0, cur.y) : 0;
+        const x1 = cur.w ? Math.max(C.w, cur.x + cur.w) : C.w, y1 = cur.w ? Math.max(C.h, cur.y + cur.h) : C.h;
+        const w = x1 - x0, h = y1 - y0;
+        const px = new Uint8Array(w * h).fill(cur.def);
+        for (let yy = 0; yy < cur.h; yy++) px.set(cur.px.subarray(yy * cur.w, (yy + 1) * cur.w), (yy + cur.y - y0) * w + cur.x - x0);
+        const next = this.withMask(tab, node!, { x: x0, y: y0, w, h, def: cur.def, px }, m.disabled);
+        this.edit(tab, null, (tree) => { const at = this.locate(tree, node!.id)!; at.list.splice(at.index, 1, next); });
+        this.select(tab, [next.id]);
+        l.maskTarget = true;
+        node = next;
+        replaced = true;
+      }
+    } else {
+      const covers = node!.w > 0 && node!.x <= 0 && node!.y <= 0 && node!.x + node!.w >= C.w && node!.y + node!.h >= C.h;
+      if (!covers || this.sharedTexture(tab, node!.id, false)) {
+        const src = node!.w > 0 ? this.layerPixels(tab, node!) : { x: 0, y: 0, w: 0, h: 0, px: new Uint8Array(0) };
+        const x0 = src.w ? Math.min(0, src.x) : 0, y0 = src.w ? Math.min(0, src.y) : 0;
+        const x1 = src.w ? Math.max(C.w, src.x + src.w) : C.w, y1 = src.w ? Math.max(C.h, src.y + src.h) : C.h;
+        const big = crop(src, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+        const next = this.withPixels(tab, node!, big);
+        this.edit(tab, null, (tree) => { const at = this.locate(tree, node!.id)!; at.list.splice(at.index, 1, next); });
+        this.select(tab, [next.id]);
+        node = next;
+        replaced = true;
+      }
+    }
+    const g = doc.gpu.get(node!.id)!;
+    const tex = mask ? g.mask : g.tex;
+    if (!tex) return "描画先がありません";
+    const ox = mask ? node!.mask!.x : node!.x, oy = mask ? node!.mask!.y : node!.y;
+    const tw = mask ? node!.mask!.w : node!.w, th = mask ? node!.mask!.h : node!.h;
+    this.painter ??= new Painter(this.compositor.context);
+    const keepAlpha = !mask && (node!.background || ((node!.locks >>> 0) & LOCK_TRANSPARENCY) !== 0);
+    const color = hexToRgb(eraser ? paint.bg : paint.fg);
+    const s = tab.sel;
+    this.painter.begin(
+      { tex, w: tw, h: th, mask, ox, oy },
+      { color, opacity: paint.opacity, eraser: eraser && !mask, keepAlpha },
+      s ? { rect: { x: s.x - ox, y: s.y - oy, w: s.w, h: s.h }, m: s.m } : null,
+    );
+    const from = line && this.lastPaint && this.lastPaint.tabId === tab.id && this.lastPaint.nodeId === node!.id ? this.lastPaint : null;
+    this.stroke = { tab, nodeId: node!.id, mask, ox, oy, last: from ? [from.x, from.y] : [x, y], carry: 0, replaced, frame: 0 };
+    if (from) this.dabLine(x, y, pressure); else this.dabAt(x, y, pressure);
+    this.scheduleStrokeFrame();
+    return null;
+  }
+
+  private dabAt(x: number, y: number, pressure: number) {
+    const st = this.stroke!;
+    const d = paint.diameter * (paint.pressureSize ? Math.max(0.05, pressure) : 1);
+    const a = paint.pressureOpacity ? Math.max(0.02, pressure) : 1;
+    this.painter!.dab(x - st.ox, y - st.oy, d / 2, paint.hardness, a);
+  }
+
+  /** dabs from the last position to (x, y), spaced by a quarter of the diameter */
+  private dabLine(x: number, y: number, pressure: number) {
+    const st = this.stroke!;
+    const [x0, y0] = st.last;
+    const dist = Math.hypot(x - x0, y - y0);
+    const spacing = Math.max(1, paint.diameter * (paint.pressureSize ? Math.max(0.05, pressure) : 1) * 0.25);
+    let t = spacing - st.carry;
+    while (t <= dist) {
+      this.dabAt(x0 + ((x - x0) * t) / dist, y0 + ((y - y0) * t) / dist, pressure);
+      t += spacing;
+    }
+    st.carry = dist - (t - spacing);
+    st.last = [x, y];
+  }
+
+  paintMove(x: number, y: number, pressure: number) {
+    if (!this.stroke) return;
+    this.dabLine(x, y, pressure);
+    this.scheduleStrokeFrame();
+  }
+
+  /** writes the new dabs into the layer and re-composites that part (once per frame) */
+  private scheduleStrokeFrame() {
+    const st = this.stroke;
+    if (!st || st.frame) return;
+    st.frame = requestAnimationFrame(() => {
+      if (this.stroke !== st) return;
+      st.frame = 0;
+      this.flushStroke(st);
+    });
+  }
+
+  private flushStroke(st: NonNullable<ViewerState["stroke"]>) {
+    const r = this.painter!.apply();
+    const doc = this.docs.get(st.tab.id);
+    if (r && doc && st.tab.layers) this.compositor!.renderRect(doc, st.tab.layers.tree, r);
+  }
+
+  paintEnd() {
+    const st = this.stroke;
+    if (!st) return;
+    this.stroke = null;
+    if (st.frame) cancelAnimationFrame(st.frame);
+    const tab = st.tab, l = tab.layers, doc = this.docs.get(tab.id);
+    st.lastRect = this.painter!.apply();
+    const { tiles, bytes } = this.painter!.end();
+    if (!l || !doc) return;
+    // the last dabs (end() applied them to the layer)
+    if (st.lastRect) this.compositor!.renderRect(doc, l.tree, st.lastRect);
+    const node = this.locate(l.tree, st.nodeId)?.node;
+    if (node && tiles.length) {
+      const patch = { id: st.nodeId, mask: st.mask, tiles, bytes };
+      const h = this.hist(tab);
+      if (st.replaced && h.undo.length) {
+        h.undo[h.undo.length - 1].patch = patch; // the copy made at the start and the stroke: one step
+      } else {
+        h.undo.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas }, sel: tab.sel, patch });
+        if (h.undo.length > HISTORY_MAX) h.undo.shift();
+      }
+      h.redo = [];
+      h.lastKey = null;
+      // keep the pixel history within its memory budget
+      let total = 0;
+      for (const s of h.undo) total += s.patch?.bytes ?? 0;
+      while (total > ViewerState.PATCH_LIMIT && h.undo.length > 1) total -= h.undo.shift()!.patch?.bytes ?? 0;
+      l.undoCount = h.undo.length;
+      l.redoCount = h.redo.length;
+      l.dirty = true;
+      this.refreshThumb(tab, node, st.mask);
+      if (this.activeId === tab.id) this.updateTitle();
+    }
+    this.lastPaint = { tabId: tab.id, nodeId: st.nodeId, x: st.last[0], y: st.last[1] };
+  }
+
+  /** layer / mask thumbnail after its pixels changed in place (scaled on the GPU: no full read-back) */
+  private refreshThumb(tab: Tab, node: DocLayer, mask: boolean) {
+    const doc = this.docs.get(tab.id)!;
+    const w = mask ? node.mask?.w ?? 0 : node.w, h = mask ? node.mask?.h ?? 0 : node.h;
+    if (w <= 0 || h <= 0) return;
+    const k = Math.min(1, THUMB / Math.max(w, h));
+    const tw = Math.max(1, Math.round(w * k)), th = Math.max(1, Math.round(h * k));
+    const data = new Uint8ClampedArray(this.compositor!.readScaled(doc, node.id, mask, w, h, tw, th).buffer);
+    if (mask && node.mask) node.mask = { ...node.mask, thumb: { w: tw, h: th, data } };
+    else node.thumb = { w: tw, h: th, data };
+  }
+
+  /** undo / redo of a stroke: its tiles back into the texture */
+  private applyPatch(tab: Tab, p: Patch, which: "before" | "after") {
+    const doc = this.docs.get(tab.id);
+    const g = doc?.gpu.get(p.id);
+    const tex = p.mask ? g?.mask : g?.tex;
+    if (!tex || !this.compositor) return;
+    applyTiles(this.compositor.context, tex, p.mask, p.tiles, which);
+    const node = tab.layers && this.locate(tab.layers.tree, p.id)?.node;
+    if (node) this.refreshThumb(tab, node, p.mask);
+  }
+
+  /** Alt+Delete / Ctrl+Delete: fills the selection (or everything) of the active layer / mask with the foreground /
+   *  background colour */
+  fillSelection(tab: Tab, which: "fg" | "bg"): string | null {
+    const l = tab.layers;
+    if (!l || l.status !== "ready") return isPsd(tab.name) ? "塗りつぶすにはレイヤーを読み込んでください（F7）" : "塗りつぶせるのはレイヤーを読み込んだ PSD だけです";
+    const node = this.locate(l.tree, l.selectedId)?.node;
+    const color = which === "fg" ? paint.fg : paint.bg;
+    const [r, g, b] = hexToRgb(color).map((v) => Math.round(v * 255));
+    if (l.maskTarget && node?.mask) {
+      const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+      return this.editMask(tab, () => gray);
+    }
+    const bl = this.paintBlocker(node, false);
+    if (bl) return bl;
+    const C = { x: 0, y: 0, w: l.canvas.w, h: l.canvas.h };
+    const src = node!.w > 0 ? this.layerPixels(tab, node!) : { x: 0, y: 0, w: 0, h: 0, px: new Uint8Array(0) };
+    const x0 = src.w ? Math.min(0, src.x) : 0, y0 = src.w ? Math.min(0, src.y) : 0;
+    const x1 = src.w ? Math.max(C.w, src.x + src.w) : C.w, y1 = src.w ? Math.max(C.h, src.y + src.h) : C.h;
+    const big = crop(src, { x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+    const keep = node!.background || ((node!.locks >>> 0) & LOCK_TRANSPARENCY) !== 0;
+    const s = tab.sel;
+    const px = big.px;
+    for (let y = 0; y < big.h; y++) {
+      const cy = y + big.y;
+      for (let x = 0; x < big.w; x++) {
+        const cx = x + big.x;
+        const v = s ? selAt(s, cx, cy) : cx >= 0 && cy >= 0 && cx < C.w && cy < C.h ? 255 : 0;
+        if (!v) continue;
+        const i = (y * big.w + x) * 4, k = v / 255;
+        const a0 = px[i + 3] / 255;
+        if (keep) {
+          px[i] += (r - px[i]) * k; px[i + 1] += (g - px[i + 1]) * k; px[i + 2] += (b - px[i + 2]) * k;
+        } else {
+          const a = k + a0 * (1 - k);
+          px[i] = (r * k + px[i] * a0 * (1 - k)) / a; px[i + 1] = (g * k + px[i + 1] * a0 * (1 - k)) / a; px[i + 2] = (b * k + px[i + 2] * a0 * (1 - k)) / a;
+          px[i + 3] = Math.round(a * 255);
+        }
+      }
+    }
+    this.replaceActive(tab, node!, this.withPixels(tab, node!, big), false);
+    return null;
+  }
+
+  /** the colour of the image shown at canvas px (x, y) as #rrggbb (eyedropper) */
+  pickColor(x: number, y: number): string | null {
+    const r = this.renderer, set = r?.activeSet;
+    if (!r || !set) return null;
+    const p = r.readPixel(set, x, y);
+    if (!p) return null;
+    const v = p.values;
+    if (p.float) return rgbToHex(Math.pow(Math.min(1, v[0]), 1 / 2.2) * 255, Math.pow(Math.min(1, v[1]), 1 / 2.2) * 255, Math.pow(Math.min(1, v[2]), 1 / 2.2) * 255);
+    const a = v[3] || 255;
+    return rgbToHex((v[0] * 255) / a, (v[1] * 255) / a, (v[2] * 255) / a);
+  }
+
   // ---------------------------------------------------------------- AI (ComfyUI, phase D minimal)
 
   /** What an AI tool works on in `tab`. Background removal: the active layer (PSD with its layers loaded; the layer
@@ -1822,10 +2099,11 @@ export class ViewerState {
       for (const n of ns as (PlanNode & { pixels?: unknown })[]) {
         if (n.raster) {
           const d = byId.get(n.id)!;
-          const px = this.compositor!.readLayerPixels(doc, d.id, d.w, d.h);
-          n.pixels = { offset, x: d.x, y: d.y, w: d.w, h: d.h };
-          blobs.push(px);
-          offset += px.length;
+          // painted layers cover the canvas: their transparent border is not written
+          const t = trim({ x: d.x, y: d.y, w: d.w, h: d.h, px: this.compositor!.readLayerPixels(doc, d.id, d.w, d.h) });
+          n.pixels = { offset, x: t.x, y: t.y, w: t.w, h: t.h };
+          blobs.push(t.px);
+          offset += t.px.length;
         }
         if (n.maskEdited) {
           const d = byId.get(n.id)!;

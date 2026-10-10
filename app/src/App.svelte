@@ -11,6 +11,9 @@
   import CanvasDialog from "./lib/CanvasDialog.svelte";
   import HelpOverlay from "./lib/HelpOverlay.svelte";
   import AiPanel from "./lib/AiPanel.svelte";
+  import PaintBar from "./lib/PaintBar.svelte";
+  import ColorPicker from "./lib/ColorPicker.svelte";
+  import { PAINT_ICON, PAINT_LABEL, paint, stepSize, type PaintTool } from "./lib/paint.svelte";
   import { TOOL_KEY, annotTool, type Tool } from "./lib/annotations.svelte";
   import { SEL_ICON, SEL_LABEL, selTool, type SelMode, type SelTool } from "./lib/selection.svelte";
   import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
@@ -168,14 +171,38 @@
   // one tool at a time: a selection tool or an annotation tool
   function setSelTool(t: SelTool | null) {
     selTool.tool = t;
+    if (t) paint.tool = null;
     if (t === "rect" || t === "ellipse") selTool.marquee = t;
     if (t === "lasso" || t === "poly") selTool.lasso = t;
     if (t) annotTool.tool = null;
   }
   function setAnnotTool(t: Tool | null) {
     annotTool.tool = t;
-    if (t) selTool.tool = null;
+    if (t) { selTool.tool = null; paint.tool = null; }
   }
+  function setPaintTool(t: PaintTool | null) {
+    paint.tool = t;
+    if (t) { selTool.tool = null; annotTool.tool = null; }
+  }
+
+  // ---- 3-b: painting
+  const BRACKET: Record<string, boolean> = { "[": false, "{": false, "「": false, "]": true, "}": true, "」": true };
+  let colorDlg = $state<"fg" | "bg" | null>(null);
+  function onPaint(phase: "start" | "move" | "end" | "pick", x: number, y: number, pressure: number, e: PointerEvent): boolean | void {
+    const t = active;
+    if (!t) return false;
+    if (phase === "pick") { const c = vs.pickColor(x, y); if (c) { paint.fg = c; paint.save(); } return; }
+    if (phase === "start") {
+      const m = vs.paintBegin(t, x, y, pressure, paint.tool === "eraser", e.shiftKey);
+      if (m) { showToast(m); return false; }
+      return true;
+    }
+    if (phase === "move") vs.paintMove(x, y, pressure);
+    else vs.paintEnd();
+  }
+  const paintTarget = $derived(active?.layers?.status === "ready"
+    ? (active.layers.maskTarget ? "マスクに描画" : "レイヤーに描画")
+    : "レイヤー未読み込み（F7）");
 
   // ---- 3-a: selection
   function onSelShape(tool: SelTool, pts: number[], mode: SelMode) {
@@ -259,10 +286,10 @@
     const t = e.target as HTMLElement;
     if (((t.tagName === "INPUT" && (t as HTMLInputElement).type !== "checkbox") || t.tagName === "SELECT") && !ctrl && !/^F\d+$/.test(k)) return;
     // text editing keys stay with the text field
-    if ((t.tagName === "INPUT" || t.tagName === "TEXTAREA") && ctrl && ["a", "c", "x", "v", "z", "y"].includes(kk)) return;
+    if ((t.tagName === "INPUT" || t.tagName === "TEXTAREA") && ((ctrl && ["a", "c", "x", "v", "z", "y"].includes(kk)) || k === "Delete" || k === "Backspace")) return;
     let handled = true;
     const cmp = vs.compare;
-    if (exportDlg || canvasDlg) return; // the dialog handles its keys
+    if (exportDlg || canvasDlg || colorDlg) return; // the dialog handles its keys
     if (showHelp && (k === "Escape" || k === "F1")) { showHelp = false; e.preventDefault(); return; }
     if (k === "Escape" && openMenu) openMenu = null;
     else if (k === "Escape" && cmp) vs.stopCompare();
@@ -271,6 +298,7 @@
     else if (cmp && !ctrl && !e.altKey && kk === "x") vs.updateCompare({ mode: "toggle", showB: cmp.mode === "toggle" ? !cmp.showB : true });
     else if (k === "Escape" && annotOn) { if (active!.annot.selected !== null) active!.annot.selected = null; else annotTool.tool = null; }
     else if (k === "Escape" && selTool.tool) setSelTool(null);
+    else if (k === "Escape" && paint.tool) setPaintTool(null);
     else if (!ctrl && !e.altKey && kk === "m" && active?.meta && !cmp && !annotOn) setSelTool(e.shiftKey ? (selTool.marquee === "rect" ? "ellipse" : "rect") : selTool.marquee);
     else if (!ctrl && !e.altKey && kk === "l" && active?.meta && !cmp && !annotOn) setSelTool(e.shiftKey ? (selTool.lasso === "lasso" ? "poly" : "lasso") : selTool.lasso);
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "a") { if (active?.meta) vs.selectAll(active); }
@@ -280,9 +308,20 @@
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "c") copySel(false);
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "x") copySel(true);
     else if (ctrl && !e.altKey && kk === "j" && active?.sel) layerKey((t) => msg(vs.layerViaSelection(t, e.shiftKey)));
-    else if (!ctrl && (k === "Delete" || k === "Backspace") && active?.sel && !annotOn) layerKey((t) => msg(t.layers!.maskTarget ? vs.hideInMask(t) : vs.clearSelection(t)));
+    else if (!ctrl && !e.altKey && (k === "Delete" || k === "Backspace") && active?.sel && !annotOn) layerKey((t) => msg(t.layers!.maskTarget ? vs.hideInMask(t) : vs.clearSelection(t)));
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "i" && active?.layers?.maskTarget) layerKey((t) => msg(vs.invertMask(t)));
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
+    else if (!ctrl && !e.altKey && !e.shiftKey && !annotOn && (kk === "b" || kk === "e" || kk === "i") && active?.meta && !cmp) setPaintTool(kk === "b" ? "brush" : kk === "e" ? "eraser" : "eyedropper");
+    else if (!ctrl && !e.altKey && !annotOn && kk === "x" && !cmp) paint.swap();
+    else if (!ctrl && !e.altKey && !annotOn && kk === "d" && !cmp) paint.reset();
+    else if (!ctrl && !e.altKey && paint.tool && paint.tool !== "eyedropper" && BRACKET[k] !== undefined) {
+      // by the character, not the physical key: "[" sits elsewhere on a Japanese (JIS) keyboard
+      const up = BRACKET[k];
+      if (e.shiftKey) { paint.hardness = Math.max(0, Math.min(1, Math.round(paint.hardness * 4 + (up ? 1 : -1)) / 4)); paint.save(); }
+      else paint.diameter = stepSize(paint.diameter, up);
+    }
+    else if (!ctrl && !e.altKey && !e.shiftKey && paint.tool && paint.tool !== "eyedropper" && /^[0-9]$/.test(kk) && !cmp) { paint.opacity = kk === "0" ? 1 : Number(kk) / 10; paint.save(); }
+    else if ((e.altKey || ctrl) && !e.shiftKey && (k === "Delete" || k === "Backspace") && active?.meta) layerKey((t) => msg(vs.fillSelection(t, e.altKey ? "fg" : "bg")));
     else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) setAnnotTool(TOOL_BY_KEY[kk]);
     else if (ctrl && e.shiftKey && kk === "c") copyAnnotated();
     else if (ctrl && e.altKey && e.shiftKey && kk === "w") openExport("export");
@@ -384,6 +423,7 @@
     // test hook for automated checks (browser build)
     (window as unknown as { __oie: unknown }).__oie = {
       vs,
+      paint,
       openFile: (f: File) => {
         vs.openFile(f);
         return new Promise<void>((r) => { const t = setInterval(() => { if (!vs.active?.loading) { clearInterval(t); r(); } }, 20); });
@@ -442,6 +482,16 @@
     {#each ["rect", "ellipse", "lasso", "poly"] as const as st (st)}
       <button class:on={selTool.tool === st} disabled={!active?.meta || !!vs.compare} title={SEL_LABEL[st]} onclick={() => setSelTool(selTool.tool === st ? null : st)}>{SEL_ICON[st]}</button>
     {/each}
+  </div>
+  <div class="seg seltools" title="ペイント（B: ブラシ / E: 消しゴム / I: スポイト）">
+    {#each ["brush", "eraser", "eyedropper"] as const as pt (pt)}
+      <button class:on={paint.tool === pt} disabled={!active?.meta || !!vs.compare} title={PAINT_LABEL[pt]} onclick={() => setPaintTool(paint.tool === pt ? null : pt)}>{PAINT_ICON[pt]}</button>
+    {/each}
+  </div>
+  <div class="colors" title="描画色 / 背景色（クリックで変更、X: 入れ替え、D: 初期値）">
+    <button class="cbg" style:background={paint.bg} aria-label="背景色" onclick={() => (colorDlg = "bg")}></button>
+    <button class="cfg" style:background={paint.fg} aria-label="描画色" onclick={() => (colorDlg = "fg")}></button>
+    <button class="cx" onclick={() => paint.swap()} title="入れ替え (X)">⇄</button>
   </div>
   <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => setAnnotTool(annotTool.tool ? null : "pen")}
     title="注釈（ペン P / 直線 L / 矢印 A / 四角 U / テキスト T / 選択 V）。Ctrl+Shift+C で注釈込みの画像をコピー">注釈</button>
@@ -545,8 +595,11 @@
   ondragleave={() => { if (!isTauri()) dragOver = false; }}
   ondrop={onHtmlDrop}
 >
+  {#if paint.tool && active?.meta && !vs.compare}<PaintBar target={paintTarget} onclose={() => setPaintTool(null)} />{/if}
+  {#if colorDlg}<ColorPicker value={colorDlg === "fg" ? paint.fg : paint.bg} title={colorDlg === "fg" ? "描画色" : "背景色"}
+    onchange={(h) => { if (colorDlg === "fg") paint.fg = h; else paint.bg = h; paint.save(); }} onclose={() => (colorDlg = null)} />{/if}
   {#if annotOn}<AnnotBar annot={active?.annot ?? null} oncopy={copyAnnotated} onsave={saveAnnotated} />{/if}
-  <Viewer bind:renderer guides={active?.guides ?? null} annot={active?.annot ?? null} sel={active?.sel ?? null} onselshape={onSelShape} oncursor={onCursor}
+  <Viewer bind:renderer guides={active?.guides ?? null} annot={active?.annot ?? null} sel={active?.sel ?? null} onselshape={onSelShape} onpaint={onPaint} oncursor={onCursor}
     labels={vs.compare && active ? { a: active.name, b: vs.compareTab?.name ?? "" } : null}
     onsplit={(v) => vs.updateCompare({ split: v })} />
   {#if vs.compare && vs.compareTab?.loading}<div class="busy">B を読み込み中…</div>{/if}
@@ -713,6 +766,11 @@
   .layer-sel { background: #1e1e1e; color: var(--text); border: 1px solid #4a4a4a; border-radius: 3px; font: inherit; font-size: 12px; padding: 0 4px; max-width: 220px; }
   .chip { background: #2f4f73; border: 1px solid var(--accent); color: #fff; border-radius: 9px; padding: 0 8px; font-size: 11px; line-height: 16px; }
   .seltools button { padding: 2px 7px; min-width: 28px; }
+  .colors { position: relative; width: 50px; height: 30px; flex: none; }
+  .colors button { position: absolute; width: 20px; height: 20px; padding: 0; border: 1px solid #ddd; border-radius: 2px; box-shadow: 0 0 0 1px #000; }
+  .colors .cfg { left: 0; top: 0; z-index: 1; }
+  .colors .cbg { left: 10px; top: 9px; }
+  .colors .cx { left: 31px; top: -2px; width: 14px; height: 14px; border: none; box-shadow: none; background: transparent; font-size: 10px; color: var(--muted); }
   .workspace { flex: 1; min-height: 0; display: flex; }
   .stage { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
   .stage.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }
