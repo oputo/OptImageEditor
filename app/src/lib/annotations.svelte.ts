@@ -84,6 +84,8 @@ export class Annotations {
   remove(id: number) { this.commit(this.shapes.filter((s) => s.id !== id)); }
   replace(s: Shape) { this.commit(this.shapes.map((x) => (x.id === s.id ? s : x))); }
   clear() { if (this.shapes.length) this.commit([]); }
+  /** removes every shape and the history (the shapes became a layer: undoing them back would draw them twice) */
+  reset() { this.undoStack = []; this.redoStack = []; this.set([]); }
 }
 
 // ---------------------------------------------------------------- geometry

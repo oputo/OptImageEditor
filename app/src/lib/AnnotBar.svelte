@@ -2,7 +2,7 @@
   // Annotation tool palette (shown over the view while annotating).
   import { COLORS, FONT_SIZES, TOOL_KEY, TOOL_LABEL, WIDTHS, annotTool, type Annotations, type Tool } from "./annotations.svelte";
 
-  let { annot, oncopy, onsave }: { annot: Annotations | null; oncopy: () => void; onsave: () => void } = $props();
+  let { annot, oncopy, onsave, onlayer }: { annot: Annotations | null; oncopy: () => void; onsave: () => void; onlayer: () => void } = $props();
 
   /** picks the colour; a selected shape takes it too */
   function setColor(c: string) {
@@ -38,7 +38,8 @@
   <button disabled={!annot?.shapes.length} onclick={() => annot?.clear()} title="注釈をすべて消す">全消去</button>
   <span class="sep"></span>
   <button class="act" onclick={oncopy} title="注釈込みの画像をクリップボードへ (Ctrl+Shift+C)">コピー</button>
-  <button class="act" onclick={onsave} title="注釈込みの画像を PNG で保存 (Ctrl+Shift+S)">PNG 保存</button>
+  <button class="act" onclick={onsave} title="注釈込みの画像を別の PNG で保存（元画像の横に 名前_注釈.png）">PNG 保存</button>
+  <button class="act" disabled={!annot?.shapes.length} onclick={onlayer} title="注釈を一番上の「注釈」レイヤーにする（Ctrl+S で画像と一緒に保存できる）">レイヤーに</button>
   <button onclick={() => (annotTool.tool = null)} title="注釈を終了 (Esc)">×</button>
 </div>
 

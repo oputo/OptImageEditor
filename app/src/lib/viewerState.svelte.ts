@@ -10,10 +10,10 @@ import { Compositor, type LayerDoc } from "./compositor";
 import { LOCK_ALL, LOCK_TRANSPARENCY, THUMB, cloneTree, maskThumbOf, pixelsLocked, thumbOf, toPlan, type DocLayer, type PlanNode, type PsdDocData } from "./psdDoc";
 import type { CompareMode, Orientation, Renderer, TextureSet, ViewState } from "./renderer";
 import { viewOptions } from "./viewOptions.svelte";
-import { BrowserFileSource, TauriFileSource, baseName, type FileSource } from "./source";
+import { BrowserFileSource, TauriFileSource, baseName, isTauri, type FileSource } from "./source";
 import { confirmDialog, copyImageFallback, listFolderImages, savePsd, saveDialog, setWindowTitle, writeFile } from "./desktop";
 import { recent } from "./recent.svelte";
-import { Annotations, flattenToCanvas, flattenToPng } from "./annotations.svelte";
+import { Annotations, drawShape, flattenToCanvas, flattenToPng } from "./annotations.svelte";
 import { Painter, applyTiles, type PatchTile } from "./painter";
 import { hexToRgb, paint, rgbToHex } from "./paint.svelte";
 import { comfy, loadWorkflow, type Progress, type WorkflowKind } from "./comfy";
@@ -500,6 +500,14 @@ export class ViewerState {
       if (tab.layers) Object.assign(tab.layers, { status: "error", error: e instanceof Error ? e.message : String(e) });
       console.error(e);
     }
+  }
+
+  /** Loads the layers when needed and waits until they are ready (also when a load is already running).
+   *  False when the image cannot become a layer document (EXR / HDR) or loading failed. */
+  async ensureLayers(tab: Tab): Promise<boolean> {
+    if (!tab.layers) await this.loadLayers(tab);
+    while (tab.layers?.status === "loading") await new Promise((r) => setTimeout(r, 50));
+    return tab.layers?.status === "ready";
   }
 
   /** A layer document from a flat image: one layer ("背景" when opaque, else "レイヤー 0"), made in the app. */
@@ -1945,6 +1953,27 @@ export class ViewerState {
     this.openFile(new File([blob], `クリップボード ${n}.png`, { type: blob.type || "image/png" }));
   }
 
+  /** Draws the annotations into a new layer "注釈" at the top (one undo step) and removes them from the overlay.
+   *  Returns a message when it cannot. */
+  annotationsToLayer(tab: Tab): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc) return "レイヤーが読み込まれていません";
+    if (!tab.annot.shapes.length) return "注釈がありません";
+    const { w, h } = l.canvas; // annotations are in image px = canvas px
+    const c = new OffscreenCanvas(w, h);
+    const ctx = c.getContext("2d")!;
+    for (const s of tab.annot.shapes) drawShape(ctx, s);
+    const d = ctx.getImageData(0, 0, w, h).data; // straight alpha
+    const t = trim({ x: 0, y: 0, w, h, px: new Uint8Array(d.buffer, d.byteOffset, d.byteLength) });
+    tab.annot.reset();
+    if (!t.w) return "注釈が画像の外にあるため、レイヤーにできませんでした";
+    const node = this.rasterLayer(doc, "注釈", t);
+    this.edit(tab, null, (tree) => { tree.push(node); });
+    this.select(tab, [node.id]);
+    return null;
+  }
+
   /** The active tab's image as shown (layer composite or stored composite) with its annotations, as PNG. */
   private annotatedPng(): { blob: Promise<Blob>; w: number; h: number; tab: Tab } {
     const tab = this.active;
@@ -2179,15 +2208,19 @@ export class ViewerState {
       c.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(p.buffer as ArrayBuffer, p.byteOffset, p.byteLength), set.width, set.height), 0, 0);
       const blob = await c.convertToBlob({ type, quality: type === "image/png" ? undefined : 0.95 });
       const data = await blob.arrayBuffer();
-      const same = keyOf(target) === keyOf(tab.path!);
+      const same = !!tab.path && keyOf(target) === keyOf(tab.path);
       const backup = same && !this.backedUp.has(keyOf(target));
       await writeFile(target, data, backup);
       if (backup) this.backedUp.add(keyOf(target));
       l.dirty = false;
       l.saved = { ms: performance.now() - t0, bytes: data.byteLength, path: target };
-      if (!same) { tab.path = target; tab.key = keyOf(target); tab.name = baseName(target); recent.add(target); }
-      const old = this.cache.get(cacheKey(tab));
+      const old = this.cache.get(cacheKey(tab)); // under the old key
+      if (!same) {
+        if (old) this.cache.delete(cacheKey(tab));
+        tab.path = target; tab.key = keyOf(target); tab.name = baseName(target); tab.file = null; recent.add(target);
+      }
       if (old && this.renderer!.activeSet !== old.set) { this.cache.delete(cacheKey(tab)); this.renderer!.dispose(old.set); this.cacheVersion++; }
+      else if (old && !same) this.cache.set(cacheKey(tab), old);
       void TauriFileSource.open(target).then((src) => this.decodeAndUpload(src, cacheKey(tab)))
         .then((e) => { tab.meta = { ...e.meta, fromCache: true, totalMs: 0 }; this.enforceCache(); })
         .catch((e) => console.warn("re-reading the saved image failed", e));
@@ -2214,7 +2247,15 @@ export class ViewerState {
     if (!l || l.status !== "ready" || !this.renderer || l.saving) return false;
     let target: string | null = tab.path;
     const flatSource = !isPsd(tab.name);
-    if (flatSource && tab.path) {
+    if (!tab.path && isTauri()) {
+      // a pasted image (no file yet): always ask where and in which format
+      target = await saveDialog(`${tab.name.replace(/\.[^.]+$/, "")}.png`, [
+        { name: "PNG", extensions: ["png"] }, { name: "Photoshop（レイヤーを保持）", extensions: ["psd", "psb"] },
+        { name: "JPEG", extensions: ["jpg", "jpeg"] }, { name: "WebP", extensions: ["webp"] },
+      ]);
+      if (!target) return false;
+      if (!isPsd(target)) return this.saveFlat(tab, target);
+    } else if (flatSource && tab.path) {
       // a PNG / JPG / WebP opened as a layered document
       const dir = tab.path.slice(0, Math.max(tab.path.lastIndexOf("\\"), tab.path.lastIndexOf("/")) + 1);
       const stem = tab.name.replace(/\.[^.]+$/, "");
@@ -2249,11 +2290,11 @@ export class ViewerState {
         l.saved = { ms: performance.now() - t0, bytes: buffer.byteLength, path: tab.name };
         return true;
       }
-      const sameFile = keyOf(target) === keyOf(tab.path!);
+      const sameFile = !!tab.path && keyOf(target) === keyOf(tab.path);
       const backup = sameFile && !this.backedUp.has(keyOf(target));
       // desktop: Rust rebuilds the layer records and copies the layers' pixel data from the original file
       l.savePhase = "統合画像";
-      const { req, rgba } = this.saveRequest(tab, tab.path!, target, backup);
+      const { req, rgba } = this.saveRequest(tab, tab.path ?? "", target, backup); // no source (pasted): Rust starts from a blank PSD
       l.savePhase = "書き込み";
       const r = await savePsd(req, rgba);
       console.info(`[save] total ${(performance.now() - t0).toFixed(0)} ms; Rust ${r.ms.toFixed(0)} ms (parse ${r.parseMs.toFixed(0)}, composite ${r.compositeMs.toFixed(0)}, write ${r.writeMs.toFixed(0)}), ${(r.bytes / 2 ** 20).toFixed(0)} MB`);
@@ -2270,15 +2311,18 @@ export class ViewerState {
       l.canvas = { ...l.canvas, ox: 0, oy: 0 };
       l.dirty = false;
       l.saved = { ms: performance.now() - t0, bytes: buffer.byteLength, path: target };
+      const old = this.cache.get(cacheKey(tab)); // under the old key
       if (!sameFile) {
+        if (old) this.cache.delete(cacheKey(tab));
         tab.path = target;
         tab.key = keyOf(target);
         tab.name = baseName(target);
+        tab.file = null;
         recent.add(target);
       }
       if (!l.useLayers) this.setUseLayers(tab, true);
-      const old = this.cache.get(cacheKey(tab));
       if (old && this.renderer.activeSet !== old.set) { this.cache.delete(cacheKey(tab)); this.renderer.dispose(old.set); this.cacheVersion++; }
+      else if (old && !sameFile) this.cache.set(cacheKey(tab), old); // still shown: keep it under the new key
       // read the new file's composite in the background (for "PS の統合画像" / compare / tab switching)
       void TauriFileSource.open(target).then((src) => this.decodeAndUpload(src, cacheKey(tab)))
         .then((e) => { tab.meta = { ...e.meta, fromCache: true, totalMs: 0 }; this.enforceCache(); })

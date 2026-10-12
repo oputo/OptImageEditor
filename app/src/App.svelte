@@ -13,6 +13,7 @@
   import AiPanel from "./lib/AiPanel.svelte";
   import PaintBar from "./lib/PaintBar.svelte";
   import ColorPicker from "./lib/ColorPicker.svelte";
+  import ChoiceDialog from "./lib/ChoiceDialog.svelte";
   import { PAINT_ICON, PAINT_LABEL, paint, stepSize, type PaintTool } from "./lib/paint.svelte";
   import { TOOL_KEY, annotTool, type Tool } from "./lib/annotations.svelte";
   import { SEL_ICON, SEL_LABEL, selTool, type SelMode, type SelTool } from "./lib/selection.svelte";
@@ -113,15 +114,55 @@
   /** Ctrl+S / Ctrl+Shift+S: saves the active tab's layers as PSD. */
   async function save(saveAs: boolean) {
     const t = active;
-    const l = t?.layers;
-    if (!t || l?.status !== "ready") { showToast("保存するにはレイヤーを読み込んでください（F7 でレイヤーパネルを開く）。画像のままの書き出しは Ctrl+Alt+Shift+W"); return; }
-    if (!saveAs && !l.dirty) { showToast("変更はありません"); return; }
+    if (!t?.meta) return;
+    const annots = t.annot.shapes.length;
+    // nothing to save: no layer edits, no annotations, and the image is a file already (a pasted one is not)
+    if (!saveAs && !annots && t.path && t.layers?.status === "ready" && !t.layers.dirty) { showToast("変更はありません"); return; }
+    if (!saveAs && !annots && t.path && !t.layers) { showToast("変更はありません"); return; }
+    if (t.layers?.status !== "ready") {
+      showToast("レイヤーを読み込んでいます…");
+      if (!(await vs.ensureLayers(t))) {
+        await infoDialog(t.layers?.error ? `レイヤーを読み込めませんでした: ${t.layers.error}` : "この画像（EXR / HDR）の保存には対応していません");
+        return;
+      }
+    }
+    if (annots) {
+      const c = await choose(
+        `注釈が ${annots} 個あります。注釈は画像の上に表示しているだけで、そのままでは保存されません。`,
+        ["注釈をレイヤーにして保存", "注釈なしで保存", "キャンセル"],
+      );
+      if (c === 2) return;
+      if (c === 0) {
+        const m = vs.annotationsToLayer(t);
+        if (m) { await infoDialog(m); return; }
+        annotTool.tool = null; // Ctrl+Z now undoes the new layer
+      }
+    }
+    const l = t.layers!;
+    if (!saveAs && !l.dirty && t.path) { showToast("変更はありません（注釈は保存していません）"); return; }
     try {
       if (await vs.save(t, saveAs)) showToast(`保存しました: ${t.name}（${(l.saved!.ms / 1000).toFixed(1)} 秒）`);
     } catch (e) {
       console.error(e);
       await infoDialog(`保存に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
     }
+  }
+
+  // a question with more than two answers (ChoiceDialog); resolves with the answer's index
+  let choice = $state<{ text: string; options: string[]; resolve: (i: number) => void } | null>(null);
+  function choose(text: string, options: string[]): Promise<number> {
+    return new Promise((resolve) => (choice = { text, options, resolve: (i) => { choice = null; resolve(i); } }));
+  }
+
+  /** the annotation bar's "レイヤーに": the annotations become a layer "注釈" */
+  async function annotToLayer() {
+    const t = active;
+    if (!t?.meta || !t.annot.shapes.length) return;
+    if (t.layers?.status !== "ready" && !(await vs.ensureLayers(t))) { showToast("この画像はレイヤーにできません（EXR / HDR）"); return; }
+    const m = vs.annotationsToLayer(t);
+    if (m) { showToast(m); return; }
+    annotTool.tool = null;
+    showToast("注釈を「注釈」レイヤーにしました（Ctrl+Z で取り消し）");
   }
 
   /** layer editing shortcut on the active tab (needs the layers loaded) */
@@ -290,7 +331,7 @@
     if ((t.tagName === "INPUT" || t.tagName === "TEXTAREA") && ((ctrl && ["a", "c", "x", "v", "z", "y"].includes(kk)) || k === "Delete" || k === "Backspace")) return;
     let handled = true;
     const cmp = vs.compare;
-    if (exportDlg || canvasDlg || colorDlg) return; // the dialog handles its keys
+    if (exportDlg || canvasDlg || colorDlg || choice) return; // the dialog handles its keys
     if (showHelp && (k === "Escape" || k === "F1")) { showHelp = false; e.preventDefault(); return; }
     if (k === "Escape" && openMenu) openMenu = null;
     else if (k === "Escape" && cmp) vs.stopCompare();
@@ -330,7 +371,6 @@
     else if (ctrl && e.altKey && !e.shiftKey && kk === "c") openCanvas();
     else if (k === "F1") showHelp = !showHelp;
     else if (k === "F8") showAi = !showAi;
-    else if (ctrl && e.shiftKey && kk === "s" && active?.annot.shapes.length) saveAnnotated();
     else if (annotOn && ctrl && (kk === "z" || kk === "y")) { if (kk === "y" || e.shiftKey) active!.annot.redo(); else active!.annot.undo(); }
     else if (annotOn && !ctrl && (k === "Delete" || k === "Backspace") && active!.annot.selected !== null) active!.annot.remove(active!.annot.selected!);
     else if (ctrl && (kk === "z" || kk === "y")) {
@@ -599,7 +639,7 @@
   {#if paint.tool && active?.meta && !vs.compare}<PaintBar target={paintTarget} onclose={() => setPaintTool(null)} />{/if}
   {#if colorDlg}<ColorPicker value={colorDlg === "fg" ? paint.fg : paint.bg} title={colorDlg === "fg" ? "描画色" : "背景色"}
     onchange={(h) => { if (colorDlg === "fg") paint.fg = h; else paint.bg = h; paint.save(); }} onclose={() => (colorDlg = null)} />{/if}
-  {#if annotOn}<AnnotBar annot={active?.annot ?? null} oncopy={copyAnnotated} onsave={saveAnnotated} />{/if}
+  {#if annotOn}<AnnotBar annot={active?.annot ?? null} oncopy={copyAnnotated} onsave={saveAnnotated} onlayer={annotToLayer} />{/if}
   <Viewer bind:renderer guides={active?.guides ?? null} annot={active?.annot ?? null} sel={active?.sel ?? null} onselshape={onSelShape} onpaint={onPaint} oncursor={onCursor}
     labels={vs.compare && active ? { a: active.name, b: vs.compareTab?.name ?? "" } : null}
     onsplit={(v) => vs.updateCompare({ split: v })} />
@@ -629,6 +669,7 @@
       hasAnnotations={active.annot.shapes.length > 0} isPsd={isPsd(active.name)}
       onexport={doExport} onclose={() => (exportDlg = null)} />
   {/if}
+  {#if choice}<ChoiceDialog text={choice.text} options={choice.options} onchoose={choice.resolve} />{/if}
   {#if canvasDlg}<CanvasDialog w0={canvasDlg.w} h0={canvasDlg.h} onapply={doCanvas} onclose={() => (canvasDlg = null)} />{/if}
   {#if showHelp}<HelpOverlay onclose={() => (showHelp = false)} />{/if}
   {#if showAi}<AiPanel {vs} tab={active} onclose={() => (showAi = false)} onmsg={showToast} />{/if}
