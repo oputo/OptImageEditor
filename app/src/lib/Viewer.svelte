@@ -13,6 +13,7 @@
   } from "./annotations.svelte";
   import { modeOf, outline, selTool, type Sel, type SelMode, type SelTool } from "./selection.svelte";
   import { paint } from "./paint.svelte";
+  import { cropTool, normRect, type CropRect } from "./crop.svelte";
 
   let { renderer = $bindable(), guides = null, annot = null, sel = null, labels = null, oncursor, onsplit, onselshape, onpaint }: {
     /** paint tools: "start" returns false when the layer cannot be painted; "pick" samples a colour (eyedropper / Alt) */
@@ -59,8 +60,12 @@
     | { kind: "paint" }
     | { kind: "adjust"; cx: number; cy: number; d0: number; h0: number; o0: number; opacity: boolean }
     | { kind: "pick" }
+    | { kind: "crop"; h: CropHandle; r0: CropRect; ix: number; iy: number; moved: boolean }
     | { kind: "sel"; tool: "rect" | "ellipse" | "lasso"; mode: SelMode; pts: number[]; shiftAtStart: boolean; shiftReleased: boolean };
+  type CropHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "move" | "new";
   let drag: Drag | null = null;
+  /** crop tool in use (not while comparing) */
+  const cropping = () => !!cropTool.rect && !renderer?.compare;
   let hot: { axis: "v" | "h"; index: number } | null = $state(null); // guide under the mouse / being dragged
 
   const showRulers = $derived(opt.rulers && hasImage && !rotated && !sideBySide);
@@ -152,6 +157,7 @@
     void annot?.selected;
     void annotTool.tool;
     void [paint.tool, paint.diameter];
+    void cropTool.rect;
     renderer?.requestDraw();
   });
 
@@ -177,6 +183,7 @@
     const panes = r.panes();
     if (opt.extras) for (const p of panes) drawExtras(ctx, p, dpr, r.imageWidth, r.imageHeight);
     if (!r.compare && panes.length) drawSelectionAnts(ctx, panes[0], dpr);
+    if (cropping() && panes.length) drawCrop(ctx, panes[0], dpr);
     if (drag?.kind === "adjust" && panes.length) drawAdjust(ctx, panes[0], dpr, drag);
     else if (painting() && mouse && paint.tool !== "eyedropper" && !spaceDown && panes.length) drawBrushCursor(ctx, panes[0], dpr);
     if (annot && !r.compare && panes.length) drawAnnotations(ctx, panes[0], dpr);
@@ -239,6 +246,115 @@
     ctx.textBaseline = "middle";
     ctx.fillText(text, d.cx - w / 2 + 7, d.cy + rad + 19);
     ctx.restore();
+  }
+
+  /** the crop rectangle points of each handle (image px) */
+  function cropPoints(r: CropRect): [CropHandle, number, number][] {
+    const x1 = r.x + r.w, y1 = r.y + r.h, mx = r.x + r.w / 2, my = r.y + r.h / 2;
+    return [["nw", r.x, r.y], ["n", mx, r.y], ["ne", x1, r.y], ["e", x1, my], ["se", x1, y1], ["s", mx, y1], ["sw", r.x, y1], ["w", r.x, my]];
+  }
+  const toScreen = (m: Affine, x: number, y: number): [number, number] => [m[0] * x + m[1] * y + m[2], m[3] * x + m[4] * y + m[5]];
+
+  /** crop tool: the area outside darkened, the frame with thirds, the handles and the size */
+  function drawCrop(ctx: CanvasRenderingContext2D, p: Pane, dpr: number) {
+    const r = cropTool.rect!;
+    const s = p.view.scale;
+    const b = visibleBox(p.matrix, p);
+    ctx.save();
+    setMatrix(ctx, p.matrix, dpr);
+    ctx.beginPath();
+    ctx.rect(b.minX - 1, b.minY - 1, b.maxX - b.minX + 2, b.maxY - b.minY + 2);
+    ctx.rect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
+    ctx.fill("evenodd");
+    ctx.lineWidth = 1 / s;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.45)";
+    ctx.beginPath();
+    for (const k of [1, 2]) {
+      ctx.moveTo(r.x + (r.w * k) / 3, r.y); ctx.lineTo(r.x + (r.w * k) / 3, r.y + r.h);
+      ctx.moveTo(r.x, r.y + (r.h * k) / 3); ctx.lineTo(r.x + r.w, r.y + (r.h * k) / 3);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = "#fff";
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    for (const [, x, y] of cropPoints(r)) {
+      const [sx, sy] = toScreen(p.matrix, x, y);
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(sx - 4, sy - 4, 8, 8);
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.7)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(sx - 4.5, sy - 4.5, 9, 9);
+    }
+    if (drag?.kind === "crop") {
+      const [sx, sy] = toScreen(p.matrix, r.x + r.w, r.y + r.h);
+      const text = `${r.w} × ${r.h}`;
+      ctx.font = "12px 'Segoe UI', 'Yu Gothic UI', sans-serif";
+      const w = ctx.measureText(text).width + 14;
+      ctx.fillStyle = "rgba(0, 0, 0, 0.75)";
+      ctx.beginPath(); ctx.roundRect(sx + 8, sy + 8, w, 22, 4); ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, sx + 15, sy + 19);
+    }
+    ctx.restore();
+  }
+
+  /** what the pointer at (cx, cy) would grab: a handle, an edge, the inside (move) or outside (a new frame) */
+  function cropHandleAt(cx: number, cy: number, pane: Pane): CropHandle {
+    const r = cropTool.rect!;
+    for (const [h, x, y] of cropPoints(r)) {
+      const [sx, sy] = toScreen(pane.matrix, x, y);
+      if (Math.hypot(cx - sx, cy - sy) <= 9) return h;
+    }
+    const [ix, iy] = applyInverse(pane.matrix, cx, cy);
+    const tol = 5 / pane.view.scale;
+    const inX = ix >= r.x - tol && ix <= r.x + r.w + tol, inY = iy >= r.y - tol && iy <= r.y + r.h + tol;
+    if (inY && Math.abs(ix - r.x) <= tol) return "w";
+    if (inY && Math.abs(ix - (r.x + r.w)) <= tol) return "e";
+    if (inX && Math.abs(iy - r.y) <= tol) return "n";
+    if (inX && Math.abs(iy - (r.y + r.h)) <= tol) return "s";
+    if (ix > r.x && ix < r.x + r.w && iy > r.y && iy < r.y + r.h) return "move";
+    return "new";
+  }
+
+  function cropMove(e: PointerEvent, cx: number, cy: number) {
+    const r = renderer;
+    const pane = r?.panes()[0];
+    if (!r || !pane || drag?.kind !== "crop") return;
+    const d = drag;
+    const [ix, iy] = applyInverse(pane.matrix, cx, cy);
+    const W = r.imageWidth, H = r.imageHeight;
+    const dx = ix - d.ix, dy = iy - d.iy;
+    if (!d.moved && Math.hypot(dx, dy) * pane.view.scale < 2) return;
+    d.moved = true;
+    const r0 = d.r0;
+    if (d.h === "move") {
+      const x = Math.round(Math.max(0, Math.min(W - r0.w, r0.x + dx))), y = Math.round(Math.max(0, Math.min(H - r0.h, r0.y + dy)));
+      cropTool.rect = { x, y, w: r0.w, h: r0.h };
+      return;
+    }
+    let x0 = r0.x, y0 = r0.y, x1 = r0.x + r0.w, y1 = r0.y + r0.h;
+    if (d.h === "new") {
+      x0 = d.ix; y0 = d.iy; x1 = ix; y1 = iy;
+      if (e.shiftKey) { const s = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0)); x1 = x0 + Math.sign(x1 - x0 || 1) * s; y1 = y0 + Math.sign(y1 - y0 || 1) * s; }
+    } else {
+      const h = d.h;
+      if (h.includes("w")) x0 += dx;
+      if (h.includes("e")) x1 += dx;
+      if (h.includes("n")) y0 += dy;
+      if (h.includes("s")) y1 += dy;
+      if (e.shiftKey && h.length === 2 && r0.h > 0) {
+        // a corner with Shift: the aspect ratio of the frame when the drag started
+        const a = r0.w / r0.h;
+        let w = x1 - x0, hh = y1 - y0;
+        if (Math.abs(w) / a > Math.abs(hh)) hh = Math.sign(hh || 1) * (Math.abs(w) / a); else w = Math.sign(w || 1) * Math.abs(hh) * a;
+        if (h.includes("w")) x0 = x1 - w; else x1 = x0 + w;
+        if (h.includes("n")) y0 = y1 - hh; else y1 = y0 + hh;
+      }
+    }
+    const nr = normRect(x0, y0, x1, y1, W, H);
+    if (nr.w >= 1 && nr.h >= 1) cropTool.rect = nr;
   }
 
   /** marching ants of the selection and of the shape being drawn with a selection tool */
@@ -522,7 +638,11 @@
     const [cx, cy] = local(e);
     const pane = r.paneAt(cx, cy);
     if (!pane) return;
-    if (e.button === 0 && !rDown && !spaceDown && annotating()) {
+    if (e.button === 0 && !rDown && !spaceDown && cropping()) {
+      e.preventDefault();
+      const [ix, iy] = applyInverse(pane.matrix, cx, cy);
+      drag = { kind: "crop", h: cropHandleAt(cx, cy, pane), r0: { ...cropTool.rect! }, ix, iy, moved: false };
+    } else if (e.button === 0 && !rDown && !spaceDown && annotating()) {
       e.preventDefault(); // no focus change: a text box opened here keeps the focus
       if (!annotDown(e, cx, cy, pane)) return;
     } else if (e.button === 2 && painting()) {
@@ -728,7 +848,10 @@
     if (!r) return;
     const [cx, cy] = local(e);
     mouse = [cx, cy];
-    if (drag?.kind === "draw" || drag?.kind === "move") {
+    if (drag?.kind === "crop") {
+      cropMove(e, cx, cy);
+      updateCursor(cx, cy);
+    } else if (drag?.kind === "draw" || drag?.kind === "move") {
       annotMove(e, cx, cy);
     } else if (drag?.kind === "adjust") {
       const pane = r.panes()[0];
@@ -793,6 +916,7 @@
     }
     if (drag?.kind === "draw" || drag?.kind === "move") annotUp();
     if (drag?.kind === "sel") selUp();
+    if (drag?.kind === "crop") renderer?.requestDraw(); // drop the size label
     if (drag?.kind === "paint") { const [cx, cy] = local(e); const pane = renderer?.panes()[0]; const [ix, iy] = pane ? applyInverse(pane.matrix, cx, cy) : [0, 0]; onpaint?.("end", ix, iy, 0, e); }
     drag = null;
     const [cx, cy] = local(e);
@@ -809,6 +933,12 @@
 
   function updateCursor(cx: number, cy: number) {
     if (drag?.kind === "pan") { cursorClass = "grabbing"; return; }
+    if ((cropping() || drag?.kind === "crop") && !spaceDown && !rDown) {
+      const pane = renderer?.panes()[0];
+      const h = drag?.kind === "crop" ? drag.h : pane ? cropHandleAt(cx, cy, pane) : "new";
+      cursorClass = ({ nw: "nwse", se: "nwse", ne: "nesw", sw: "nesw", n: "row", s: "row", e: "col", w: "col", move: "move", new: "draw" } as const)[h];
+      return;
+    }
     if (annotating() && !spaceDown && !rDown) {
       const t = annotTool.tool;
       if (t === "select") {
@@ -884,6 +1014,8 @@
   .gl.pick { cursor: copy; }
   .gl.text { cursor: text; }
   .gl.move { cursor: move; }
+  .gl.nwse { cursor: nwse-resize; }
+  .gl.nesw { cursor: nesw-resize; }
   .annot-text {
     position: absolute; z-index: 5; margin: 0; padding: 0; border: 1px dashed rgba(255, 255, 255, 0.7);
     background: rgba(0, 0, 0, 0.25); font-weight: bold; line-height: 1.25; resize: none; overflow: hidden;

@@ -13,7 +13,8 @@ import { viewOptions } from "./viewOptions.svelte";
 import { BrowserFileSource, TauriFileSource, baseName, isTauri, type FileSource } from "./source";
 import { confirmDialog, copyImageFallback, listFolderImages, savePsd, saveDialog, setWindowTitle, writeFile } from "./desktop";
 import { recent } from "./recent.svelte";
-import { Annotations, drawShape, flattenToCanvas, flattenToPng } from "./annotations.svelte";
+import { Annotations, drawShape, flattenToCanvas, flattenToPng, type Shape } from "./annotations.svelte";
+import { cropGrey, mapPoint, transformPixels, type CropRect, type DocTransform } from "./crop.svelte";
 import { Painter, applyTiles, type PatchTile } from "./painter";
 import { hexToRgb, paint, rgbToHex } from "./paint.svelte";
 import { comfy, loadWorkflow, type Progress, type WorkflowKind } from "./comfy";
@@ -102,7 +103,9 @@ export type Canvas = { w: number; h: number; ox: number; oy: number };
 /** pixels changed in place by a stroke (layer `id`'s texture or mask), applied backwards / forwards by undo / redo */
 type Patch = { id: number; mask: boolean; tiles: PatchTile[]; bytes: number };
 /** `patch`: the pixel change from this state to the next one (strokes) */
-type Snapshot = { tree: DocLayer[]; canvas: Canvas; sel: Sel | null; patch?: Patch };
+/** `view`: guides and annotations before a crop / rotation (they move with the document) */
+type Snapshot = { tree: DocLayer[]; canvas: Canvas; sel: Sel | null; patch?: Patch; view?: ViewMarks };
+type ViewMarks = { guides: Guides; shapes: Shape[] };
 type History = { undo: Snapshot[]; redo: Snapshot[]; lastKey: string | null; lastTime: number };
 const HISTORY_MAX = 100;
 
@@ -652,8 +655,9 @@ export class ViewerState {
     const snap = from.pop();
     if (!snap) return;
     if (this.stroke?.tab === tab) this.paintEnd();
-    to.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas }, sel: tab.sel, patch: snap.patch });
+    to.push({ tree: cloneTree(l.tree), canvas: { ...l.canvas }, sel: tab.sel, patch: snap.patch, view: snap.view ? this.marks(tab) : undefined });
     if (snap.patch) this.applyPatch(tab, snap.patch, back ? "before" : "after");
+    if (snap.view) this.restoreMarks(tab, snap.view);
     l.tree = snap.tree;
     l.canvas = { ...snap.canvas };
     if (tab.sel !== snap.sel) { if (!snap.sel && tab.sel) tab.lastSel = tab.sel; tab.sel = snap.sel; }
@@ -1153,6 +1157,163 @@ export class ViewerState {
     this.edit(tab, null, (tree) => { tree.splice(0, tree.length, res); });
     this.select(tab, [res.id]);
     this.releaseUnused(tab);
+    return null;
+  }
+
+  // ---------------------------------------------------------------- crop / rotate / stamp (2026-10, 後回し A)
+
+  /** guides and annotations of `tab` (copies) */
+  private marks(tab: Tab): ViewMarks {
+    return { guides: { v: [...tab.guides.v], h: [...tab.guides.h] }, shapes: tab.annot.shapes };
+  }
+  private restoreMarks(tab: Tab, m: ViewMarks) {
+    tab.guides.v = [...m.guides.v];
+    tab.guides.h = [...m.guides.h];
+    tab.annot.load(m.shapes);
+  }
+  /** one undo step that also moves the guides and annotations (`mapX` / `mapY`: a vertical / horizontal guide at
+   *  v goes to [axis, value]; `mapPt`: an annotation point) */
+  private transformStep(tab: Tab, mutate: (tree: DocLayer[]) => void,
+    mapGuide: (axis: "v" | "h", v: number) => ["v" | "h", number], mapPt: (x: number, y: number) => [number, number]) {
+    const before = this.marks(tab);
+    this.edit(tab, null, mutate);
+    const h = this.hist(tab);
+    h.undo[h.undo.length - 1].view = before;
+    const g: Guides = { v: [], h: [] };
+    for (const axis of ["v", "h"] as const) for (const v of before.guides[axis]) { const [a, nv] = mapGuide(axis, v); g[a].push(nv); }
+    tab.guides.v = g.v;
+    tab.guides.h = g.h;
+    tab.annot.load(before.shapes.map((s) => {
+      const pts = s.pts.slice();
+      for (let i = 0; i < pts.length; i += 2) [pts[i], pts[i + 1]] = mapPt(pts[i], pts[i + 1]);
+      return { ...s, pts };
+    }));
+  }
+
+  /** Crops the canvas to `r` (canvas px). The layers move; outside the new canvas their pixels are kept, or (with
+   *  `deletePixels`) removed from pixel layers and layer masks. Returns a message when it cannot. */
+  crop(tab: Tab, r: CropRect, deletePixels: boolean): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc) return "レイヤーが読み込まれていません";
+    const c = l.canvas;
+    const x0 = Math.max(0, Math.round(r.x)), y0 = Math.max(0, Math.round(r.y));
+    const x1 = Math.min(c.w, Math.round(r.x + r.w)), y1 = Math.min(c.h, Math.round(r.y + r.h));
+    if (x1 - x0 < 1 || y1 - y0 < 1) return "切り抜く範囲がありません";
+    const rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    if (rect.x === 0 && rect.y === 0 && rect.w === c.w && rect.h === c.h) return null;
+    const inside = (x: number, y: number, w: number, h: number) => x >= rect.x && y >= rect.y && x + w <= rect.x + rect.w && y + h <= rect.y + rect.h;
+    // pixels / masks cut to the new canvas (new ids: the old data stays for undo)
+    const cut = (n: DocLayer): DocLayer => {
+      let out = n;
+      if (n.kind === "pixel" && n.w > 0 && !inside(n.x, n.y, n.w, n.h) && !pixelsLocked(n)) {
+        const p = this.layerPixels(tab, n);
+        const x = Math.max(rect.x, n.x), y = Math.max(rect.y, n.y);
+        const w = Math.max(0, Math.min(rect.x + rect.w, n.x + n.w) - x), h = Math.max(0, Math.min(rect.y + rect.h, n.y + n.h) - y);
+        out = this.withPixels(tab, n, w && h ? crop(p, { x, y, w, h }) : { x: 0, y: 0, w: 0, h: 0, px: new Uint8Array(0) });
+      }
+      const m = n.mask;
+      if (m && m.w > 0 && !m.withVector && !inside(m.x, m.y, m.w, m.h)) {
+        const cur = this.maskOf(tab, n);
+        const x = Math.max(rect.x, m.x), y = Math.max(rect.y, m.y);
+        const w = Math.max(0, Math.min(rect.x + rect.w, m.x + m.w) - x), h = Math.max(0, Math.min(rect.y + rect.h, m.y + m.h) - y);
+        const g = w && h ? cropGrey(cur, { x, y, w, h }, cur.def) : { x: 0, y: 0, w: 0, h: 0, px: new Uint8Array(0) };
+        out = this.withMask(tab, out, { ...g, def: cur.def }, m.disabled);
+      }
+      return out;
+    };
+    const dx = -rect.x, dy = -rect.y;
+    this.transformStep(tab, (tree) => {
+      const walk = (ls: DocLayer[]) => {
+        for (let i = 0; i < ls.length; i++) {
+          if (deletePixels && !ls[i].children) ls[i] = cut(ls[i]);
+          const x = ls[i];
+          x.x += dx; x.y += dy;
+          if (x.mask) { x.mask.x += dx; x.mask.y += dy; }
+          if (x.children) walk(x.children);
+        }
+      };
+      walk(tree);
+      l.canvas = { w: rect.w, h: rect.h, ox: c.ox + dx, oy: c.oy + dy };
+      tab.sel = null;
+    }, (axis, v) => [axis, axis === "v" ? v + dx : v + dy], (x, y) => [x + dx, y + dy]);
+    if (deletePixels) this.releaseUnused(tab);
+    return null;
+  }
+
+  /** what a rotation / flip has to do first: layers to rasterize (text / smart objects / vector masks), or why it
+   *  cannot (a group mask) */
+  transformIssues(tab: Tab): { rasterize: string[]; blocker: string | null } {
+    const out: string[] = [];
+    let blocker: string | null = null;
+    const walk = (ls: DocLayer[]) => {
+      for (const n of ls) {
+        if (n.children) { if (n.mask && !blocker) blocker = `グループ「${n.name}」にマスクがあるため回転・反転できません（グループのマスクは未対応）`; walk(n.children); continue; }
+        if (n.kind === "text" || n.kind === "smart" || n.mask?.withVector) out.push(n.name);
+      }
+    };
+    walk(tab.layers?.tree ?? []);
+    return { rasterize: out, blocker };
+  }
+
+  /** Rotates / flips the whole document. Text, smart objects and layers with a vector mask are rasterized (call
+   *  transformIssues first and ask). Returns a message when it cannot. */
+  transform(tab: Tab, t: DocTransform): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc) return "レイヤーが読み込まれていません";
+    const { blocker } = this.transformIssues(tab);
+    if (blocker) return blocker;
+    const W = l.canvas.w, H = l.canvas.h;
+    const swap = t === "cw" || t === "ccw";
+    const one = (n: DocLayer): DocLayer => {
+      if (n.kind === "text" || n.kind === "smart" || n.mask?.withVector) {
+        // rasterize: the layer as drawn (mask applied) becomes a new pixel layer
+        const p = this.soloPixels(tab, n);
+        const q = p.w ? transformPixels(t, p, W, H, 4) : p;
+        const res = this.rasterLayer(doc, n.name, q);
+        return { ...res, hidden: n.hidden, opacity: n.opacity, fill: n.fill, blendMode: n.blendMode, clipping: n.clipping };
+      }
+      let out = n;
+      if (n.kind !== "adjustment" && n.w > 0) out = this.withPixels(tab, n, transformPixels(t, this.layerPixels(tab, n), W, H, 4));
+      const m = n.mask;
+      if (m) {
+        const cur = this.maskOf(tab, n);
+        const g = cur.w > 0 ? transformPixels(t, cur, W, H, 1) : { x: 0, y: 0, w: 0, h: 0, px: new Uint8Array(0) };
+        out = this.withMask(tab, out, { ...g, def: cur.def }, m.disabled);
+      }
+      return out;
+    };
+    this.transformStep(tab, (tree) => {
+      const walk = (ls: DocLayer[]) => { for (let i = 0; i < ls.length; i++) { if (ls[i].children) walk(ls[i].children!); else ls[i] = one(ls[i]); } };
+      walk(tree);
+      if (swap) l.canvas = { ...l.canvas, w: H, h: W };
+      tab.sel = null;
+    }, (axis, v) => {
+      if (t === "cw") return axis === "v" ? ["h", v] : ["v", H - v];
+      if (t === "ccw") return axis === "v" ? ["h", W - v] : ["v", v];
+      if (t === "180") return [axis, axis === "v" ? W - v : H - v];
+      if (t === "fh") return [axis, axis === "v" ? W - v : v];
+      return [axis, axis === "h" ? H - v : v];
+    }, (x, y) => mapPoint(t, x, y, W, H));
+    this.releaseUnused(tab);
+    return null;
+  }
+
+  /** Ctrl+Alt+Shift+E: what is visible, as one new layer "結合" at the top (the layers stay). */
+  stampVisible(tab: Tab): string | null {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc) return "レイヤーが読み込まれていません";
+    const visible = l.tree.filter((n) => !n.hidden);
+    if (!visible.length) return "表示されているレイヤーがありません";
+    const blocked = this.mergeBlocker(visible);
+    if (blocked) return blocked.replace("結合できません", "複写結合できません");
+    const r = this.rasterize(doc, l.tree);
+    if (!r.w) return "表示されている画素がありません";
+    const res = this.rasterLayer(doc, "結合", r);
+    this.edit(tab, null, (tree) => { tree.push(res); });
+    this.select(tab, [res.id]);
     return null;
   }
 

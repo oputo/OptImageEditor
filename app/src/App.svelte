@@ -1,7 +1,7 @@
 <script lang="ts">
   // OptImageEditor — phase 1-c: viewer with tabs, prefetch, recent files, single instance, "Open with" registration,
   // navigator, view rotation / flip, rulers, guides, grid, pixel grid; phase 1-d: compare (side by side / swipe / A-B toggle).
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import Viewer from "./lib/Viewer.svelte";
   import TabBar from "./lib/TabBar.svelte";
   import Navigator from "./lib/Navigator.svelte";
@@ -14,6 +14,8 @@
   import PaintBar from "./lib/PaintBar.svelte";
   import ColorPicker from "./lib/ColorPicker.svelte";
   import ChoiceDialog from "./lib/ChoiceDialog.svelte";
+  import CropBar from "./lib/CropBar.svelte";
+  import { TRANSFORM_LABEL, cropTool, type CropRect, type DocTransform } from "./lib/crop.svelte";
   import { PAINT_ICON, PAINT_LABEL, paint, stepSize, type PaintTool } from "./lib/paint.svelte";
   import { TOOL_KEY, U_CYCLE, annotTool, type Tool } from "./lib/annotations.svelte";
   import { SEL_ICON, SEL_LABEL, selTool, type SelMode, type SelTool } from "./lib/selection.svelte";
@@ -218,15 +220,73 @@
     if (t) paint.tool = null;
     if (t === "rect" || t === "ellipse") selTool.marquee = t;
     if (t === "lasso" || t === "poly") selTool.lasso = t;
-    if (t) annotTool.tool = null;
+    if (t) { annotTool.tool = null; cropTool.rect = null; }
   }
   function setAnnotTool(t: Tool | null) {
     annotTool.tool = t;
-    if (t) { selTool.tool = null; paint.tool = null; }
+    if (t) { selTool.tool = null; paint.tool = null; cropTool.rect = null; }
   }
   function setPaintTool(t: PaintTool | null) {
     paint.tool = t;
-    if (t) { selTool.tool = null; annotTool.tool = null; }
+    if (t) { selTool.tool = null; annotTool.tool = null; cropTool.rect = null; }
+  }
+
+  // ---- crop (C) / rotate / stamp visible
+  function setCrop(on: boolean) {
+    const t = active;
+    if (!on || !t?.meta || vs.compare) { cropTool.rect = null; return; }
+    const c = vs.canvasOf(t);
+    cropTool.rect = { x: 0, y: 0, w: c.w, h: c.h };
+    selTool.tool = null; paint.tool = null; annotTool.tool = null;
+    // the whole image on screen: leave room around it so the frame's handles are not under the bars
+    const r = renderer;
+    if (r?.hasImage) {
+      const [a, b] = [r.imageToView(0, 0), r.imageToView(c.w, c.h)];
+      const inView = Math.min(a[0], b[0]) >= 0 && Math.min(a[1], b[1]) >= 0 && Math.max(a[0], b[0]) <= r.viewWidth && Math.max(a[1], b[1]) <= r.viewHeight;
+      if (inView) { r.fit(); r.zoomAt(r.scale * 0.85, r.viewWidth / 2, r.viewHeight / 2); vs.zoom = r.scale; }
+    }
+  }
+  // another tab / image: the crop rectangle belongs to the old one
+  $effect(() => { void vs.activeId; void active?.meta; untrack(() => { cropTool.rect = null; }); });
+  /** the layers of `t`, loaded when needed (crop / rotate / stamp work on the layer document) */
+  async function layersOf(t: NonNullable<typeof active>): Promise<boolean> {
+    if (t.layers?.status === "ready") return true;
+    showToast("レイヤーを読み込んでいます…");
+    if (await vs.ensureLayers(t)) return true;
+    await infoDialog(t.layers?.error ? `レイヤーを読み込めませんでした: ${t.layers.error}` : "この画像（EXR / HDR）は編集できません");
+    return false;
+  }
+  async function applyCrop(r: CropRect | null = cropTool.rect) {
+    const t = active;
+    cropTool.rect = null;
+    if (!t || !r || !(await layersOf(t))) return;
+    const m = vs.crop(t, r, cropTool.deletePixels);
+    showToast(m ?? `切り抜きました（${t.layers!.canvas.w} × ${t.layers!.canvas.h}）`);
+  }
+  function cropToSelection() {
+    const s = active?.sel;
+    if (!s) { showToast("選択範囲がありません"); return; }
+    void applyCrop({ x: s.x, y: s.y, w: s.w, h: s.h });
+  }
+  async function transformDoc(tr: DocTransform) {
+    const t = active;
+    if (!t?.meta || !(await layersOf(t))) return;
+    const { rasterize, blocker } = vs.transformIssues(t);
+    if (blocker) { await infoDialog(blocker); return; }
+    if (rasterize.length) {
+      const list = rasterize.slice(0, 12).map((n) => `・${n}`).join("\n") + (rasterize.length > 12 ? `\n…ほか ${rasterize.length - 12} 個` : "");
+      const c = await choose(`次のレイヤーはラスタライズされます（テキストやスマートオブジェクトとして編集できなくなります）。\n\n${list}`,
+        [`ラスタライズして実行（${TRANSFORM_LABEL[tr]}）`, "キャンセル"]);
+      if (c !== 0) return;
+    }
+    const m = vs.transform(t, tr);
+    showToast(m ?? `画像を${tr === "fh" || tr === "fv" ? "反転" : "回転"}しました（${TRANSFORM_LABEL[tr]}）`);
+  }
+  async function stampVisible() {
+    const t = active;
+    if (!t?.meta || !(await layersOf(t))) return;
+    const m = vs.stampVisible(t);
+    showToast(m ?? "表示中の画像を「結合」レイヤーにしました");
   }
 
   // ---- 3-b: painting
@@ -337,7 +397,10 @@
     if (showHelp && (k === "Escape" || k === "F1")) { showHelp = false; e.preventDefault(); return; }
     if (k === "Escape" && openMenu) openMenu = null;
     else if (k === "Escape" && cmp) vs.stopCompare();
-    else if (!ctrl && !e.altKey && !e.shiftKey && kk === "c") { if (active?.meta || cmp) vs.toggleCompare(); }
+    else if (k === "Enter" && cropTool.rect) applyCrop();
+    else if (k === "Escape" && cropTool.rect) setCrop(false);
+    else if (!ctrl && !e.altKey && e.shiftKey && kk === "c") { if (active?.meta || cmp) vs.toggleCompare(); }
+    else if (!ctrl && !e.altKey && !e.shiftKey && kk === "c") { if (cmp) vs.toggleCompare(); else if (active?.meta) setCrop(!cropTool.rect); }
     else if (cmp && !ctrl && !e.altKey && (kk === "1" || kk === "2" || kk === "3")) vs.updateCompare({ mode: (["side", "swipe", "toggle"] as const)[Number(kk) - 1] });
     else if (cmp && !ctrl && !e.altKey && kk === "x") vs.updateCompare({ mode: "toggle", showB: cmp.mode === "toggle" ? !cmp.showB : true });
     else if (k === "Escape" && annotOn) { if (active!.annot.selected !== null) active!.annot.selected = null; else annotTool.tool = null; }
@@ -386,6 +449,7 @@
       if (active?.layers?.status === "ready") { if (redo) vs.redo(active); else vs.undo(active); }
       else if (!(active && vs.travelSelection(active, !redo))) layerKey(() => {});
     }
+    else if (ctrl && e.altKey && e.shiftKey && kk === "e") stampVisible();
     else if (ctrl && !e.altKey && kk === "e") layerKey((t) => { const m = e.shiftKey ? vs.mergeVisible(t) : vs.mergeDown(t); if (m) showToast(m); });
     else if (ctrl && kk === "s") save(e.shiftKey);
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "j") layerKey((t) => vs.duplicate(t));
@@ -505,6 +569,14 @@
         <button class="item" role="menuitem" disabled={!active?.meta} onclick={() => openExport("export")}>書き出し…<span class="fdir">Ctrl+Alt+Shift+W</span></button>
         <button class="item" role="menuitem" disabled={!active?.meta} onclick={() => openExport("size")}>画像解像度…<span class="fdir">Ctrl+Alt+I</span></button>
         <button class="item" role="menuitem" disabled={active?.layers?.status !== "ready"} onclick={openCanvas}>カンバスサイズ…<span class="fdir">Ctrl+Alt+C</span></button>
+        <button class="item" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; setCrop(true); }}>切り抜き<span class="fdir">C</span></button>
+        <button class="item" role="menuitem" disabled={!active?.sel} onclick={() => { openMenu = null; cropToSelection(); }}>選択範囲で切り抜き</button>
+        <div class="menu-head">画像の回転</div>
+        {#each ["cw", "ccw", "180", "fh", "fv"] as const as tr (tr)}
+          <button class="item" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; transformDoc(tr); }}>{TRANSFORM_LABEL[tr]}</button>
+        {/each}
+        <div class="menu-sep"></div>
+        <button class="item" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; stampVisible(); }}>複写結合<span class="fdir">Ctrl+Alt+Shift+E</span></button>
         <button class="item" role="menuitem" onclick={() => { openMenu = null; showHelp = true; }}>ショートカット一覧<span class="fdir">F1</span></button>
         {#if isTauri()}
           <div class="menu-sep"></div>
@@ -525,12 +597,13 @@
   <button onclick={() => zoomTo(1)} title="100% (Ctrl+1)">100%</button>
   <span class="sep"></span>
   <button class:active={opt.layersPanel} onclick={() => (opt.layersPanel = !opt.layersPanel)} title="レイヤーパネル (F7)">レイヤー</button>
-  <button class:active={!!vs.compare} disabled={!active?.meta && !vs.compare} onclick={() => vs.toggleCompare()} title="比較表示 (C)">比較</button>
+  <button class:active={!!vs.compare} disabled={!active?.meta && !vs.compare} onclick={() => vs.toggleCompare()} title="比較表示 (Shift+C)">比較</button>
   <div class="seg seltools" title="選択ツール（M: 長方形 / 楕円形、L: なげなわ / 多角形、Shift で切り替え）。Shift: 追加 / Alt: 除外 / Shift+Alt: 交差">
     {#each ["rect", "ellipse", "lasso", "poly"] as const as st (st)}
       <button class:on={selTool.tool === st} disabled={!active?.meta || !!vs.compare} title={SEL_LABEL[st]} onclick={() => setSelTool(selTool.tool === st ? null : st)}>{SEL_ICON[st]}</button>
     {/each}
   </div>
+  <button class:active={!!cropTool.rect} disabled={!active?.meta || !!vs.compare} onclick={() => setCrop(!cropTool.rect)} title="切り抜き (C)。Enter で確定、Esc で中止">✂</button>
   <div class="seg seltools" title="ペイント（B: ブラシ / E: 消しゴム / I: スポイト）">
     {#each ["brush", "eraser", "eyedropper"] as const as pt (pt)}
       <button class:on={paint.tool === pt} disabled={!active?.meta || !!vs.compare} title={PAINT_LABEL[pt]} onclick={() => setPaintTool(paint.tool === pt ? null : pt)}>{PAINT_ICON[pt]}</button>
@@ -643,6 +716,7 @@
   ondragleave={() => { if (!isTauri()) dragOver = false; }}
   ondrop={onHtmlDrop}
 >
+  {#if cropTool.rect && active?.meta && !vs.compare}<CropBar onapply={() => applyCrop()} oncancel={() => setCrop(false)} />{/if}
   {#if paint.tool && active?.meta && !vs.compare}<PaintBar target={paintTarget} onclose={() => setPaintTool(null)} />{/if}
   {#if colorDlg}<ColorPicker value={colorDlg === "fg" ? paint.fg : paint.bg} title={colorDlg === "fg" ? "描画色" : "背景色"}
     onchange={(h) => { if (colorDlg === "fg") paint.fg = h; else paint.bg = h; paint.save(); }} onclose={() => (colorDlg = null)} />{/if}

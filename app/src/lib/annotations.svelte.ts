@@ -90,7 +90,9 @@ export class Annotations {
   replace(s: Shape) { this.commit(this.shapes.map((x) => (x.id === s.id ? s : x))); }
   clear() { if (this.shapes.length) this.commit([]); }
   /** removes every shape and the history (the shapes became a layer: undoing them back would draw them twice) */
-  reset() { this.undoStack = []; this.redoStack = []; this.set([]); }
+  reset() { this.load([]); }
+  /** replaces the shapes without history (the document was cropped / rotated, or that was undone) */
+  load(shapes: Shape[]) { this.undoStack = []; this.redoStack = []; this.set(shapes); }
 }
 
 // ---------------------------------------------------------------- geometry
