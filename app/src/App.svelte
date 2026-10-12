@@ -15,7 +15,7 @@
   import ColorPicker from "./lib/ColorPicker.svelte";
   import ChoiceDialog from "./lib/ChoiceDialog.svelte";
   import { PAINT_ICON, PAINT_LABEL, paint, stepSize, type PaintTool } from "./lib/paint.svelte";
-  import { TOOL_KEY, annotTool, type Tool } from "./lib/annotations.svelte";
+  import { TOOL_KEY, U_CYCLE, annotTool, type Tool } from "./lib/annotations.svelte";
   import { SEL_ICON, SEL_LABEL, selTool, type SelMode, type SelTool } from "./lib/selection.svelte";
   import { viewOptions as opt, GRID_LABEL, COMPARE_LABEL, type GridMode } from "./lib/viewOptions.svelte";
   import type { ChannelView, CompareMode } from "./lib/renderer";
@@ -209,7 +209,9 @@
 
   // ---- annotations
   const annotOn = $derived(annotTool.tool !== null && !!active?.meta && !vs.compare);
-  const TOOL_BY_KEY = Object.fromEntries(Object.entries(TOOL_KEY).map(([t, k]) => [k, t as Tool]));
+  const TOOL_BY_KEY = Object.fromEntries(Object.entries(TOOL_KEY).filter(([, k]) => k).map(([t, k]) => [k, t as Tool]));
+  // remember the last drawing tool (also when picked on the annotation bar)
+  $effect(() => { const t = annotTool.tool; if (t && t !== "select") annotTool.last = t; });
   // one tool at a time: a selection tool or an annotation tool
   function setSelTool(t: SelTool | null) {
     selTool.tool = t;
@@ -364,6 +366,11 @@
     }
     else if (!ctrl && !e.altKey && !e.shiftKey && paint.tool && paint.tool !== "eyedropper" && /^[0-9]$/.test(kk) && !cmp) paint.opacity = kk === "0" ? 1 : Number(kk) / 10;
     else if ((e.altKey || ctrl) && !e.shiftKey && (k === "Delete" || k === "Backspace") && active?.meta) layerKey((t) => msg(vs.fillSelection(t, e.altKey ? "fg" : "bg")));
+    else if (!ctrl && !e.altKey && kk === "u" && active?.meta && !cmp) {
+      // U: start annotating (the last tool, first the arrow); Shift+U while annotating: the next tool
+      if (!annotOn) setAnnotTool(annotTool.last);
+      else if (e.shiftKey) setAnnotTool(U_CYCLE[(U_CYCLE.indexOf(annotTool.tool!) + 1) % U_CYCLE.length]);
+    }
     else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) setAnnotTool(TOOL_BY_KEY[kk]);
     else if (ctrl && e.shiftKey && kk === "c") copyAnnotated();
     else if (ctrl && e.altKey && e.shiftKey && kk === "w") openExport("export");
@@ -535,7 +542,7 @@
     <button class="cx" onclick={() => paint.swap()} title="入れ替え (X)">⇄</button>
   </div>
   <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => setAnnotTool(annotTool.tool ? null : "arrow")}
-    title="注釈（ペン P / 直線 L / 矢印 A / 四角 U / テキスト T / 選択 V）。Ctrl+Shift+C で注釈込みの画像をコピー">注釈</button>
+    title="注釈（U で開始、注釈中の Shift+U で切り替え。ペン P / 直線 L / 矢印 A / テキスト T / 選択 V）。Ctrl+Shift+C で注釈込みの画像をコピー">注釈</button>
   <button class:active={showAi} onclick={() => (showAi = !showAi)} title="AI（ComfyUI）: 背景除去 / 指示で編集 (F8)">AI</button>
   <div class="menu-wrap">
     <button class:active={openMenu === "view"} onclick={() => (openMenu = openMenu === "view" ? null : "view")} title="表示（ナビゲーター / 定規 / ガイド / グリッド / 回転）">表示 ▾</button>

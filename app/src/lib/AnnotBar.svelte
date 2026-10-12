@@ -20,7 +20,7 @@
 <div class="bar" role="toolbar" aria-label="注釈">
   {#each TOOLS as x (x.t)}
     <button class:on={annotTool.tool === x.t} onclick={() => (annotTool.tool = x.t)}
-      title="{TOOL_LABEL[x.t]} ({TOOL_KEY[x.t].toUpperCase()}){x.t === 'line' || x.t === 'arrow' ? '。Shift で 45° 刻み' : x.t === 'rect' ? '。Shift で正方形' : x.t === 'select' ? '。ドラッグで移動、Delete で削除、テキストはダブルクリックで編集' : ''}">{x.icon}</button>
+      title="{TOOL_LABEL[x.t]} ({TOOL_KEY[x.t] ? TOOL_KEY[x.t].toUpperCase() : "Shift+U で切り替え"}){x.t === 'line' || x.t === 'arrow' ? '。Shift で 45° 刻み' : x.t === 'rect' ? '。Shift で正方形' : x.t === 'select' ? '。ドラッグで移動、Delete で削除、テキストはダブルクリックで編集' : ''}">{x.icon}</button>
   {/each}
   <span class="sep"></span>
   {#each COLORS as c (c.c)}

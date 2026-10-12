@@ -28,7 +28,9 @@ export const WIDTHS = [2, 4, 8];
 export const FONT_SIZES = [16, 24, 36];
 export const TOOL_LABEL: Record<Tool, string> = { select: "選択", pen: "ペン", line: "直線", arrow: "矢印", rect: "四角", text: "テキスト" };
 /** single-letter keys (physical key, see App.svelte) */
-export const TOOL_KEY: Record<Tool, string> = { select: "v", pen: "p", line: "l", arrow: "a", rect: "u", text: "t" };
+export const TOOL_KEY: Record<Tool, string> = { select: "v", pen: "p", line: "l", arrow: "a", rect: "", text: "t" };
+/** U: starts annotating with the last tool; Shift+U (annotating): the next tool of this cycle (the rectangle has no own key) */
+export const U_CYCLE: Tool[] = ["arrow", "line", "rect", "pen", "text"];
 
 const FONT_FAMILY = `"Segoe UI", "Yu Gothic UI", "Hiragino Sans", sans-serif`;
 const HISTORY_MAX = 100;
@@ -39,6 +41,8 @@ class AnnotTool {
   color = $state(COLORS[0].c);
   /** default: 2px */
   widthIndex = $state(0);
+  /** the last drawing tool (U starts with it) */
+  last = $state<Tool>("arrow");
 }
 export const annotTool = new AnnotTool();
 
