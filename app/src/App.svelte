@@ -67,7 +67,9 @@
   let dragOver = $state(false);
   let showStats = $state(false);
   let readMode = $state(readTuning.mode);
-  let openMenu = $state<"main" | "view" | null>(null);
+  let openMenu = $state<"file" | "edit" | "view" | null>(null);
+  /** submenu open in the file / edit menu */
+  let sub = $state<"recent" | "rotate" | null>(null);
   let toast = $state<string | null>(null);
   let fileInput: HTMLInputElement;
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -551,42 +553,69 @@
 
 <header class="toolbar">
   <div class="menu-wrap">
-    <button class="menu-btn" class:active={openMenu === "main"} onclick={() => (openMenu = openMenu === "main" ? null : "main")} title="メニュー">≡</button>
-    {#if openMenu === "main"}
-      <div class="menu" role="menu">
-        <div class="menu-head">最近使ったファイル</div>
-        {#each recent.list as p (p)}
-          <button class="item" role="menuitem" title={p} onclick={() => { openMenu = null; openPaths([p]); }}>
-            <span class="fname">{baseName(p)}</span><span class="fdir">{shortPath(p)}</span>
-          </button>
-        {:else}
-          <div class="empty">（まだありません）</div>
-        {/each}
-        {#if recent.list.length}
-          <button class="item small" role="menuitem" onclick={() => { recent.clear(); }}>履歴を消去</button>
-        {/if}
+    <button class:active={openMenu === "file"} onclick={() => { openMenu = openMenu === "file" ? null : "file"; sub = null; }}
+      onmouseenter={() => { if (openMenu && openMenu !== "file") { openMenu = "file"; sub = null; } }}>ファイル</button>
+    {#if openMenu === "file"}
+      <div class="menu nav" role="menu">
+        <button class="item cmd" role="menuitem" onclick={() => { openMenu = null; openDialog(); }}>開く…<span class="fdir">Ctrl+O</span></button>
+        <div class="sub-wrap" role="presentation" onmouseenter={() => (sub = "recent")} onmouseleave={() => (sub = null)}>
+          <button class="item cmd" class:hot={sub === "recent"} role="menuitem" aria-haspopup="menu" onclick={() => (sub = sub === "recent" ? null : "recent")}>最近使ったファイル<span class="fdir">▸</span></button>
+          {#if sub === "recent"}
+            <div class="menu submenu recent" role="menu">
+              {#each recent.list as p (p)}
+                <button class="item" role="menuitem" title={p} onclick={() => { openMenu = null; sub = null; openPaths([p]); }}>
+                  <span class="fname">{baseName(p)}</span><span class="fdir">{shortPath(p)}</span>
+                </button>
+              {:else}
+                <div class="empty">（まだありません）</div>
+              {/each}
+              {#if recent.list.length}
+                <div class="menu-sep"></div>
+                <button class="item small" role="menuitem" onclick={() => { recent.clear(); }}>履歴を消去</button>
+              {/if}
+            </div>
+          {/if}
+        </div>
         <div class="menu-sep"></div>
-        <button class="item" role="menuitem" disabled={!active?.meta} onclick={() => openExport("export")}>書き出し…<span class="fdir">Ctrl+Alt+Shift+W</span></button>
-        <button class="item" role="menuitem" disabled={!active?.meta} onclick={() => openExport("size")}>画像解像度…<span class="fdir">Ctrl+Alt+I</span></button>
-        <button class="item" role="menuitem" disabled={active?.layers?.status !== "ready"} onclick={openCanvas}>カンバスサイズ…<span class="fdir">Ctrl+Alt+C</span></button>
-        <button class="item" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; setCrop(true); }}>切り抜き<span class="fdir">C</span></button>
-        <button class="item" role="menuitem" disabled={!active?.sel} onclick={() => { openMenu = null; cropToSelection(); }}>選択範囲で切り抜き</button>
-        <div class="menu-head">画像の回転</div>
-        {#each ["cw", "ccw", "180", "fh", "fv"] as const as tr (tr)}
-          <button class="item" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; transformDoc(tr); }}>{TRANSFORM_LABEL[tr]}</button>
-        {/each}
-        <div class="menu-sep"></div>
-        <button class="item" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; stampVisible(); }}>複写結合<span class="fdir">Ctrl+Alt+Shift+E</span></button>
-        <button class="item" role="menuitem" onclick={() => { openMenu = null; showHelp = true; }}>ショートカット一覧<span class="fdir">F1</span></button>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => { openMenu = null; save(false); }}>保存<span class="fdir">Ctrl+S</span></button>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => { openMenu = null; save(true); }}>別名で保存…<span class="fdir">Ctrl+Shift+S</span></button>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => openExport("export")}>書き出し…<span class="fdir">Ctrl+Alt+Shift+W</span></button>
         {#if isTauri()}
           <div class="menu-sep"></div>
-          <button class="item" role="menuitem" onclick={() => registerOpenWith(true)}>「プログラムから開く」に登録</button>
-          <button class="item" role="menuitem" onclick={() => registerOpenWith(false)}>登録を解除</button>
+          <button class="item cmd" role="menuitem" onclick={() => registerOpenWith(true)}>「プログラムから開く」に登録</button>
+          <button class="item cmd" role="menuitem" onclick={() => registerOpenWith(false)}>登録を解除</button>
         {/if}
       </div>
     {/if}
   </div>
-  <button onclick={openDialog} title="開く (Ctrl+O)">開く</button>
+  <div class="menu-wrap">
+    <button class:active={openMenu === "edit"} onclick={() => { openMenu = openMenu === "edit" ? null : "edit"; sub = null; }}
+      onmouseenter={() => { if (openMenu && openMenu !== "edit") { openMenu = "edit"; sub = null; } }}>編集</button>
+    {#if openMenu === "edit"}
+      <div class="menu nav" role="menu">
+        <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => openExport("size")}>画像解像度…<span class="fdir">Ctrl+Alt+I</span></button>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={async () => { openMenu = null; if (active && (await layersOf(active))) openCanvas(); }}>カンバスサイズ…<span class="fdir">Ctrl+Alt+C</span></button>
+        <div class="sub-wrap" role="presentation" onmouseenter={() => (sub = "rotate")} onmouseleave={() => (sub = null)}>
+          <button class="item cmd" class:hot={sub === "rotate"} role="menuitem" aria-haspopup="menu" disabled={!active?.meta || !!vs.compare} onclick={() => (sub = sub === "rotate" ? null : "rotate")}>画像の回転<span class="fdir">▸</span></button>
+          {#if sub === "rotate" && active?.meta && !vs.compare}
+            <div class="menu submenu" role="menu">
+              {#each ["cw", "ccw", "180", "fh", "fv"] as const as tr (tr)}
+                {#if tr === "fh"}<div class="menu-sep"></div>{/if}
+                <button class="item cmd" role="menuitem" onclick={() => { openMenu = null; sub = null; transformDoc(tr); }}>{TRANSFORM_LABEL[tr]}</button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <div class="menu-sep"></div>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; setCrop(true); }}>切り抜き<span class="fdir">C</span></button>
+        <button class="item cmd" role="menuitem" disabled={!active?.sel} onclick={() => { openMenu = null; cropToSelection(); }}>選択範囲で切り抜き</button>
+        <div class="menu-sep"></div>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; stampVisible(); }}>複写結合<span class="fdir">Ctrl+Alt+Shift+E</span></button>
+        <div class="menu-sep"></div>
+        <button class="item cmd" role="menuitem" onclick={() => { openMenu = null; showHelp = true; }}>ショートカット一覧<span class="fdir">F1</span></button>
+      </div>
+    {/if}
+  </div>
   <input bind:this={fileInput} type="file" multiple accept={SUPPORTED_EXT.map((e) => "." + e).join(",")} hidden
     onchange={() => { for (const f of Array.from(fileInput.files ?? [])) vs.openFile(f); fileInput.value = ""; }} />
   <span class="sep"></span>
@@ -728,7 +757,7 @@
   {#if opt.navigator && active?.meta}<Navigator {renderer} zoom={vs.zoom} />{/if}
   {#if !active}
     <div class="start">
-      <div class="hint">PSD / PSB / PNG / JPG / WebP をドロップ、または「開く」（Ctrl+O）</div>
+      <div class="hint">PSD / PSB / PNG / JPG / WebP をドロップ、または「ファイル」→「開く」（Ctrl+O）</div>
       {#if recent.list.length}
         <div class="recent">
           <div class="recent-head">最近使ったファイル</div>
@@ -828,7 +857,12 @@
   button.active { border-color: var(--accent); color: var(--accent); }
 
   .menu-wrap { position: relative; }
-  .menu-btn { font-size: 16px; line-height: 1; padding: 2px 9px 4px; }
+  .menu.nav { overflow: visible; min-width: 260px; }
+  .item.cmd { flex-direction: row; justify-content: space-between; align-items: center; gap: 24px; width: 100%; }
+  .item.hot { background: #3a3a3a; }
+  .sub-wrap { position: relative; }
+  .menu.submenu { top: -6px; left: 100%; min-width: 200px; } /* no gap: the pointer stays inside .sub-wrap on the way */
+  .menu.submenu.recent { min-width: 320px; max-width: 520px; }
   .menu {
     position: absolute; top: 32px; left: 0; z-index: 20;
     min-width: 320px; max-width: 520px; max-height: 70vh; overflow-y: auto;
@@ -836,7 +870,6 @@
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); padding: 6px;
     display: flex; flex-direction: column;
   }
-  .menu-head { color: var(--muted); font-size: 11px; padding: 4px 8px; }
   .menu-sep { height: 1px; background: var(--border); margin: 6px 2px; }
   .menu .empty { color: var(--muted); padding: 4px 8px 8px; }
   .item {
