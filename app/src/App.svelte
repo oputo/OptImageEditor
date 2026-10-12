@@ -341,7 +341,7 @@
     else if (k === "Escape" && annotOn) { if (active!.annot.selected !== null) active!.annot.selected = null; else annotTool.tool = null; }
     else if (k === "Escape" && selTool.tool) setSelTool(null);
     else if (k === "Escape" && paint.tool) setPaintTool(null);
-    else if (!ctrl && !e.altKey && kk === "m" && active?.meta && !cmp && !annotOn) setSelTool(e.shiftKey ? (selTool.marquee === "rect" ? "ellipse" : "rect") : selTool.marquee);
+    else if (!ctrl && !e.altKey && kk === "m" && active?.meta && !cmp) setSelTool(e.shiftKey ? (selTool.marquee === "rect" ? "ellipse" : "rect") : selTool.marquee);
     else if (!ctrl && !e.altKey && kk === "l" && active?.meta && !cmp && !annotOn) setSelTool(e.shiftKey ? (selTool.lasso === "lasso" ? "poly" : "lasso") : selTool.lasso);
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "a") { if (active?.meta) vs.selectAll(active); }
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "d") { if (active) vs.deselect(active); }
@@ -353,7 +353,7 @@
     else if (!ctrl && !e.altKey && (k === "Delete" || k === "Backspace") && active?.sel && !annotOn) layerKey((t) => msg(t.layers!.maskTarget ? vs.hideInMask(t) : vs.clearSelection(t)));
     else if (ctrl && !e.shiftKey && !e.altKey && kk === "i" && active?.layers?.maskTarget) layerKey((t) => msg(vs.invertMask(t)));
     else if (k === "Escape" && renderer?.hasImage && renderer.rotation !== 0) renderer.rotateTo(0);
-    else if (!ctrl && !e.altKey && !e.shiftKey && !annotOn && (kk === "b" || kk === "e" || kk === "i") && active?.meta && !cmp) setPaintTool(kk === "b" ? "brush" : kk === "e" ? "eraser" : "eyedropper");
+    else if (!ctrl && !e.altKey && !e.shiftKey && (kk === "b" || kk === "e" || kk === "i") && active?.meta && !cmp) setPaintTool(kk === "b" ? "brush" : kk === "e" ? "eraser" : "eyedropper");
     else if (!ctrl && !e.altKey && !annotOn && kk === "x" && !cmp) paint.swap();
     else if (!ctrl && !e.altKey && !annotOn && kk === "d" && !cmp) paint.reset();
     else if (!ctrl && !e.altKey && paint.tool && BRACKET[k] !== undefined) {
@@ -534,7 +534,7 @@
     <button class="cfg" style:background={paint.fg} aria-label="描画色" onclick={() => (colorDlg = "fg")}></button>
     <button class="cx" onclick={() => paint.swap()} title="入れ替え (X)">⇄</button>
   </div>
-  <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => setAnnotTool(annotTool.tool ? null : "pen")}
+  <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => setAnnotTool(annotTool.tool ? null : "arrow")}
     title="注釈（ペン P / 直線 L / 矢印 A / 四角 U / テキスト T / 選択 V）。Ctrl+Shift+C で注釈込みの画像をコピー">注釈</button>
   <button class:active={showAi} onclick={() => (showAi = !showAi)} title="AI（ComfyUI）: 背景除去 / 指示で編集 (F8)">AI</button>
   <div class="menu-wrap">

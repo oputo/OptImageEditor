@@ -37,7 +37,8 @@ const HISTORY_MAX = 100;
 class AnnotTool {
   tool = $state<Tool | null>(null);
   color = $state(COLORS[0].c);
-  widthIndex = $state(1);
+  /** default: 2px */
+  widthIndex = $state(0);
 }
 export const annotTool = new AnnotTool();
 
