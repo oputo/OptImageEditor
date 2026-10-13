@@ -1238,7 +1238,122 @@ fn extra_rows(f: &mut File, src: &Source, first: usize, canvas: Option<(Shift, u
 /// copied as is. Returns segments to write (copy from the source / bytes) and their total length.
 enum Seg { Copy(u64, u64), Bytes(Vec<u8>) }
 
-fn plan_tagged(f: &mut File, src: &Source, used: &std::collections::HashSet<String>) -> Result<(Vec<Seg>, u64), String> {
+/// RLE channel data (compression 1) whose row byte counts are u16 or u32 (smart filter caches use u32 even in PSD
+/// files): which one, by the total length
+fn rle_count_width(d: &[u8], h: usize) -> usize {
+    let total = |cb: usize| -> Option<usize> {
+        if d.len() < 2 + h * cb { return None; }
+        Some(2 + h * cb + (0..h).map(|y| if cb == 4 { u32::from_be_bytes(d[2 + y * 4..6 + y * 4].try_into().unwrap()) as usize } else { u16::from_be_bytes([d[2 + y * 2], d[3 + y * 2]]) as usize }).sum::<usize>())
+    };
+    if total(4) == Some(d.len()) { 4 } else { 2 }
+}
+
+/// one RLE channel with u32 / u16 row counts
+fn encode_rle(px: &[u8], w: usize, h: usize, cb: usize) -> Vec<u8> {
+    let mut data = vec![];
+    if w == 0 || h == 0 { data.extend_from_slice(&0u16.to_be_bytes()); return data; }
+    let rows: Vec<Vec<u8>> = (0..h)
+        .into_par_iter()
+        .map(|y| { let mut o = Vec::with_capacity(w + w / 64 + 2); pack_bits(&px[y * w..(y + 1) * w], &mut o); o })
+        .collect();
+    data.extend_from_slice(&1u16.to_be_bytes());
+    for r in &rows { if cb == 4 { data.extend_from_slice(&(r.len() as u32).to_be_bytes()) } else { data.extend_from_slice(&(r.len() as u16).to_be_bytes()) } }
+    for r in &rows { data.extend_from_slice(r); }
+    data
+}
+
+/// a channel of a smart filter cache turned with the document (any compression in, RLE out)
+fn turn_cache_channel(d: &[u8], w: usize, h: usize, s: &Shift) -> Result<Vec<u8>, String> {
+    if w == 0 || h == 0 || d.len() < 2 { return Ok(d.to_vec()); }
+    let comp = u16::from_be_bytes([d[0], d[1]]);
+    let cb = if comp == 1 { rle_count_width(d, h) } else { 4 };
+    let plane = decode_channel(d, w, h, cb == 4)?;
+    let (np, nw, nh) = turn_plane(&plane, w, h, s);
+    Ok(encode_rle(&np, nw, nh, cb))
+}
+
+/// Smart filter caches ("FEid" / "FXid": per smart object, its unfiltered image and the filter mask, in document
+/// coordinates) moved / turned with the document. `d`: the block's data.
+fn shift_filter_effects(d: &[u8], s: Shift) -> Result<Vec<u8>, String> {
+    let mut r = 0usize;
+    let need = |r: usize, n: usize| -> Result<(), String> { if r + n > d.len() { err("filter effects data too short") } else { Ok(()) } };
+    let be32 = |p: usize| u32::from_be_bytes(d[p..p + 4].try_into().unwrap());
+    let be64 = |p: usize| u64::from_be_bytes(d[p..p + 8].try_into().unwrap());
+    need(r, 4)?;
+    let mut out = d[0..4].to_vec(); // version
+    r += 4;
+    while r + 8 <= d.len() {
+        let elen = be64(r) as usize;
+        let es = r + 8;
+        if elen == 0 || es + elen > d.len() { out.extend_from_slice(&d[r..]); return Ok(out); }
+        let mut e = vec![];
+        let mut p = es;
+        let idl = d[p] as usize;
+        need(p, 1 + idl + 12)?;
+        e.extend_from_slice(&d[p..p + 1 + idl + 4]); // id, version
+        p += 1 + idl + 4;
+        let ln2 = be64(p) as usize;
+        let s2 = p + 8;
+        need(s2, ln2)?;
+        // rectangle, depth, max channels, channels
+        let mut body = vec![];
+        let mut rect: [u8; 16] = d[s2..s2 + 16].try_into().unwrap();
+        let (w, h) = rect_size(&rect);
+        shift_rect(&mut rect, s);
+        body.extend_from_slice(&rect);
+        body.extend_from_slice(&d[s2 + 16..s2 + 24]);
+        if be32(s2 + 16) != 8 && s.turns() { return err("8 bit 以外のスマートフィルターの回転は未対応です"); }
+        let maxc = be32(s2 + 20) as usize;
+        let mut q = s2 + 24;
+        for _ in 0..maxc + 2 {
+            need(q, 4)?;
+            let written = be32(q);
+            body.extend_from_slice(&d[q..q + 4]);
+            q += 4;
+            if written == 0 { continue; }
+            need(q, 8)?;
+            let cl = be64(q) as usize;
+            need(q + 8, cl)?;
+            let ch = &d[q + 8..q + 8 + cl];
+            let nc = if s.turns() { turn_cache_channel(ch, w, h, &s)? } else { ch.to_vec() };
+            body.extend_from_slice(&(nc.len() as u64).to_be_bytes());
+            body.extend_from_slice(&nc);
+            q += 8 + cl;
+        }
+        body.extend_from_slice(&d[q..s2 + ln2]); // anything else up to the end of this part
+        e.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        e.extend_from_slice(&body);
+        // the filter mask
+        let mut x = s2 + ln2;
+        if x < es + elen {
+            let written = d[x];
+            e.push(written);
+            x += 1;
+            if written != 0 {
+                need(x, 26)?;
+                let mut mrect: [u8; 16] = d[x..x + 16].try_into().unwrap();
+                let (mw, mh) = rect_size(&mrect);
+                shift_rect(&mut mrect, s);
+                let ml = be64(x + 16) as usize;
+                need(x + 24, ml)?;
+                let ch = &d[x + 24..x + 24 + ml];
+                let nc = if s.turns() { turn_cache_channel(ch, mw, mh, &s)? } else { ch.to_vec() };
+                e.extend_from_slice(&mrect);
+                e.extend_from_slice(&(nc.len() as u64).to_be_bytes());
+                e.extend_from_slice(&nc);
+                x += 24 + ml;
+            }
+            e.extend_from_slice(&d[x..es + elen]);
+        }
+        out.extend_from_slice(&(e.len() as u64).to_be_bytes());
+        out.extend_from_slice(&e);
+        r = es + elen;
+    }
+    out.extend_from_slice(&d[r..]);
+    Ok(out)
+}
+
+fn plan_tagged(f: &mut File, src: &Source, used: &std::collections::HashSet<String>, shift: Option<Shift>) -> Result<(Vec<Seg>, u64), String> {
     let (start, end) = src.tagged;
     let whole = || (vec![Seg::Copy(start, end - start)], end - start);
     let psb = src.psb;
@@ -1263,6 +1378,22 @@ fn plan_tagged(f: &mut File, src: &Source, used: &std::collections::HashSet<Stri
             if at >= end || sig_at(f, at) { next = Some(at.min(end)); break; }
         }
         let Some(next) = next else { return Ok(whole()) };
+        if matches!(&key, b"FEid" | b"FXid") && len > 0 {
+            if let Some(s) = shift {
+                // smart filter caches move / turn with the document
+                let nd = shift_filter_effects(&read_at(f, data, len as usize)?, s)?;
+                let mut hdr = head.clone();
+                put_len(&mut hdr, nd.len() as u64, long);
+                let pad = (4 - nd.len() % 4) % 4; // tagged blocks are padded to 4 bytes
+                let n = hdr.len() + nd.len() + pad;
+                segs.push(Seg::Bytes(hdr));
+                segs.push(Seg::Bytes(nd));
+                if pad > 0 { segs.push(Seg::Bytes(vec![0; pad])); }
+                total += n as u64;
+                pos = next;
+                continue;
+            }
+        }
         let is_link = matches!(&key, b"lnk2" | b"lnkD" | b"lnk3" | b"lnkE");
         if !is_link || len == 0 {
             segs.push(Seg::Copy(pos, next - pos));
@@ -1431,7 +1562,7 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         let li_pad = (4 - li_len % 4) % 4;
         li_len += li_pad;
         let used: std::collections::HashSet<String> = out.iter().flat_map(|(r, _)| r.linked_file_ids()).collect();
-        let (tagged_segs, tagged_len) = plan_tagged(&mut f, &src, &used)?;
+        let (tagged_segs, tagged_len) = plan_tagged(&mut f, &src, &used, if shift.is_none() { None } else { Some(shift) })?;
         let lm_len = if flattened || (out.is_empty() && src.records.is_empty() && src.global_mask.is_empty() && tagged_len == 0) {
             0
         } else {
