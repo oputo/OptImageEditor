@@ -2496,6 +2496,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "exr",
+ "flate2",
  "half",
  "rayon",
  "serde",

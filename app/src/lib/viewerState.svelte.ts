@@ -99,7 +99,9 @@ export type LayersState = {
 
 /** Undo history of a tab's layer tree (snapshots of the tree; pixels are not edited in 2-b). */
 /** Canvas of a layered document: size, and how far the file's layers have moved (canvas size changes not saved yet). */
-export type Canvas = { w: number; h: number; ox: number; oy: number };
+/** canvas size, and where the file's layers went: x' = m0 x + m1 y + ox, y' = m2 x + m3 y + oy (m: rotation / flip,
+ *  identity when absent) */
+export type Canvas = { w: number; h: number; ox: number; oy: number; m?: [number, number, number, number] };
 /** pixels changed in place by a stroke (layer `id`'s texture or mask), applied backwards / forwards by undo / redo */
 type Patch = { id: number; mask: boolean; tiles: PatchTile[]; bytes: number };
 /** `patch`: the pixel change from this state to the next one (strokes) */
@@ -744,7 +746,7 @@ export class ViewerState {
         }
       };
       walk(tree);
-      l.canvas = { w, h, ox: c.ox + dx, oy: c.oy + dy };
+      l.canvas = { ...c, w, h, ox: c.ox + dx, oy: c.oy + dy };
       tab.sel = shiftSel(tab.sel, dx, dy);
     });
     return null;
@@ -907,7 +909,7 @@ export class ViewerState {
   /** After a save the file's layers are numbered anew: point the undo / redo snapshots at the new numbers.
    *  Steps that need a layer which is no longer in the file (deleted before saving) cannot be restored from the
    *  new file, so they (and everything older) are dropped from the history. */
-  private remapHistory(tab: Tab, savedOffset: { ox: number; oy: number }) {
+  private remapHistory(tab: Tab, savedOffset: Canvas) {
     const l = tab.layers;
     const h = this.histories.get(tab.id);
     if (!l || !h) return;
@@ -926,9 +928,18 @@ export class ViewerState {
       return ok;
     };
     // newest first: the last element of each stack is the next step
-    // snapshots' canvas offsets are relative to the file: the saved file moved by `saved`
-    const saved = { ox: savedOffset.ox, oy: savedOffset.oy };
-    for (const sn of [...h.undo, ...h.redo]) { sn.canvas = { ...sn.canvas, ox: sn.canvas.ox - saved.ox, oy: sn.canvas.oy - saved.oy }; }
+    // snapshots' canvas mappings are relative to the old file; the saved file is the old one mapped by S:
+    // relative to the new file a snapshot's mapping N becomes N ∘ S⁻¹
+    const S = savedOffset.m ?? [1, 0, 0, 1];
+    const det = S[0] * S[3] - S[1] * S[2];
+    const inv = [S[3] / det, -S[1] / det, -S[2] / det, S[0] / det];
+    for (const sn of [...h.undo, ...h.redo]) {
+      const N = sn.canvas.m ?? [1, 0, 0, 1];
+      const r: [number, number, number, number] = [N[0] * inv[0] + N[1] * inv[2], N[0] * inv[1] + N[1] * inv[3], N[2] * inv[0] + N[3] * inv[2], N[2] * inv[1] + N[3] * inv[3]];
+      const ox = sn.canvas.ox - (r[0] * savedOffset.ox + r[1] * savedOffset.oy), oy = sn.canvas.oy - (r[2] * savedOffset.ox + r[3] * savedOffset.oy);
+      const ident = r[0] === 1 && r[1] === 0 && r[2] === 0 && r[3] === 1;
+      sn.canvas = { w: sn.canvas.w, h: sn.canvas.h, ox: Math.round(ox), oy: Math.round(oy), ...(ident ? {} : { m: r }) };
+    }
     for (let i = h.undo.length - 1; i >= 0; i--) if (!fix(h.undo[i].tree)) { h.undo = h.undo.slice(i + 1); break; }
     for (let i = h.redo.length - 1; i >= 0; i--) if (!fix(h.redo[i].tree)) { h.redo = h.redo.slice(i + 1); break; }
     l.undoCount = h.undo.length;
@@ -1234,60 +1245,71 @@ export class ViewerState {
         }
       };
       walk(tree);
-      l.canvas = { w: rect.w, h: rect.h, ox: c.ox + dx, oy: c.oy + dy };
+      l.canvas = { ...c, w: rect.w, h: rect.h, ox: c.ox + dx, oy: c.oy + dy };
       tab.sel = null;
     }, (axis, v) => [axis, axis === "v" ? v + dx : v + dy], (x, y) => [x + dx, y + dy]);
     if (deletePixels) this.releaseUnused(tab);
     return null;
   }
 
-  /** what a rotation / flip has to do first: layers to rasterize (text / smart objects / vector masks), or why it
-   *  cannot (a group mask) */
-  transformIssues(tab: Tab): { rasterize: string[]; blocker: string | null } {
-    const out: string[] = [];
-    let blocker: string | null = null;
-    const walk = (ls: DocLayer[]) => {
-      for (const n of ls) {
-        if (n.children) { if (n.mask && !blocker) blocker = `グループ「${n.name}」にマスクがあるため回転・反転できません（グループのマスクは未対応）`; walk(n.children); continue; }
-        if (n.kind === "text" || n.kind === "smart" || n.mask?.withVector) out.push(n.name);
-      }
-    };
-    walk(tab.layers?.tree ?? []);
-    return { rasterize: out, blocker };
-  }
-
-  /** Rotates / flips the whole document. Text, smart objects and layers with a vector mask are rasterized (call
-   *  transformIssues first and ask). Returns a message when it cannot. */
+  /** Rotates / flips the whole document. Every layer keeps its kind (smart objects and text are not rasterized):
+   *  pixels and masks (also of groups) are turned here for the display; when saving, Rust turns the file's channels
+   *  and the placement of smart objects / text / vector masks (psd_save.rs `Shift`). Returns a message when it cannot. */
   transform(tab: Tab, t: DocTransform): string | null {
     const l = tab.layers;
     const doc = this.docs.get(tab.id);
     if (!l || l.status !== "ready" || !doc) return "レイヤーが読み込まれていません";
-    const { blocker } = this.transformIssues(tab);
-    if (blocker) return blocker;
     const W = l.canvas.w, H = l.canvas.h;
     const swap = t === "cw" || t === "ccw";
-    const one = (n: DocLayer): DocLayer => {
-      if (n.kind === "text" || n.kind === "smart" || n.mask?.withVector) {
-        // rasterize: the layer as drawn (mask applied) becomes a new pixel layer
-        const p = this.soloPixels(tab, n);
-        const q = p.w ? transformPixels(t, p, W, H, 4) : p;
-        const res = this.rasterLayer(doc, n.name, q);
-        return { ...res, hidden: n.hidden, opacity: n.opacity, fill: n.fill, blendMode: n.blendMode, clipping: n.clipping };
+    const mapRect = (x: number, y: number, w: number, h: number) => {
+      const [ax, ay] = mapPoint(t, x, y, W, H), [bx, by] = mapPoint(t, x + w, y + h, W, H);
+      return { x: Math.min(ax, bx), y: Math.min(ay, by), w: Math.abs(bx - ax), h: Math.abs(by - ay) };
+    };
+    // the same node turned: a new id with turned textures. "raster" / "maskEdited" stay as they are: what comes from
+    // the file is turned again by Rust from the file's own data when saving
+    const turned = (n: DocLayer): DocLayer => {
+      const id = doc.nextId++;
+      let rect = { x: n.x, y: n.y, w: n.w, h: n.h };
+      let thumb = n.thumb;
+      if (!n.children && n.w > 0 && n.h > 0 && doc.gpu.get(n.id)?.tex) {
+        const q = transformPixels(t, this.layerPixels(tab, n), W, H, 4);
+        this.compositor!.setLayerPixels(doc, id, q.px, q.w, q.h, null);
+        rect = { x: q.x, y: q.y, w: q.w, h: q.h };
+        thumb = thumbOf(q.px, q.w, q.h);
+      } else {
+        this.compositor!.setLayerPixels(doc, id, new Uint8Array(0), 0, 0, null);
+        if (n.w > 0 && n.h > 0) rect = mapRect(n.x, n.y, n.w, n.h);
       }
-      let out = n;
-      if (n.kind !== "adjustment" && n.w > 0) out = this.withPixels(tab, n, transformPixels(t, this.layerPixels(tab, n), W, H, 4));
-      const m = n.mask;
-      if (m) {
+      let mask = n.mask;
+      if (n.mask) {
         const cur = this.maskOf(tab, n);
-        const g = cur.w > 0 ? transformPixels(t, cur, W, H, 1) : { x: 0, y: 0, w: 0, h: 0, px: new Uint8Array(0) };
-        out = this.withMask(tab, out, { ...g, def: cur.def }, m.disabled);
+        const g = cur.w > 0 && cur.h > 0 ? transformPixels(t, cur, W, H, 1) : { x: 0, y: 0, w: 0, h: 0, px: new Uint8Array(0) };
+        this.compositor!.setLayerMask(doc, id, id, g.w > 0 ? g.px : null, g.w, g.h);
+        mask = { ...n.mask, x: g.x, y: g.y, w: g.w, h: g.h, pixels: null, thumb: g.w > 0 ? maskThumbOf(g.px, g.w, g.h, cur.def) : n.mask.thumb };
       }
-      return out;
+      return { ...n, id, ...rect, thumb, mask, warnings: [...n.warnings] };
     };
     this.transformStep(tab, (tree) => {
-      const walk = (ls: DocLayer[]) => { for (let i = 0; i < ls.length; i++) { if (ls[i].children) walk(ls[i].children!); else ls[i] = one(ls[i]); } };
+      const walk = (ls: DocLayer[]) => {
+        for (let i = 0; i < ls.length; i++) {
+          if (ls[i].children) walk(ls[i].children!);
+          ls[i] = turned(ls[i]);
+        }
+      };
       walk(tree);
-      if (swap) l.canvas = { ...l.canvas, w: H, h: W };
+      // the file -> document mapping becomes (this turn) ∘ (the mapping so far): new = M old + (tx, ty)
+      const M: [number, number, number, number] = t === "cw" ? [0, -1, 1, 0] : t === "ccw" ? [0, 1, -1, 0] : t === "180" ? [-1, 0, 0, -1] : t === "fh" ? [-1, 0, 0, 1] : [1, 0, 0, -1];
+      const tx = t === "cw" || t === "180" || t === "fh" ? (t === "cw" ? H : W) : 0;
+      const ty = t === "ccw" ? W : t === "180" || t === "fv" ? H : 0;
+      const c = l.canvas;
+      const m = c.m ?? [1, 0, 0, 1];
+      const nm: [number, number, number, number] = [M[0] * m[0] + M[1] * m[2], M[0] * m[1] + M[1] * m[3], M[2] * m[0] + M[3] * m[2], M[2] * m[1] + M[3] * m[3]];
+      const ident = nm[0] === 1 && nm[1] === 0 && nm[2] === 0 && nm[3] === 1;
+      l.canvas = {
+        w: swap ? H : W, h: swap ? W : H,
+        ox: M[0] * c.ox + M[1] * c.oy + tx, oy: M[2] * c.ox + M[3] * c.oy + ty,
+        ...(ident ? {} : { m: nm }),
+      };
       tab.sel = null;
     }, (axis, v) => {
       if (t === "cw") return axis === "v" ? ["h", v] : ["v", H - v];
@@ -2339,7 +2361,7 @@ export class ViewerState {
     attach(plan);
     const req = {
       src, dst, backup, width: doc.data.width, height: doc.data.height, layerCount: l.fileCount, plan,
-      offsetX: l.canvas.ox, offsetY: l.canvas.oy,
+      offsetX: l.canvas.ox, offsetY: l.canvas.oy, xform: l.canvas.m ?? null,
     };
     const rgba = new Uint8Array(composite.length + offset);
     rgba.set(composite, 0);
@@ -2469,7 +2491,7 @@ export class ViewerState {
       if (flat) { l.tree[0].origId = null; l.tree[0].raster = true; } else renumber(l.tree);
       l.fileCount = n;
       this.remapHistory(tab, l.canvas);
-      l.canvas = { ...l.canvas, ox: 0, oy: 0 };
+      l.canvas = { w: l.canvas.w, h: l.canvas.h, ox: 0, oy: 0 };
       l.dirty = false;
       l.saved = { ms: performance.now() - t0, bytes: buffer.byteLength, path: target };
       const old = this.cache.get(cacheKey(tab)); // under the old key

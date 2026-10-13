@@ -94,37 +94,129 @@ pub struct SaveRequest {
     pub offset_x: i32,
     #[serde(default)]
     pub offset_y: i32,
+    /// rotation / flip of the document (90° steps): the linear part [a, b, c, d] of x' = a x + b y + offset_x,
+    /// y' = c x + d y + offset_y (none: identity)
+    #[serde(default)]
+    pub xform: Option<[f64; 4]>,
 }
 
 /// Canvas change applied to records copied from the file.
 #[derive(Clone, Copy)]
-struct Shift { dx: i32, dy: i32, old_w: f64, old_h: f64, new_w: f64, new_h: f64 }
+/// A point of the old canvas goes to (m[0] x + m[1] y + dx, m[2] x + m[3] y + dy) on the new one: a canvas size
+/// change / crop (translation) and rotations / flips in 90° steps.
+struct Shift { dx: i32, dy: i32, m: [f64; 4], old_w: f64, old_h: f64, new_w: f64, new_h: f64 }
+
+const IDENTITY: [f64; 4] = [1.0, 0.0, 0.0, 1.0];
 
 impl Shift {
-    fn is_none(&self) -> bool { self.dx == 0 && self.dy == 0 && self.old_w == self.new_w && self.old_h == self.new_h }
+    fn is_none(&self) -> bool { self.dx == 0 && self.dy == 0 && self.m == IDENTITY && self.old_w == self.new_w && self.old_h == self.new_h }
+    /// pixels are rearranged (not only moved)
+    fn turns(&self) -> bool { self.m != IDENTITY }
+    fn pt(&self, x: f64, y: f64) -> (f64, f64) {
+        (self.m[0] * x + self.m[1] * y + self.dx as f64, self.m[2] * x + self.m[3] * y + self.dy as f64)
+    }
 }
 
-fn shift_rect(r: &mut [u8], dx: i32, dy: i32) {
+/// a rectangle (top, left, bottom, right as i32) moved / turned
+fn shift_rect(r: &mut [u8], s: Shift) {
     let v: Vec<i32> = (0..4).map(|i| i32::from_be_bytes(r[i * 4..i * 4 + 4].try_into().unwrap())).collect();
     if v.iter().all(|&x| x == 0) { return; } // empty layer
-    let n = [v[0] + dy, v[1] + dx, v[2] + dy, v[3] + dx];
+    let (x0, y0) = s.pt(v[1] as f64, v[0] as f64);
+    let (x1, y1) = s.pt(v[3] as f64, v[2] as f64);
+    let n = [y0.min(y1).round() as i32, x0.min(x1).round() as i32, y0.max(y1).round() as i32, x0.max(x1).round() as i32];
     for i in 0..4 { r[i * 4..i * 4 + 4].copy_from_slice(&n[i].to_be_bytes()); }
 }
 
-/// adds (dx, dy) to the x / y pairs of a descriptor list of doubles: `key` (as encoded: u32 length 0 + 4 chars, or
+/// width / height of a rectangle (top, left, bottom, right)
+fn rect_size(r: &[u8]) -> (usize, usize) {
+    if r.len() < 16 { return (0, 0); }
+    let v: Vec<i32> = (0..4).map(|i| i32::from_be_bytes(r[i * 4..i * 4 + 4].try_into().unwrap())).collect();
+    ((v[3] - v[1]).max(0) as usize, (v[2] - v[0]).max(0) as usize)
+}
+
+/// A w x h plane turned by the linear part of `s` (90° steps / flips). Returns the plane and its new size.
+fn turn_plane(old: &[u8], w: usize, h: usize, s: &Shift) -> (Vec<u8>, usize, usize) {
+    let [a, b, c, d] = s.m;
+    let (nw, nh) = if a == 0.0 { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; nw * nh];
+    if w == 0 || h == 0 { return (out, nw, nh); }
+    let (wf, hf) = (w as f64, h as f64);
+    let umin = [0.0, a * wf, b * hf, a * wf + b * hf].into_iter().fold(f64::MAX, f64::min);
+    let vmin = [0.0, c * wf, d * hf, c * wf + d * hf].into_iter().fold(f64::MAX, f64::min);
+    for y in 0..h {
+        let fy = y as f64 + 0.5;
+        for x in 0..w {
+            let fx = x as f64 + 0.5;
+            let u = (a * fx + b * fy - umin) as usize;
+            let v = (c * fx + d * fy - vmin) as usize;
+            out[v.min(nh - 1) * nw + u.min(nw - 1)] = old[y * w + x];
+        }
+    }
+    (out, nw, nh)
+}
+
+/// One channel's image data (compression + data) decoded to w x h bytes (8 bit).
+fn decode_channel(d: &[u8], w: usize, h: usize, psb: bool) -> Result<Vec<u8>, String> {
+    let mut out = vec![0u8; w * h];
+    if w == 0 || h == 0 { return Ok(out); }
+    if d.len() < 2 { return err("channel data too short"); }
+    match u16::from_be_bytes([d[0], d[1]]) {
+        0 => {
+            if d.len() < 2 + w * h { return err("raw channel data too short"); }
+            out.copy_from_slice(&d[2..2 + w * h]);
+        }
+        1 => {
+            let cb = if psb { 4 } else { 2 };
+            if d.len() < 2 + h * cb { return err("RLE row table too short"); }
+            let mut o = 2 + h * cb;
+            for y in 0..h {
+                let n = if psb { u32::from_be_bytes(d[2 + y * 4..6 + y * 4].try_into().unwrap()) as usize } else { u16::from_be_bytes([d[2 + y * 2], d[3 + y * 2]]) as usize };
+                if o + n > d.len() { return err("RLE channel data too short"); }
+                unpack_bits(&d[o..o + n], &mut out[y * w..(y + 1) * w])?;
+                o += n;
+            }
+        }
+        c @ (2 | 3) => {
+            let mut z = flate2::read::ZlibDecoder::new(&d[2..]);
+            let mut v = Vec::with_capacity(w * h);
+            z.read_to_end(&mut v).map_err(|e| format!("ZIP channel: {e}"))?;
+            if v.len() < w * h { return err("ZIP channel data too short"); }
+            out.copy_from_slice(&v[..w * h]);
+            if c == 3 { for y in 0..h { for x in 1..w { out[y * w + x] = out[y * w + x].wrapping_add(out[y * w + x - 1]); } } }
+        }
+        c => return err(format!("channel compression {c} is not supported")),
+    }
+    Ok(out)
+}
+
+/// size of channel `id` of a record: the layer rectangle, the mask rectangle (-2) or the real mask rectangle (-3)
+fn channel_size(r: &Record, id: i16) -> (usize, usize) {
+    let n = r.mask.len();
+    match id {
+        -2 => if n >= 18 { rect_size(&r.mask[0..16]) } else { (0, 0) },
+        -3 => if n >= 36 { rect_size(&r.mask[n - 16..n]) } else { (0, 0) },
+        _ => rect_size(&r.rect),
+    }
+}
+
+/// moves / turns the x / y pairs of a descriptor list of doubles: `key` (as encoded: u32 length 0 + 4 chars, or
 /// u32 length + chars) followed by "VlLs", count and "doub" items
-fn shift_doubles_after(d: &mut [u8], key: &[u8], dx: f64, dy: f64) {
+fn shift_doubles_after(d: &mut [u8], key: &[u8], s: Shift) {
     let mut from = 0;
     while let Some(i) = d[from..].windows(key.len() + 4).position(|w| &w[..key.len()] == key && &w[key.len()..] == b"VlLs") {
         let mut o = from + i + key.len() + 4;
         if o + 4 > d.len() { return; }
         let n = u32::from_be_bytes(d[o..o + 4].try_into().unwrap()) as usize;
         o += 4;
-        for k in 0..n {
-            if o + 12 > d.len() || &d[o..o + 4] != b"doub" { break; }
-            let v = f64::from_be_bytes(d[o + 4..o + 12].try_into().unwrap()) + if k % 2 == 0 { dx } else { dy };
-            d[o + 4..o + 12].copy_from_slice(&v.to_be_bytes());
-            o += 12;
+        // x, y pairs
+        for _ in 0..n / 2 {
+            if o + 24 > d.len() || &d[o..o + 4] != b"doub" || &d[o + 12..o + 16] != b"doub" { break; }
+            let x = f64::from_be_bytes(d[o + 4..o + 12].try_into().unwrap());
+            let y = f64::from_be_bytes(d[o + 16..o + 24].try_into().unwrap());
+            let (nx, ny) = s.pt(x, y);
+            d[o + 4..o + 12].copy_from_slice(&nx.to_be_bytes());
+            d[o + 16..o + 24].copy_from_slice(&ny.to_be_bytes());
+            o += 24;
         }
         from = o;
     }
@@ -134,37 +226,44 @@ impl Record {
     /// Moves this (file) layer for a canvas size change: pixel and mask rectangles, smart object placement,
     /// text position and vector mask points (stored as fractions of the document size).
     fn shift(&mut self, s: Shift) {
-        let (dx, dy) = (s.dx, s.dy);
-        shift_rect(&mut self.rect, dx, dy);
+        shift_rect(&mut self.rect, s);
         if self.mask.len() >= 18 {
-            shift_rect(&mut self.mask[0..16], dx, dy);
+            shift_rect(&mut self.mask[0..16], s);
             if self.mask.len() >= 36 {
                 let n = self.mask.len();
-                shift_rect(&mut self.mask[n - 16..n], dx, dy);
+                shift_rect(&mut self.mask[n - 16..n], s);
             }
         }
+        // a live shape's origin data (rectangle / ellipse parameters) is not turned: without it the shape stays a path
+        if s.turns() { self.blocks.retain(|b| &b.key != b"vogk"); }
         for b in &mut self.blocks {
             let d = &mut b.data;
             match &b.key {
                 b"PlLd" if d.len() > 9 && &d[0..4] == b"plcL" => {
+                    // the four corners (x, y)
                     let o = 8 + 1 + d[8] as usize + 16;
-                    for k in 0..8 {
-                        let p = o + k * 8;
-                        if p + 8 > d.len() { break; }
-                        let v = f64::from_be_bytes(d[p..p + 8].try_into().unwrap()) + if k % 2 == 0 { dx as f64 } else { dy as f64 };
-                        d[p..p + 8].copy_from_slice(&v.to_be_bytes());
+                    for k in 0..4 {
+                        let p = o + k * 16;
+                        if p + 16 > d.len() { break; }
+                        let x = f64::from_be_bytes(d[p..p + 8].try_into().unwrap());
+                        let y = f64::from_be_bytes(d[p + 8..p + 16].try_into().unwrap());
+                        let (nx, ny) = s.pt(x, y);
+                        d[p..p + 8].copy_from_slice(&nx.to_be_bytes());
+                        d[p + 8..p + 16].copy_from_slice(&ny.to_be_bytes());
                     }
                 }
                 b"SoLd" | b"SoLE" => {
-                    shift_doubles_after(d, b"\0\0\0\0Trnf", dx as f64, dy as f64);
-                    shift_doubles_after(d, b"\0\0\0\x12nonAffineTransform", dx as f64, dy as f64);
+                    shift_doubles_after(d, b"\0\0\0\0Trnf", s);
+                    shift_doubles_after(d, b"\0\0\0\x12nonAffineTransform", s);
                 }
                 b"TySh" if d.len() >= 50 => {
-                    for (k, delta) in [(4usize, dx as f64), (5, dy as f64)] {
-                        let p = 2 + k * 8;
-                        let v = f64::from_be_bytes(d[p..p + 8].try_into().unwrap()) + delta;
-                        d[p..p + 8].copy_from_slice(&v.to_be_bytes());
-                    }
+                    // text transform xx, xy, yx, yy, tx, ty: a text point p goes to (xx px + yx py + tx, xy px + yy py + ty)
+                    let g = |k: usize| f64::from_be_bytes(d[2 + k * 8..10 + k * 8].try_into().unwrap());
+                    let (xx, xy, yx, yy, tx, ty) = (g(0), g(1), g(2), g(3), g(4), g(5));
+                    let [a, b, c, e] = s.m;
+                    let (ntx, nty) = s.pt(tx, ty);
+                    let nv = [a * xx + b * xy, c * xx + e * xy, a * yx + b * yy, c * yx + e * yy, ntx, nty];
+                    for (k, v) in nv.iter().enumerate() { d[2 + k * 8..10 + k * 8].copy_from_slice(&v.to_be_bytes()); }
                 }
                 b"vmsk" | b"vsms" if d.len() >= 8 => {
                     // path records (26 bytes) after version + flags; knots hold 3 points (y, x) as 8.24 fractions
@@ -172,12 +271,14 @@ impl Record {
                     while o + 26 <= d.len() {
                         let sel = u16::from_be_bytes([d[o], d[o + 1]]);
                         if matches!(sel, 1 | 2 | 4 | 5) {
-                            for k in 0..6 {
-                                let p = o + 2 + k * 4;
-                                let f = i32::from_be_bytes(d[p..p + 4].try_into().unwrap()) as f64 / 16777216.0;
-                                let (old, new, delta) = if k % 2 == 0 { (s.old_h, s.new_h, dy) } else { (s.old_w, s.new_w, dx) };
-                                let nf = (f * old + delta as f64) / new;
-                                d[p..p + 4].copy_from_slice(&((nf * 16777216.0).round() as i32).to_be_bytes());
+                            // three points (y, x) as fractions of the document size
+                            for k in 0..3 {
+                                let p = o + 2 + k * 8;
+                                let fy = i32::from_be_bytes(d[p..p + 4].try_into().unwrap()) as f64 / 16777216.0;
+                                let fx = i32::from_be_bytes(d[p + 4..p + 8].try_into().unwrap()) as f64 / 16777216.0;
+                                let (nx, ny) = s.pt(fx * s.old_w, fy * s.old_h);
+                                d[p..p + 4].copy_from_slice(&((ny / s.new_h * 16777216.0).round() as i32).to_be_bytes());
+                                d[p + 4..p + 8].copy_from_slice(&((nx / s.new_w * 16777216.0).round() as i32).to_be_bytes());
                             }
                         }
                         o += 26;
@@ -653,6 +754,8 @@ struct Builder<'a> {
     divider_of: HashMap<usize, usize>,
     next_layer_id: u32,
     out: Vec<(Record, Data)>,
+    /// the source file, to read channels that are turned (rotation / flip)
+    file: Option<File>,
 }
 
 impl<'a> Builder<'a> {
@@ -675,10 +778,49 @@ impl<'a> Builder<'a> {
                 }
             }
         }
-        Ok(Builder { src, pixels: &[], shift: None, by_id, divider_of, next_layer_id: max_id + 1, out: vec![] })
+        Ok(Builder { src, pixels: &[], shift: None, by_id, divider_of, next_layer_id: max_id + 1, out: vec![], file: None })
     }
 
     fn layer_count(&self) -> u32 { self.by_id.len() as u32 }
+
+    /// The channels of file record `orig` selected by `keep`, in file order: copied as is, or (the document is turned)
+    /// decoded, turned and written again (RLE).
+    fn kept(&mut self, orig: &Record, keep: impl Fn(i16) -> bool) -> Result<(Vec<(i16, u64)>, Vec<Part>), String> {
+        let turn = self.shift.filter(|s| s.turns());
+        let psb = self.src.psb;
+        let (mut chans, mut parts) = (vec![], vec![]);
+        let mut off = orig.data_off;
+        for &(id, len) in &orig.channels {
+            if keep(id) {
+                match turn {
+                    Some(s) => {
+                        let f = self.file.as_mut().ok_or("source file not open")?;
+                        let raw = read_at(f, off, len as usize)?;
+                        let (w, h) = channel_size(orig, id);
+                        let plane = decode_channel(&raw, w, h, psb)?;
+                        let (np, nw, nh) = turn_plane(&plane, w, h, &s);
+                        let enc = encode_gray(&np, nw, nh, psb);
+                        chans.push((id, enc.len() as u64));
+                        parts.push(Part::Bytes(enc));
+                    }
+                    None => { chans.push((id, len)); parts.push(Part::Copy(off, len)); }
+                }
+            }
+            off += len;
+        }
+        Ok((chans, parts))
+    }
+
+    /// a file record copied whole: its channel data (turned when the document is)
+    fn copied(&mut self, rec: &mut Record, orig: &Record) -> Result<Data, String> {
+        if self.shift.map_or(false, |s| s.turns()) && !orig.channels.is_empty() {
+            let (c, p) = self.kept(orig, |_| true)?;
+            rec.channels = c;
+            Ok(Data::Mixed(p))
+        } else {
+            Ok(Data::Copy(orig.data_off, orig.data_len))
+        }
+    }
 
     fn new_layer_id(&mut self) -> Vec<u8> {
         let id = self.next_layer_id;
@@ -751,10 +893,11 @@ impl<'a> Builder<'a> {
                     }
                 }
                 self.emit(q.children.as_deref().unwrap_or(&[]))?;
+                let src = self.src;
                 let (mut rec, data) = match src_index {
                     Some(i) => {
-                        let r = self.src.records[i].clone();
-                        let d = Data::Copy(r.data_off, r.data_len);
+                        let mut r = src.records[i].clone();
+                        let d = self.copied(&mut r, &src.records[i])?; // a group mask turns with the document
                         (r, d)
                     }
                     None => (Record::empty(0x18), Data::Empty),
@@ -768,14 +911,12 @@ impl<'a> Builder<'a> {
             } else if src_index.is_some() && (q.raster || q.mask_edited) {
                 // a layer of the file with new pixels and / or a new layer mask (edited in the app): its record (name,
                 // effects, smart object data ...) stays; the replaced channels are written, the others copied
-                let mut rec = self.src.records[src_index.unwrap()].clone();
+                let src = self.src;
+                let orig = &src.records[src_index.unwrap()];
+                let mut rec = orig.clone();
                 if let Some(s) = self.shift { rec.shift(s); }
                 let mut chans: Vec<(i16, u64)> = vec![];
                 let mut parts: Vec<Part> = vec![];
-                // the file's channels: their data lies one after the other from data_off
-                let mut file_chans = vec![];
-                let mut off = rec.data_off;
-                for &(id, len) in &rec.channels { file_chans.push((id, off, len)); off += len; }
                 if q.raster {
                     let p = q.pixels.as_ref().ok_or("raster layer without pixels")?;
                     let (w, h) = (p.w as usize, p.h as usize);
@@ -798,7 +939,9 @@ impl<'a> Builder<'a> {
                     rect[12..16].copy_from_slice(&(p.x + p.w as i32).to_be_bytes());
                     rec.rect = rect;
                 } else {
-                    for &(id, o, len) in &file_chans { if id >= -1 { chans.push((id, len)); parts.push(Part::Copy(o, len)); } }
+                    let (c, p) = self.kept(orig, |id| id >= -1)?;
+                    chans.extend(c);
+                    parts.extend(p);
                 }
                 if q.mask_edited {
                     match &q.mask_pixels {
@@ -814,7 +957,9 @@ impl<'a> Builder<'a> {
                         None => rec.mask = vec![],
                     }
                 } else {
-                    for &(id, o, len) in &file_chans { if id < -1 { chans.push((id, len)); parts.push(Part::Copy(o, len)); } }
+                    let (c, p) = self.kept(orig, |id| id < -1)?;
+                    chans.extend(c);
+                    parts.extend(p);
                 }
                 rec.channels = chans;
                 if q.dup {
@@ -863,10 +1008,11 @@ impl<'a> Builder<'a> {
                 self.apply(&mut rec, q)?;
                 self.out.push((rec, data));
             } else {
+                let src = self.src;
                 let (mut rec, data) = match src_index {
                     Some(i) => {
-                        let r = self.src.records[i].clone();
-                        let d = Data::Copy(r.data_off, r.data_len);
+                        let mut r = src.records[i].clone();
+                        let d = self.copied(&mut r, &src.records[i])?;
                         (r, d)
                     }
                     None => (Record::empty(0x08), Data::Empty),
@@ -1007,9 +1153,14 @@ fn shift_guides(block: &[u8], s: Shift) -> Vec<u8> {
     for i in 0..n {
         let o = data + 16 + i * 5;
         if o + 5 > b.len() { break; }
-        let v = i32::from_be_bytes(b[o..o + 4].try_into().unwrap());
-        let d = if b[o + 4] == 0 { s.dx } else { s.dy }; // 0 = vertical guide (x)
-        b[o..o + 4].copy_from_slice(&(v + d * 32).to_be_bytes());
+        let v = i32::from_be_bytes(b[o..o + 4].try_into().unwrap()) as f64 / 32.0;
+        // 0 = vertical guide (x = v), 1 = horizontal (y = v); a quarter turn makes one the other
+        let [a, bb, c, d] = s.m;
+        let (nv, vertical) = if b[o + 4] == 0 {
+            if bb == 0.0 && a != 0.0 { (a * v + s.dx as f64, true) } else { (c * v + s.dy as f64, false) }
+        } else if c == 0.0 && d != 0.0 { (d * v + s.dy as f64, false) } else { (bb * v + s.dx as f64, true) };
+        b[o..o + 4].copy_from_slice(&((nv * 32.0).round() as i32).to_be_bytes());
+        b[o + 4] = if vertical { 0 } else { 1 };
     }
     b
 }
@@ -1026,11 +1177,10 @@ fn extra_rows(f: &mut File, src: &Source, first: usize, canvas: Option<(Shift, u
             for (y, r) in plane.iter().enumerate() { unpack_bits(r, &mut old[y * w..(y + 1) * w])?; }
             let mut new = vec![0u8; nw * nh];
             for y in 0..h {
-                let ny = y as i64 + s.dy as i64;
-                if ny < 0 || ny >= nh as i64 { continue; }
                 for x in 0..w {
-                    let nx = x as i64 + s.dx as i64;
-                    if nx >= 0 && nx < nw as i64 { new[ny as usize * nw + nx as usize] = old[y * w + x]; }
+                    let (fx, fy) = s.pt(x as f64 + 0.5, y as f64 + 0.5);
+                    let (nx, ny) = (fx.floor() as i64, fy.floor() as i64);
+                    if nx >= 0 && nx < nw as i64 && ny >= 0 && ny < nh as i64 { new[ny as usize * nw + nx as usize] = old[y * w + x]; }
                 }
             }
             for y in 0..nh {
@@ -1213,7 +1363,7 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         let mut f = File::open(&req.src).map_err(|e| format!("{}: {e}", req.src))?;
         let src = parse(&mut f)?;
         let shift = Shift {
-            dx: req.offset_x, dy: req.offset_y,
+            dx: req.offset_x, dy: req.offset_y, m: req.xform.unwrap_or(IDENTITY),
             old_w: src.width as f64, old_h: src.height as f64, new_w: req.width as f64, new_h: req.height as f64,
         };
         if src.psb != is_psb_path(&req.dst) {
@@ -1222,6 +1372,11 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         let mut b = Builder::new(&src)?;
         b.pixels = pixels;
         if !shift.is_none() { b.shift = Some(shift); }
+        if shift.turns() {
+            let depth = u16::from_be_bytes([src.header[22], src.header[23]]);
+            if depth != 8 { return err("8 bit 以外の文書の回転・反転は未対応です"); }
+            b.file = Some(File::open(&req.src).map_err(|e| format!("{}: {e}", req.src))?);
+        }
         if b.layer_count() != req.layer_count {
             return err(format!(
                 "ファイルのレイヤー数（{}）が読み込み時（{}）と違います。読み込んだ後にファイルが変更された可能性があります（F5 で読み直してください）",

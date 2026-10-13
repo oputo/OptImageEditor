@@ -273,14 +273,6 @@
   async function transformDoc(tr: DocTransform) {
     const t = active;
     if (!t?.meta || !(await layersOf(t))) return;
-    const { rasterize, blocker } = vs.transformIssues(t);
-    if (blocker) { await infoDialog(blocker); return; }
-    if (rasterize.length) {
-      const list = rasterize.slice(0, 12).map((n) => `・${n}`).join("\n") + (rasterize.length > 12 ? `\n…ほか ${rasterize.length - 12} 個` : "");
-      const c = await choose(`次のレイヤーはラスタライズされます（テキストやスマートオブジェクトとして編集できなくなります）。\n\n${list}`,
-        [`ラスタライズして実行（${TRANSFORM_LABEL[tr]}）`, "キャンセル"]);
-      if (c !== 0) return;
-    }
     const m = vs.transform(t, tr);
     showToast(m ?? `画像を${tr === "fh" || tr === "fv" ? "反転" : "回転"}しました（${TRANSFORM_LABEL[tr]}）`);
   }
