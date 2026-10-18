@@ -30,7 +30,7 @@ class PaintState {
       if (s.fg) this.fg = s.fg;
       if (s.bg) this.bg = s.bg;
       for (const t of Object.keys(DEFAULTS) as PaintTool[]) Object.assign(this.params[t], s.params?.[t] ?? {});
-      // settings saved before the tools had their own (3-b, bf22fcc)
+      // settings saved before the tools had their own (3-b, daa6fab)
       if (!s.params) {
         if (s.size) this.params.brush.size = s.size;
         if (s.eraserSize) this.params.eraser.size = s.eraserSize;
