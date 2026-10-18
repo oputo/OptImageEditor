@@ -11,7 +11,6 @@ Google ドライブで `liboptimageeditor_lib.rlib` に「一部のファイル�
 - リポジトリは `D:\google\github\` にあり、`D:\google` は Google ドライブと同期されている。
 - Rust / Tauri のビルド生成物 `app/src-tauri/target/`（約 4.9GB、約 4,900 ファイル）も同期対象になっていた。`.gitignore` は Git にしか効かず、Drive の同期対象からは外せない。
 - ビルドのたびに約 264MB の `.rlib` が書き換わり、アップロードの途中で内容が変わる。その結果 `RegisterUpload Content fields don't match` / `ITEM_UPLOAD_ALREADY_IN_PROGRESS` の状態で競合していた。
-- 調査メモの原本: `D:\google\AI_local\ChatGPT\Create\sessions\2026-10-07-optimageeditor-drive-sync.md`
 
 ### 対策
 

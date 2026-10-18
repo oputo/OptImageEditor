@@ -1,9 +1,9 @@
 # OptImageEditor
 
-軽量な画像ビューワー兼エディタ（PSD / PNG / JPG）。Photoshop のうち自分が使う機能だけを持ち、ローカル AI（ComfyUI）と密に連携することを目指す。
+軽量な画像ビューワー兼エディタ（PSD / PNG / JPG / WebP / EXR / HDR）。Photoshop のうち作者が使う機能だけを持ち、ローカル AI（ComfyUI）と連携することを目指す個人開発のツール。Windows 向け。
 
-- 状態: フェーズ 0（技術検証）。PSD 入出力と表示性能の検証は合格（改修版 ag-psd + Tauri 2）。600MB 級の PSD を 0.2〜0.4 秒で表示
-- 技術構成（検証中）: Tauri 2 + TypeScript + ag-psd + WebGL2 / WebGPU（T 案）。結果が悪ければ Rust 中核の R 案に切り替える
+- 状態: 開発中（未リリース）。ビューワー、PSD のレイヤー表示・編集・保存、選択範囲・レイヤーマスク、ペイント、切り抜き・回転（スマートオブジェクトをラスタライズせずに回転）、ComfyUI 連携（背景除去・指示で編集）まで実装済み
+- 技術構成: Tauri 2 + Svelte 5 + TypeScript + ag-psd（patch-package で改修）+ WebGL2。Rust 側で PSD の高速デコード・保存、EXR / HDR のデコードを行う
 
 ## アプリ
 
@@ -15,7 +15,9 @@
 |---|---|
 | `docs/mvp_plan.md` | MVP 計画とフェーズ分け、技術構成の比較 |
 | `docs/ps_feature_inventory.md` | Photoshop 機能の棚卸し（使用頻度と難度） |
-| `docs/psd_samples_findings.md` | サンプル PSD の解析結果 |
+| `docs/psd_samples_findings.md` | サンプル PSD の解析結果、合成と保存の知見 |
+| `docs/perf_ipc.md` | 読み込み性能と Rust ⇄ WebView の受け渡しの計測 |
+| `docs/build_env.md` | ビルド環境（ビルド生成物の置き場所） |
 
 ## 検証（spike）
 
@@ -33,6 +35,10 @@
 - **配布するアプリ（インストーラ・実行ファイル）**: [利用規約](EULA.md)に従います。配布者から直接受け取った方は、業務での利用も可能です。
 - **サードパーティ**: 依存ライブラリはそれぞれのライセンスに従います（[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）。`app/patches/` の ag-psd 改変部分は、ag-psd の MIT License にも従います。
 - 商用利用のライセンスについては、作者（info@oputo.com）にお問い合わせください。
+
+## 開発への参加について
+
+個人で開発しているため、外部からのプルリクエストは受け付けていません。不具合の報告や要望は Issue で受け付けることがありますが、対応は約束できません。
 
 ## 商標
 

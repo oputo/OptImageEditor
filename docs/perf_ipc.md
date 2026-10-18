@@ -1,6 +1,6 @@
 # 読み込み経路の性能メモ（2026-10-06）
 
-## 計測（DSC02987.psd、676MB / 統合画像部分 81.6MB、Windows + WebView2）
+## 計測（サンプル A、676MB / 統合画像部分 81.6MB、Windows + WebView2）
 
 | 経路 | ディスク読み込み（Rust 側） | WebView に届くまで（read file） | PSD のデコード | 合計 |
 |---|---|---|---|---|
@@ -51,5 +51,5 @@
 
 ## EXR / HDR（フェーズ 1-e、2026-10-07）
 
-- Radiance .hdr（skyDome.hdr、4096×2004、24.4MB、RLE）: デコード 44ms（Rust、dev ビルド）、往復 58ms、GPU 転送 38ms（RGBA16F + ミップマップ）、合計 **101ms**。経路は共有メモリ。
+- Radiance .hdr（4096×2004、24.4MB、RLE）: デコード 44ms（Rust、dev ビルド）、往復 58ms、GPU 転送 38ms（RGBA16F + ミップマップ）、合計 **101ms**。経路は共有メモリ。
 - GPU 上のサイズは 1 画素 8 バイト（RGBA16F）。この画像で約 84MB（ミップマップ込み）。

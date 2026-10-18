@@ -19,7 +19,7 @@ python compare_extra.py <orig.psd> out/<name>.rt.psd   # スマートオブジ�
 
 ## 結果（既存サンプル 3 本）
 
-対象: `_tmp/test_text_1.psd`、`_tmp/test_alpha_1.psd`、grayObject の `Alarm Clock Mage-Flow.psd`
+対象: `_tmp/test_text_1.psd`、`_tmp/test_alpha_1.psd`、別ツールのパイプライン出力の PSD 1 本
 
 ### 問題なかったもの（事実）
 
