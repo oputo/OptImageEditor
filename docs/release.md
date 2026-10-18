@@ -92,4 +92,4 @@ powershell -ExecutionPolicy Bypass -File tools\release.ps1 -Version 0.2.0
 ## 配布前に済ませること
 
 - ~~ComfyUI との通信を Rust 側経由にする~~（済み。ComfyUI 側の `--enable-cors-header` は不要になった）
-- ~~自動アップデートの組み込み~~（済み。残り: 署名鍵の作成と公開鍵の設定）
+- ~~自動アップデートの組み込み~~（済み。署名鍵は 2026-10-18 に作成、公開鍵の ID は `2AC27777A4CB0174`）
