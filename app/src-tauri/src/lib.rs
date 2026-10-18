@@ -1,4 +1,5 @@
 // OptImageEditor — Rust side.
+mod comfy;
 mod composite;
 mod hdr;
 mod psd_save;
@@ -630,6 +631,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .manage(comfy::ComfyWs::default())
         .on_window_event(|window, event| {
             use std::sync::atomic::Ordering::SeqCst;
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -664,7 +666,10 @@ pub fn run() {
             list_images,
             startup_paths,
             register_open_with,
-            open_default_apps_settings
+            open_default_apps_settings,
+            comfy::comfy_http,
+            comfy::comfy_ws_open,
+            comfy::comfy_ws_close
         ])
         .run(context)
         .expect("error while running tauri application");

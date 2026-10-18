@@ -41,5 +41,5 @@ Tauri 2 の updater プラグインを使う予定。最初に配布するビル
 
 ## 配布前に済ませること
 
-- ComfyUI との通信を Rust 側経由にする（ComfyUI 側の `--enable-cors-header *` を不要にする）
+- ~~ComfyUI との通信を Rust 側経由にする~~（済み。ComfyUI 側の `--enable-cors-header` は不要になった）
 - 自動アップデートの組み込み

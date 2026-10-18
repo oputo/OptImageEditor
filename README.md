@@ -31,14 +31,12 @@
 
 - `tools/psd_scan.py` — PSD のレイヤー構成と機能の使用状況を集計する（`pip install psd-tools`）
 
-## ComfyUI 連携について（注意）
+## ComfyUI 連携について
 
-AI パネルは、アプリの画面（WebView）から ComfyUI に直接接続します。そのため現在は、ComfyUI を `--enable-cors-header` 付きで起動する必要があります。
+AI パネルは、アプリの Rust 側から ComfyUI に HTTP / WebSocket で接続します。ComfyUI を `--enable-cors-header` 付きで起動する必要はありません（以前の版では必要でした。今は外して起動してください）。
 
-- この設定では、ComfyUI を起動しているあいだ、同じ PC のブラウザで開いた**任意の Web サイト**からも ComfyUI を操作できる状態になります（生成の実行、画像や履歴の読み取りなど）。
-- AI パネルを使わないときは ComfyUI を止めるか、このフラグを外して起動してください。`--listen` で LAN に公開している場合は、特に注意してください。
-- 接続元を限定したい場合は `--enable-cors-header http://tauri.localhost` とします（配布用ビルドだけが接続できます。dev ビルド `http://localhost:1420` からは接続できなくなります）。
-- 今後、通信をアプリの Rust 側経由に変更し、このフラグを不要にする予定です。
+- 接続先は AI パネルで設定します（既定は `http://127.0.0.1:18188`）。`http://` のみ対応です（`https://` は未対応）
+- `--listen` で ComfyUI を LAN に公開している場合は、同じネットワークの他の機器からも操作できる状態になる点に注意してください
 
 ## ライセンス
 

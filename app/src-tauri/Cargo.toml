@@ -30,6 +30,11 @@ exr = "1.74"
 half = "2"
 # clipboard image (fallback when the WebView refuses navigator.clipboard.write)
 arboard = { version = "3", default-features = false, features = ["image-data"] }
+# ComfyUI traffic from Rust (src/comfy.rs): plain HTTP and WebSocket only, no TLS
+reqwest = { version = "0.13", default-features = false }
+tokio-tungstenite = "0.30"
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 
 # Windows only: WebView2 SharedBuffer (zero-copy file reads). Versions must match the ones used by tauri/wry.

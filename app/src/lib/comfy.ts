@@ -1,10 +1,13 @@
 // ComfyUI client (phase D, minimal): runs an API-format workflow on a local ComfyUI server and returns its images.
-// The webview talks to ComfyUI directly (ComfyUI runs with --enable-cors-header; the app's CSP is off):
+// In the app, all traffic goes through Rust (src-tauri/src/comfy.rs) so ComfyUI needs no --enable-cors-header
+// (requests from the WebView itself carry an Origin that ComfyUI refuses); in a plain browser (`npm run dev`) the page
+// talks to ComfyUI directly, which does need the flag:
 //   POST /upload/image (the input, always the same name so nothing piles up) -> POST /prompt -> WebSocket /ws
 //   (progress, and the result images of SaveImageWebsocket as binary messages) -> fallback: /history + /view.
 // Workflows are templates with placeholders: the string values "{{image}}", "{{prompt}}", "{{seed}}" are replaced
 // ("{{seed}}" by a number). Built-ins below; a JSON file in the app's config folder (comfy/<kind>.json, exported from
 // ComfyUI with "Export (API)") overrides one.
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { appConfigDir, join } from "@tauri-apps/api/path";
 import { TauriFileSource, isTauri } from "./source";
 
@@ -94,6 +97,114 @@ const PHASE: Record<string, string> = {
   VAEDecode: "デコード", RemoveBackground: "背景除去", SaveImageWebsocket: "受け取り", SaveImage: "受け取り",
 };
 
+// ---------------------------------------------------------------- transport (Rust in the app, direct in a browser)
+
+type HttpInit = { method?: string; body?: Uint8Array; contentType?: string; timeoutMs?: number };
+type HttpResult = { status: number; body: Uint8Array };
+
+/** Rust error strings (comfy.rs `describe`) / browser errors -> "timeout" | "connect" | other */
+class TransportError extends Error {
+  constructor(readonly kind: "timeout" | "connect" | "other", message: string) { super(message); }
+}
+
+async function httpRequest(url: string, init: HttpInit): Promise<HttpResult> {
+  const timeoutMs = init.timeoutMs ?? 10000;
+  if (isTauri()) {
+    const headers: Record<string, string> = { "oie-method": init.method ?? "GET", "oie-url": url, "oie-timeout-ms": String(timeoutMs) };
+    if (init.contentType) headers["oie-content-type"] = init.contentType;
+    let buf: ArrayBuffer;
+    try {
+      buf = await invoke<ArrayBuffer>("comfy_http", init.body ?? new Uint8Array(0), { headers });
+    } catch (e) {
+      const m = String(e);
+      throw new TransportError(m === "timeout" ? "timeout" : m.startsWith("connect") ? "connect" : "other", m);
+    }
+    const u = new Uint8Array(buf);
+    return { status: (u[0] << 8) | u[1], body: u.subarray(2) };
+  }
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      method: init.method ?? "GET", signal: ctl.signal,
+      headers: init.contentType ? { "Content-Type": init.contentType } : undefined,
+      body: init.body ? (init.body as Uint8Array<ArrayBuffer>) : undefined,
+    });
+    return { status: r.status, body: new Uint8Array(await r.arrayBuffer()) };
+  } catch (e) {
+    if ((e as Error).name === "AbortError") throw new TransportError("timeout", "timeout");
+    if (e instanceof TypeError) throw new TransportError("connect", (e as Error).message);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const jsonBody = (v: unknown): HttpInit => ({ body: new TextEncoder().encode(JSON.stringify(v)), contentType: "application/json" });
+
+/** multipart/form-data body + its content type (with the boundary), built by the browser */
+async function formBody(fd: FormData): Promise<HttpInit> {
+  const req = new Request("http://localhost/", { method: "POST", body: fd });
+  return { body: new Uint8Array(await req.arrayBuffer()), contentType: req.headers.get("content-type") ?? undefined };
+}
+
+/** A WebSocket to ComfyUI. Messages that arrive before `onmessage` is set are kept and delivered when it is set. */
+class ComfySocket {
+  onclose: ((reason: string) => void) | null = null;
+  private handler: ((data: string | ArrayBuffer) => void) | null = null;
+  private queue: (string | ArrayBuffer)[] = [];
+  private closeImpl: () => void = () => {};
+
+  set onmessage(h: ((data: string | ArrayBuffer) => void) | null) {
+    this.handler = h;
+    if (h) { const q = this.queue; this.queue = []; for (const d of q) h(d); }
+  }
+
+  private deliver(d: string | ArrayBuffer) {
+    if (this.handler) this.handler(d); else this.queue.push(d);
+  }
+
+  /** resolves once connected; rejects with a TransportError */
+  static async open(url: string): Promise<ComfySocket> {
+    const s = new ComfySocket();
+    if (isTauri()) {
+      const ch = new Channel<ArrayBuffer>();
+      const text = new TextDecoder();
+      ch.onmessage = (buf) => {
+        const u = new Uint8Array(buf);
+        if (u[0] === 0) s.deliver(text.decode(u.subarray(1)));
+        else if (u[0] === 1) s.deliver(buf.slice(1));
+        else s.onclose?.(text.decode(u.subarray(1)));
+      };
+      let id: number;
+      try {
+        id = await invoke<number>("comfy_ws_open", { url, onMessage: ch });
+      } catch (e) {
+        const m = String(e);
+        throw new TransportError(m === "timeout" ? "timeout" : m.startsWith("connect") ? "connect" : "other", m);
+      }
+      s.closeImpl = () => { invoke("comfy_ws_close", { id }).catch(() => {}); };
+      return s;
+    }
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    await new Promise<void>((res, rej) => {
+      ws.onopen = () => res();
+      ws.onerror = () => rej(new TransportError("connect", "WebSocket"));
+    });
+    ws.onmessage = (ev) => s.deliver(ev.data as string | ArrayBuffer);
+    ws.onclose = (ev) => s.onclose?.(ev.reason);
+    s.closeImpl = () => { ws.onclose = null; ws.close(); };
+    return s;
+  }
+
+  close() {
+    this.onclose = null;
+    this.handler = null;
+    this.closeImpl();
+  }
+}
+
 export class AbortedError extends Error { constructor() { super("中止しました"); this.name = "AbortedError"; } }
 
 /** One ComfyUI server (URL kept in localStorage). */
@@ -112,29 +223,33 @@ export class ComfyClient {
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ url: this.url })); } catch { /* storage unavailable */ }
   }
 
-  private async json<T>(path: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  /** one request; transport errors become messages for the user */
+  private async send(path: string, init: HttpInit = {}): Promise<HttpResult> {
     try {
-      const r = await fetch(this.url + path, { ...init, signal: ctl.signal });
-      const text = await r.text();
-      if (!r.ok) {
-        let msg = text;
-        try { const j = JSON.parse(text); msg = j.error?.message ?? j.message ?? text; if (j.node_errors && Object.keys(j.node_errors).length) msg += ": " + describeNodeErrors(j.node_errors); } catch { /* plain text */ }
-        throw new Error(`ComfyUI ${r.status}: ${msg.slice(0, 400)}`);
-      }
-      return (text ? JSON.parse(text) : null) as T;
+      return await httpRequest(this.url + path, init);
     } catch (e) {
-      if ((e as Error).name === "AbortError") throw new Error(`ComfyUI（${this.url}）が応答しません`);
-      if (e instanceof TypeError) throw new Error(`ComfyUI（${this.url}）に接続できません。起動しているか確認してください`);
+      if (e instanceof TransportError) {
+        if (e.kind === "timeout") throw new Error(`ComfyUI（${this.url}）が応答しません`);
+        if (e.kind === "connect") throw new Error(`ComfyUI（${this.url}）に接続できません。起動しているか確認してください`);
+        throw new Error(`ComfyUI（${this.url}）: ${e.message}`);
+      }
       throw e;
-    } finally {
-      clearTimeout(timer);
     }
   }
 
+  private async json<T>(path: string, init: HttpInit = {}): Promise<T> {
+    const r = await this.send(path, init);
+    const text = new TextDecoder().decode(r.body);
+    if (r.status < 200 || r.status >= 300) {
+      let msg = text;
+      try { const j = JSON.parse(text); msg = j.error?.message ?? j.message ?? text; if (j.node_errors && Object.keys(j.node_errors).length) msg += ": " + describeNodeErrors(j.node_errors); } catch { /* plain text */ }
+      throw new Error(`ComfyUI ${r.status}: ${msg.slice(0, 400)}`);
+    }
+    return (text ? JSON.parse(text) : null) as T;
+  }
+
   async info(): Promise<ServerInfo> {
-    const s = await this.json<{ system: { comfyui_version: string }; devices: { name: string; vram_free: number; vram_total: number }[] }>("/system_stats", undefined, 4000);
+    const s = await this.json<{ system: { comfyui_version: string }; devices: { name: string; vram_free: number; vram_total: number }[] }>("/system_stats", { timeoutMs: 4000 });
     const d = s.devices[0];
     return {
       version: s.system.comfyui_version,
@@ -145,7 +260,7 @@ export class ComfyClient {
 
   /** frees the models from VRAM / RAM */
   async free() {
-    await this.json("/free", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ unload_models: true, free_memory: true }) });
+    await this.json("/free", { method: "POST", ...jsonBody({ unload_models: true, free_memory: true }) });
   }
 
   private async upload(png: Blob, name: string): Promise<string> {
@@ -154,7 +269,7 @@ export class ComfyClient {
     fd.append("subfolder", "oie");
     fd.append("type", "input");
     fd.append("overwrite", "true");
-    const r = await this.json<{ name: string; subfolder: string }>("/upload/image", { method: "POST", body: fd }, 120000);
+    const r = await this.json<{ name: string; subfolder: string }>("/upload/image", { method: "POST", ...(await formBody(fd)), timeoutMs: 120000 });
     return r.subfolder ? `${r.subfolder}/${r.name}` : r.name;
   }
 
@@ -171,17 +286,17 @@ export class ComfyClient {
     const prompt = fill(wf, { image, ...values });
 
     // websocket first, so no message of the run is missed
-    const ws = new WebSocket(`${this.url.replace(/^http/, "ws")}/ws?clientId=${this.clientId}`);
-    ws.binaryType = "arraybuffer";
-    await new Promise<void>((res, rej) => {
-      ws.onopen = () => res();
-      ws.onerror = () => rej(new Error(`ComfyUI（${this.url}）の WebSocket に接続できません`));
-    });
+    let ws: ComfySocket;
+    try {
+      ws = await ComfySocket.open(`${this.url.replace(/^http/, "ws")}/ws?clientId=${this.clientId}`);
+    } catch (e) {
+      throw new Error(`ComfyUI（${this.url}）の WebSocket に接続できません${e instanceof TransportError && e.kind === "other" ? `: ${e.message}` : ""}`);
+    }
 
     let promptId: string | null = null;
     try {
       const r = await this.json<{ prompt_id: string; node_errors?: Record<string, unknown> }>("/prompt", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt, client_id: this.clientId }),
+        method: "POST", ...jsonBody({ prompt, client_id: this.clientId }),
       });
       promptId = r.prompt_id;
       report("順番待ち", null);
@@ -190,24 +305,23 @@ export class ComfyClient {
       await new Promise<void>((res, rej) => {
         let current: string | null = null;
         const onAbort = () => {
-          const body = JSON.stringify({ prompt_id: promptId });
-          fetch(this.url + "/queue", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ delete: [promptId] }) }).catch(() => {});
-          fetch(this.url + "/interrupt", { method: "POST", headers: { "Content-Type": "application/json" }, body }).catch(() => {});
+          this.send("/queue", { method: "POST", ...jsonBody({ delete: [promptId] }) }).catch(() => {});
+          this.send("/interrupt", { method: "POST", ...jsonBody({ prompt_id: promptId }) }).catch(() => {});
           rej(new AbortedError());
         };
         signal.addEventListener("abort", onAbort, { once: true });
         ws.onclose = () => rej(new Error("ComfyUI との接続が切れました"));
-        ws.onmessage = (ev) => {
-          if (typeof ev.data !== "string") {
+        ws.onmessage = (data) => {
+          if (typeof data !== "string") {
             // binary: [u32 event][u32 format][image]; only images sent while one of our output nodes runs
-            const v = new DataView(ev.data as ArrayBuffer);
-            if (current && outputs.has(current) && v.getUint32(0) === 1 && v.getUint32(4) === 2) {
-              images.push(new Blob([(ev.data as ArrayBuffer).slice(8)], { type: "image/png" }));
+            const v = new DataView(data);
+            if (current && outputs.has(current) && v.byteLength > 8 && v.getUint32(0) === 1 && v.getUint32(4) === 2) {
+              images.push(new Blob([data.slice(8)], { type: "image/png" }));
             }
             return;
           }
           let m: { type: string; data: Record<string, unknown> };
-          try { m = JSON.parse(ev.data); } catch { return; }
+          try { m = JSON.parse(data); } catch { return; }
           const d = m.data ?? {};
           if (d.prompt_id !== undefined && d.prompt_id !== promptId) return;
           if (m.type === "executing") {
@@ -235,14 +349,13 @@ export class ComfyClient {
       for (const o of Object.values(out)) {
         for (const im of o.images ?? []) {
           const q = new URLSearchParams({ filename: im.filename, subfolder: im.subfolder, type: im.type });
-          const r = await fetch(`${this.url}/view?${q}`);
-          if (r.ok) images.push(await r.blob());
+          const r = await this.send(`/view?${q}`, { timeoutMs: 60000 });
+          if (r.status >= 200 && r.status < 300) images.push(new Blob([r.body as Uint8Array<ArrayBuffer>]));
         }
       }
       if (!images.length) throw new Error("ワークフローが画像を出力しませんでした（SaveImageWebsocket か SaveImage が必要です）");
       return images;
     } finally {
-      ws.onclose = null;
       ws.close();
     }
   }

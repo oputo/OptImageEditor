@@ -9,6 +9,7 @@
 - ウィンドウのタイトルに実行中のビルドの名前（OptImageEditor / OptImageEditor Dev）を表示
 
 ### 変更
+- ComfyUI との通信をアプリの Rust 側経由にした。ComfyUI を `--enable-cors-header` 付きで起動する必要がなくなった（付けている場合は外してよい）
 - 版番号を `package.json` に一本化（`tauri.conf.json` はそれを参照）
 
 ## 0.1.0（未配布）
