@@ -2,8 +2,17 @@
 
 軽量な画像ビューワー兼エディタ（PSD / PNG / JPG / WebP / EXR / HDR）。Photoshop のうち作者が使う機能だけを持ち、ローカル AI（ComfyUI）と連携することを目指す個人開発のツール。Windows 向け。
 
-- 状態: 開発中（未リリース）。ビューワー、PSD のレイヤー表示・編集・保存、選択範囲・レイヤーマスク、ペイント、切り抜き・回転（スマートオブジェクトをラスタライズせずに回転）、ComfyUI 連携（背景除去・指示で編集）まで実装済み
+- 状態: 公開中（Windows 版。開発は継続中）。ビューワー、PSD のレイヤー表示・編集・保存、選択範囲・レイヤーマスク、ペイント、切り抜き・回転（スマートオブジェクトをラスタライズせずに回転）、ComfyUI 連携（背景除去・指示で編集）まで実装済み
 - 技術構成: Tauri 2 + Svelte 5 + TypeScript + ag-psd（patch-package で改修）+ WebGL2。Rust 側で PSD の高速デコード・保存、EXR / HDR のデコードを行う
+
+## ダウンロード
+
+- 最新版: [GitHub Releases](https://github.com/oputo/OptImageEditor/releases/latest) のインストーラ（`OptImageEditor_x.y.z_x64-setup.exe`）
+- 紹介ページ: https://oputo.com/apps/#optimageeditor
+- 対応環境: Windows 10 / 11（64 bit）、WebView2（Windows 11 は標準で搭載）
+- 初回のインストール時に SmartScreen の警告が出ます（コード署名なし）。「詳細情報 → 実行」で進めてください
+- 以後の更新はアプリが起動時に知らせます（ツールバーの「更新 x.y.z」、または「ヘルプ → アップデートを確認」）
+- 変更履歴: `CHANGELOG.md`
 
 ## アプリ
 
