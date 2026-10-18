@@ -18,6 +18,8 @@
 | `docs/psd_samples_findings.md` | サンプル PSD の解析結果、合成と保存の知見 |
 | `docs/perf_ipc.md` | 読み込み性能と Rust ⇄ WebView の受け渡しの計測 |
 | `docs/build_env.md` | ビルド環境（ビルド生成物の置き場所） |
+| `docs/release.md` | リリースの運用（版番号・dev 版と配布版の分離・自動アップデート） |
+| `CHANGELOG.md` | 変更履歴 |
 
 ## 検証（spike）
 

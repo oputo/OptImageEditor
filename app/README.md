@@ -16,9 +16,12 @@ Tauri 2 + Svelte 5 + Vite + TypeScript。現在はフェーズ 2（レイヤー�
 ```powershell
 cd D:\google\github\OptImageEditor\app
 npm install          # postinstall で patches/ の ag-psd 改修が自動で当たる
-npm run tauri dev    # 開発用に起動する
+npm run app          # 開発用に起動する（dev 版: 識別子 com.oputo.optimageeditor.dev、表示名 OptImageEditor Dev）
 npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEditor\release\ に exe、bundle\nsis\ にインストーラ）
 ```
+
+- 開発用の起動は `npm run tauri dev` ではなく `npm run app` を使う。`tauri.dev.conf.json` で識別子を分けるので、インストール済みの配布版と設定・WebView のデータ・多重起動の判定が混ざらない（`npm run tauri dev` で起動するとコンソールに警告が出る）
+- 版番号は `package.json` の `version` が正（`tauri.conf.json` はそれを参照する）。リリースの手順と版番号の運用は `docs/release.md`
 
 - ブラウザだけで UI を確認する場合: `npm run dev` を実行して http://localhost:1420 を開く（ファイルパスに関わる機能は無効）
 - 型チェック: `npm run check`
@@ -138,7 +141,7 @@ npm run tauri build  # 配布用にビルドする（D:\build-cache\OptImageEdit
 - PSD は統合画像だけを表示する。統合画像が無い PSD（PS の「互換性を優先」がオフで保存されたもの）はエラーになる。
 - 16 / 32bit の PSD は、表示用に 8bit へ変換する。
 - `.svelte.ts` のモジュール名は、同じフォルダの `.svelte` コンポーネントと大文字小文字違いで重ねない（Windows ではファイル名の大文字小文字を区別しないため、`./lib/viewer.svelte` が `Viewer.svelte` に解決されてしまう）。
-- 「プログラムから開く」の登録は exe の場所を書き込むので、dev ビルドで登録すると `D:\build-cache\OptImageEditor\debug\optimageeditor.exe` が登録される。配布用ビルドに切り替えたら登録し直す。
+- 「プログラムから開く」の登録は exe の場所を書き込む。dev 版で登録すると、配布版とは別の項目（ProgID `OptImageEditor.Dev.Image`）として `D:\build-cache\OptImageEditor\debug\optimageeditor.exe` が登録される。dev 版は exe 名が同じなので `Applications\optimageeditor.exe` のキーには書き込まない（配布版の登録を上書きしないため）。
 - レイヤー合成（2-a）で描画しないもの: レイヤー効果、調整レイヤー、ベクトルマスク、ブレンド条件（Blend If）、ノックアウト。該当レイヤーにはパネルで ⚠ を表示する。16bit / RGB 以外の PSD はレイヤー表示に未対応
 - 保存時の統合画像はこのアプリの合成結果。⚠ のある要素（レイヤー効果・調整レイヤーなど）は統合画像に入らない（保存前に 1 回確認する）。レイヤー自体は元のまま保存されるので、PS で開けば正しく表示される。PS で開いて保存し直せば統合画像も PS のものになる
 - 保存時に PS の一部の情報（レイヤーの選択状態、レイヤーカンプ等の参照 ID を含むリソース）は書き出さない

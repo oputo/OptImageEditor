@@ -1,4 +1,5 @@
 // Desktop (Tauri) integration. Every function is a no-op / null outside Tauri so the UI also runs in a browser.
+import { getName } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -40,7 +41,16 @@ export async function onNativeDrop(handlers: { over: (on: boolean) => void; drop
   });
 }
 
-export async function setWindowTitle(title: string) {
+let appNameP: Promise<string> | null = null;
+/** productName of the running build ("OptImageEditor", or "OptImageEditor Dev" for `npm run app`). */
+export function appName(): Promise<string> {
+  return (appNameP ??= isTauri() ? getName().catch(() => "OptImageEditor") : Promise.resolve("OptImageEditor"));
+}
+
+/** Window title: "<doc> — <app name>", or just the app name when `doc` is empty. */
+export async function setWindowTitle(doc: string) {
+  const name = await appName();
+  const title = doc ? `${doc} — ${name}` : name;
   if (isTauri()) await getCurrentWindow().setTitle(title);
   else document.title = title;
 }

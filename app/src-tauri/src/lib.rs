@@ -487,17 +487,26 @@ fn file_args(args: impl IntoIterator<Item = String>, cwd: &Path) -> Vec<String> 
         .collect()
 }
 
+/// Development builds run under their own identifier (separate app data, WebView storage and single-instance lock).
+fn is_dev_identifier(identifier: &str) -> bool {
+    identifier.ends_with(".dev")
+}
+
 /// Registers / unregisters the app in Explorer's "Open with" list for `extensions` (HKCU only, no admin rights).
 /// Returns the registered exe path.
+/// Dev builds (identifier ending in ".dev", see tauri.dev.conf.json) use their own ProgID and leave the
+/// shared Applications\optimageeditor.exe key alone, so they never take over the installed build's entry.
 #[tauri::command]
-fn register_open_with(register: bool, extensions: Vec<String>) -> Result<String, String> {
+fn register_open_with(app: tauri::AppHandle, register: bool, extensions: Vec<String>) -> Result<String, String> {
+    use tauri::Manager;
+    let dev = is_dev_identifier(&app.config().identifier);
     #[cfg(windows)]
     {
-        openwith::apply(register, &extensions)
+        openwith::apply(register, &extensions, dev)
     }
     #[cfg(not(windows))]
     {
-        let _ = (register, extensions);
+        let _ = (register, extensions, dev);
         Err("Windows のみ対応".into())
     }
 }
@@ -519,6 +528,7 @@ mod openwith {
     use winreg::{RegKey, RegValue};
 
     const PROG_ID: &str = "OptImageEditor.Image";
+    const PROG_ID_DEV: &str = "OptImageEditor.Dev.Image";
     const APP_KEY: &str = r"Software\Classes\Applications\optimageeditor.exe";
 
     #[link(name = "shell32")]
@@ -527,7 +537,8 @@ mod openwith {
     }
     const SHCNE_ASSOCCHANGED: i32 = 0x0800_0000;
 
-    pub fn apply(register: bool, exts: &[String]) -> Result<String, String> {
+    pub fn apply(register: bool, exts: &[String], dev: bool) -> Result<String, String> {
+        let (prog_id, label) = if dev { (PROG_ID_DEV, "画像 (OptImageEditor Dev)") } else { (PROG_ID, "画像 (OptImageEditor)") };
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let exe = exe.to_string_lossy().to_string();
         let exe = exe.strip_prefix(r"\\?\").unwrap_or(&exe).to_string();
@@ -536,8 +547,8 @@ mod openwith {
         let command = format!("\"{exe}\" \"%1\"");
         if register {
             // ProgID with icon and open command
-            let (k, _) = hkcu.create_subkey(format!(r"Software\Classes\{PROG_ID}")).map_err(err)?;
-            k.set_value("", &"画像 (OptImageEditor)").map_err(err)?;
+            let (k, _) = hkcu.create_subkey(format!(r"Software\Classes\{prog_id}")).map_err(err)?;
+            k.set_value("", &label).map_err(err)?;
             let (icon, _) = k.create_subkey("DefaultIcon").map_err(err)?;
             icon.set_value("", &format!("\"{exe}\",0")).map_err(err)?;
             let (cmd, _) = k.create_subkey(r"shell\open\command").map_err(err)?;
@@ -545,9 +556,14 @@ mod openwith {
             // .ext\OpenWithProgids -> ProgID (REG_NONE, like Explorer itself writes)
             for e in exts {
                 let (ow, _) = hkcu.create_subkey(format!(r"Software\Classes\.{e}\OpenWithProgids")).map_err(err)?;
-                ow.set_raw_value(PROG_ID, &RegValue { bytes: Cow::Borrowed(&[]), vtype: RegType::REG_NONE }).map_err(err)?;
+                ow.set_raw_value(prog_id, &RegValue { bytes: Cow::Borrowed(&[]), vtype: RegType::REG_NONE }).map_err(err)?;
             }
-            // Applications\optimageeditor.exe: friendly name + supported types for the "Open with" dialog
+            // Applications\optimageeditor.exe: friendly name + supported types for the "Open with" dialog.
+            // The dev build has the same exe name, so it must not overwrite the installed build's key.
+            if dev {
+                unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, 0, std::ptr::null(), std::ptr::null()) };
+                return Ok(exe);
+            }
             let (app, _) = hkcu.create_subkey(APP_KEY).map_err(err)?;
             app.set_value("FriendlyAppName", &"OptImageEditor").map_err(err)?;
             let (st, _) = app.create_subkey("SupportedTypes").map_err(err)?;
@@ -557,11 +573,13 @@ mod openwith {
             let (cmd, _) = app.create_subkey(r"shell\open\command").map_err(err)?;
             cmd.set_value("", &command).map_err(err)?;
         } else {
-            let _ = hkcu.delete_subkey_all(format!(r"Software\Classes\{PROG_ID}"));
-            let _ = hkcu.delete_subkey_all(APP_KEY);
+            let _ = hkcu.delete_subkey_all(format!(r"Software\Classes\{prog_id}"));
+            if !dev {
+                let _ = hkcu.delete_subkey_all(APP_KEY);
+            }
             for e in exts {
                 if let Ok(ow) = hkcu.open_subkey_with_flags(format!(r"Software\Classes\.{e}\OpenWithProgids"), KEY_SET_VALUE) {
-                    let _ = ow.delete_value(PROG_ID);
+                    let _ = ow.delete_value(prog_id);
                 }
             }
         }
@@ -595,6 +613,11 @@ fn close_ack(seq: u64) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::{Emitter, Manager};
+    let context = tauri::generate_context!();
+    if cfg!(debug_assertions) && !is_dev_identifier(&context.config().identifier) {
+        // `npm run tauri dev` shares app data and the single-instance lock with the installed build
+        eprintln!("warning: debug build with the release identifier; use `npm run app` (tauri.dev.conf.json)");
+    }
     tauri::Builder::default()
         // must be the first plugin: a second launch forwards its files to this window (opened as tabs) and exits
         .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
@@ -644,7 +667,7 @@ pub fn run() {
             register_open_with,
             open_default_apps_settings
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 

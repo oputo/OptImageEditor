@@ -2575,8 +2575,8 @@ export class ViewerState {
 
   updateTitle() {
     const t = this.active;
-    if (!t) { setWindowTitle("OptImageEditor"); return; }
+    if (!t) { setWindowTitle(""); return; }
     const pos = t.folder.length && t.folderIndex >= 0 ? ` (${t.folderIndex + 1}/${t.folder.length})` : "";
-    setWindowTitle(`${t.layers?.dirty ? "● " : ""}${t.name}${pos} — OptImageEditor`);
+    setWindowTitle(`${t.layers?.dirty ? "● " : ""}${t.name}${pos}`);
   }
 }
