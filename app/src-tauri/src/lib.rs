@@ -498,7 +498,6 @@ fn is_dev_identifier(identifier: &str) -> bool {
 /// shared Applications\optimageeditor.exe key alone, so they never take over the installed build's entry.
 #[tauri::command]
 fn register_open_with(app: tauri::AppHandle, register: bool, extensions: Vec<String>) -> Result<String, String> {
-    use tauri::Manager;
     let dev = is_dev_identifier(&app.config().identifier);
     #[cfg(windows)]
     {
