@@ -630,6 +630,9 @@ fn close_ack(seq: u64) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     use tauri::{Emitter, Manager};
+    // before any reqwest client is built (comfy.rs, the updater): without a process-wide crypto provider,
+    // reqwest panics when it builds a client (see Cargo.toml)
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let context = tauri::generate_context!();
     if cfg!(debug_assertions) && !is_dev_identifier(&context.config().identifier) {
         // `npm run tauri dev` shares app data and the single-instance lock with the installed build

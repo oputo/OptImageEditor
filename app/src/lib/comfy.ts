@@ -205,6 +205,16 @@ class ComfySocket {
   }
 }
 
+/** `p`, or AbortedError as soon as `signal` aborts (the work behind `p` is not cancelled) */
+function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new AbortedError());
+  return new Promise<T>((res, rej) => {
+    const onAbort = () => rej(new AbortedError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(res, rej).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 export class AbortedError extends Error { constructor() { super("中止しました"); this.name = "AbortedError"; } }
 
 /** One ComfyUI server (URL kept in localStorage). */
@@ -273,6 +283,12 @@ export class ComfyClient {
     return r.subfolder ? `${r.subfolder}/${r.name}` : r.name;
   }
 
+  /** removes the job from the queue, or stops it when it runs */
+  private cancel(promptId: string) {
+    this.send("/queue", { method: "POST", ...jsonBody({ delete: [promptId] }) }).catch(() => {});
+    this.send("/interrupt", { method: "POST", ...jsonBody({ prompt_id: promptId }) }).catch(() => {});
+  }
+
   /** Runs `wf` (placeholders filled with the uploaded `input`) and returns the PNG images of its output nodes. */
   async run(
     wf: Workflow, input: Blob, values: { prompt?: string; seed?: number }, inputName: string,
@@ -282,22 +298,29 @@ export class ComfyClient {
     const t0 = performance.now();
     const report = (phase: string, node: string | null, value = 0, max = 0) => onProgress({ phase, node, value, max, elapsedMs: performance.now() - t0 });
     report("送信", null);
-    const image = await this.upload(input, inputName);
+    const image = await abortable(this.upload(input, inputName), signal);
     const prompt = fill(wf, { image, ...values });
 
     // websocket first, so no message of the run is missed
     let ws: ComfySocket;
     try {
-      ws = await ComfySocket.open(`${this.url.replace(/^http/, "ws")}/ws?clientId=${this.clientId}`);
+      const opening = ComfySocket.open(`${this.url.replace(/^http/, "ws")}/ws?clientId=${this.clientId}`);
+      // aborted while connecting: close the socket once it is open
+      opening.then((s) => { if (signal.aborted) s.close(); }, () => {});
+      ws = await abortable(opening, signal);
     } catch (e) {
+      if (e instanceof AbortedError) throw e;
       throw new Error(`ComfyUI（${this.url}）の WebSocket に接続できません${e instanceof TransportError && e.kind === "other" ? `: ${e.message}` : ""}`);
     }
 
     let promptId: string | null = null;
     try {
-      const r = await this.json<{ prompt_id: string; node_errors?: Record<string, unknown> }>("/prompt", {
+      const queuing = this.json<{ prompt_id: string; node_errors?: Record<string, unknown> }>("/prompt", {
         method: "POST", ...jsonBody({ prompt, client_id: this.clientId }),
       });
+      // aborted while queuing: take the job off the queue once its id is known
+      queuing.then((q) => { if (signal.aborted) this.cancel(q.prompt_id); }, () => {});
+      const r = await abortable(queuing, signal);
       promptId = r.prompt_id;
       report("順番待ち", null);
       const outputs = new Set(Object.entries(prompt).filter(([, n]) => n.class_type === "SaveImageWebsocket").map(([id]) => id));
@@ -305,8 +328,7 @@ export class ComfyClient {
       await new Promise<void>((res, rej) => {
         let current: string | null = null;
         const onAbort = () => {
-          this.send("/queue", { method: "POST", ...jsonBody({ delete: [promptId] }) }).catch(() => {});
-          this.send("/interrupt", { method: "POST", ...jsonBody({ prompt_id: promptId }) }).catch(() => {});
+          if (promptId) this.cancel(promptId);
           rej(new AbortedError());
         };
         signal.addEventListener("abort", onAbort, { once: true });

@@ -2694,6 +2694,7 @@ dependencies = [
  "half",
  "rayon",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",

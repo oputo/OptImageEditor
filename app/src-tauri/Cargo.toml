@@ -35,6 +35,9 @@ reqwest = { version = "0.13", default-features = false }
 tokio-tungstenite = "0.30"
 tokio = { version = "1", features = ["macros", "sync", "time"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# TLS crypto provider for reqwest: the updater turns on reqwest's rustls (without a provider) for every user of
+# reqwest in the build, so `run()` installs ring once at startup (ring is the provider the updater itself uses)
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 
 # Windows only: WebView2 SharedBuffer (zero-copy file reads). Versions must match the ones used by tauri/wry.
