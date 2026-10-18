@@ -26,8 +26,9 @@
   import { baseName, isTauri, readTuning, READ_MODES, READ_MODE_LABEL } from "./lib/source";
   import {
     confirmDialog, infoDialog, onCloseRequested, onNativeDrop, setCloseGuard, onOpenPaths, openDefaultAppsSettings, pickFile,
-    setOpenWithRegistration, startupPaths, toggleFullscreen,
+    setOpenWithRegistration, startupPaths, toggleFullscreen, appName,
   } from "./lib/desktop";
+  import { appVersion, checkUpdate, installUpdate, openWebPage, type UpdateInfo } from "./lib/update";
   import { ViewerState } from "./lib/viewerState.svelte";
   import { recent } from "./lib/recent.svelte";
 
@@ -67,7 +68,7 @@
   let dragOver = $state(false);
   let showStats = $state(false);
   let readMode = $state(readTuning.mode);
-  let openMenu = $state<"file" | "edit" | "view" | null>(null);
+  let openMenu = $state<"file" | "edit" | "view" | "help" | null>(null);
   /** submenu open in the file / edit menu */
   let sub = $state<"recent" | "rotate" | null>(null);
   let toast = $state<string | null>(null);
@@ -156,6 +157,55 @@
   let choice = $state<{ text: string; options: string[]; resolve: (i: number) => void } | null>(null);
   function choose(text: string, options: string[]): Promise<number> {
     return new Promise((resolve) => (choice = { text, options, resolve: (i) => { choice = null; resolve(i); } }));
+  }
+
+  // ---------------------------------------------------------------- update (src-tauri/src/update.rs)
+
+  /** a newer version found by the check at startup or from the help menu (shown in the toolbar) */
+  let updateInfo = $state<UpdateInfo | null>(null);
+  let updating = false;
+  const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  async function checkForUpdate(manual: boolean) {
+    try {
+      const u = await checkUpdate();
+      updateInfo = u;
+      if (!manual) return;
+      if (u) await promptUpdate(u);
+      else await infoDialog(`お使いの版（${await appVersion()}）が最新です。`);
+    } catch (e) {
+      console.error(e);
+      if (manual) await infoDialog(`更新を確認できませんでした: ${errText(e)}`);
+    }
+  }
+
+  async function promptUpdate(u: UpdateInfo) {
+    if (updating) return;
+    const n = u.notes?.trim() ?? "";
+    const notes = n ? `\n\n${n.length > 600 ? n.slice(0, 600) + "\n…" : n}` : "";
+    const i = await choose(
+      `新しい版 ${u.version} があります（お使いの版は ${u.currentVersion}）。${notes}\n\n更新すると、インストールのあいだアプリは終了します。`,
+      ["今すぐ更新", "Web サイトを開く", "後で"],
+    );
+    if (i === 1) { openWebPage(); return; }
+    if (i !== 0) return;
+    if (vs.hasUnsaved()) { await infoDialog("保存されていない変更があります。保存してから更新してください。"); return; }
+    updating = true;
+    try {
+      // on success the app exits when the installer starts
+      await installUpdate((done, total) =>
+        showToast(total ? `更新をダウンロード中… ${Math.round((done / total) * 100)}%` : `更新をダウンロード中… ${mb(done)}`));
+    } catch (e) {
+      console.error(e);
+      await infoDialog(`更新できませんでした: ${errText(e)}`);
+    } finally {
+      updating = false;
+    }
+  }
+
+  async function showAbout() {
+    const i = await choose(`${await appName()}\nバージョン ${await appVersion()}\n\n© Oputo`, ["Web サイトを開く", "閉じる"]);
+    if (i === 0) openWebPage();
   }
 
   /** the annotation bar's "レイヤーに": the annotations become a layer "注釈" */
@@ -519,6 +569,11 @@
     onNativeDrop({ over: (on) => (dragOver = on), drop: (paths) => openPaths(paths) }).then((u) => unlisten.push(u));
     onOpenPaths((paths) => openPaths(paths)).then((u) => unlisten.push(u));
     startupPaths().then((paths) => openPaths(paths));
+    // look for a newer version a little after startup (not in the dev build: `npm run app`)
+    if (isTauri()) {
+      const t = setTimeout(async () => { if (!(await appName()).endsWith(" Dev")) void checkForUpdate(false); }, 5000);
+      unlisten.push(() => clearTimeout(t));
+    }
     onCloseRequested(async () => confirmDialog("保存されていないレイヤーの変更があります。破棄して終了しますか？")).then((u) => unlisten.push(u));
     // browser build / reload of the webview
     const beforeUnload = (e: BeforeUnloadEvent) => { if (vs.hasUnsaved()) e.preventDefault(); };
@@ -608,6 +663,19 @@
       </div>
     {/if}
   </div>
+  <div class="menu-wrap">
+    <button class:active={openMenu === "help"} onclick={() => { openMenu = openMenu === "help" ? null : "help"; sub = null; }}
+      onmouseenter={() => { if (openMenu && openMenu !== "help") { openMenu = "help"; sub = null; } }}>ヘルプ</button>
+    {#if openMenu === "help"}
+      <div class="menu nav" role="menu">
+        <button class="item cmd" role="menuitem" onclick={() => { openMenu = null; showHelp = true; }}>ショートカット一覧<span class="fdir">F1</span></button>
+        <div class="menu-sep"></div>
+        <button class="item cmd" role="menuitem" disabled={!isTauri()} onclick={() => { openMenu = null; void checkForUpdate(true); }}>アップデートを確認…</button>
+        <button class="item cmd" role="menuitem" onclick={() => { openMenu = null; openWebPage(); }}>Web サイト（oputo.com）</button>
+        <button class="item cmd" role="menuitem" onclick={() => { openMenu = null; void showAbout(); }}>バージョン情報…</button>
+      </div>
+    {/if}
+  </div>
   <input bind:this={fileInput} type="file" multiple accept={SUPPORTED_EXT.map((e) => "." + e).join(",")} hidden
     onchange={() => { for (const f of Array.from(fileInput.files ?? [])) vs.openFile(f); fileInput.value = ""; }} />
   <span class="sep"></span>
@@ -638,6 +706,9 @@
   <button class:active={annotOn} disabled={!active?.meta || !!vs.compare} onclick={() => setAnnotTool(annotTool.tool ? null : "arrow")}
     title="注釈（U で開始、注釈中の Shift+U で切り替え。ペン P / 直線 L / 矢印 A / テキスト T / 選択 V）。Ctrl+Shift+C で注釈込みの画像をコピー">注釈</button>
   <button class:active={showAi} onclick={() => (showAi = !showAi)} title="AI（ComfyUI）: 背景除去 / 指示で編集 (F8)">AI</button>
+  {#if updateInfo}
+    <button class="update" onclick={() => updateInfo && promptUpdate(updateInfo)} title="新しい版があります（クリックで更新）">更新 {updateInfo.version}</button>
+  {/if}
   <div class="menu-wrap">
     <button class:active={openMenu === "view"} onclick={() => (openMenu = openMenu === "view" ? null : "view")} title="表示（ナビゲーター / 定規 / ガイド / グリッド / 回転）">表示 ▾</button>
     {#if openMenu === "view"}
@@ -847,6 +918,7 @@
   button:hover:not(:disabled) { background: #454545; }
   button:disabled { opacity: 0.4; cursor: default; }
   button.active { border-color: var(--accent); color: var(--accent); }
+  button.update { background: #2f4f73; border-color: var(--accent); color: #fff; }
 
   .menu-wrap { position: relative; }
   .menu.nav { overflow: visible; min-width: 260px; }

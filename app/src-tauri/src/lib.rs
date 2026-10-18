@@ -3,6 +3,7 @@ mod comfy;
 mod composite;
 mod hdr;
 mod psd_save;
+mod update;
 // File access is done here so the WebView can read byte ranges of large files (PSD composite-only reads)
 // and list sibling images for folder navigation.
 
@@ -511,6 +512,22 @@ fn register_open_with(app: tauri::AppHandle, register: bool, extensions: Vec<Str
     }
 }
 
+/// Opens the app's page on the web site (About / update dialog). The URL is fixed here, not given by the page.
+#[tauri::command]
+fn open_web_page() -> Result<(), String> {
+    const URL: &str = "https://oputo.com/apps/#optimageeditor";
+    #[cfg(windows)]
+    {
+        // rundll32 + url.dll hands the whole URL (with the #fragment) to the default browser
+        std::process::Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", URL]).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = URL;
+    }
+    Ok(())
+}
+
 /// Opens Windows Settings > Default apps.
 #[tauri::command]
 fn open_default_apps_settings() -> Result<(), String> {
@@ -631,6 +648,8 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(update::PendingUpdate::default())
         .manage(comfy::ComfyWs::default())
         .on_window_event(|window, event| {
             use std::sync::atomic::Ordering::SeqCst;
@@ -669,7 +688,10 @@ pub fn run() {
             open_default_apps_settings,
             comfy::comfy_http,
             comfy::comfy_ws_open,
-            comfy::comfy_ws_close
+            comfy::comfy_ws_close,
+            update::update_check,
+            update::update_install,
+            open_web_page
         ])
         .run(context)
         .expect("error while running tauri application");

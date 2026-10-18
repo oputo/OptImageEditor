@@ -35,5 +35,17 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/oputo/OptImageEditor/releases/latest/download/latest.json",
+        "https://oputo.com/apps/optimageeditor/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
