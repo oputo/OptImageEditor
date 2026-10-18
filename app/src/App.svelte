@@ -164,6 +164,8 @@
   /** a newer version found by the check at startup or from the help menu (shown in the toolbar) */
   let updateInfo = $state<UpdateInfo | null>(null);
   let updating = false;
+  /** the update in progress (download / restart), shown over the window */
+  let updateStatus = $state<string | null>(null);
   const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
   async function checkForUpdate(manual: boolean) {
@@ -192,15 +194,21 @@
     if (i !== 0) return;
     if (vs.hasUnsaved()) { await infoDialog("保存されていない変更があります。保存してから更新してください。"); return; }
     updating = true;
+    updateStatus = `${u.version} をダウンロードしています…`;
     try {
       // on success the app exits when the installer starts
-      await installUpdate((done, total) =>
-        showToast(total ? `更新をダウンロード中… ${Math.round((done / total) * 100)}%` : `更新をダウンロード中… ${mb(done)}`));
+      await installUpdate((done, total, installing) => {
+        updateStatus = installing
+          ? `インストールのため、アプリをいったん終了します。\n終わると ${u.version} で自動的に起動し直します。`
+          : `${u.version} をダウンロードしています… ${total ? `${Math.round((done / total) * 100)}%（${mb(done)} / ${mb(total)}）` : mb(done)}`;
+      });
     } catch (e) {
       console.error(e);
+      updateStatus = null;
       await infoDialog(`更新できませんでした: ${errText(e)}`);
     } finally {
       updating = false;
+      updateStatus = null;
     }
   }
 
@@ -843,6 +851,7 @@
       hasAnnotations={active.annot.shapes.length > 0} isPsd={isPsd(active.name)}
       onexport={doExport} onclose={() => (exportDlg = null)} />
   {/if}
+  {#if updateStatus}<div class="upd-back" role="presentation"><div class="upd-dlg" role="status">{updateStatus}</div></div>{/if}
   {#if choice}<ChoiceDialog text={choice.text} options={choice.options} onchoose={choice.resolve} />{/if}
   {#if canvasDlg}<CanvasDialog w0={canvasDlg.w} h0={canvasDlg.h} onapply={doCanvas} onclose={() => (canvasDlg = null)} />{/if}
   {#if showHelp}<HelpOverlay onclose={() => (showHelp = false)} />{/if}
@@ -920,6 +929,12 @@
   button:disabled { opacity: 0.4; cursor: default; }
   button.active { border-color: var(--accent); color: var(--accent); }
   button.update { background: #2f4f73; border-color: var(--accent); color: #fff; }
+  .upd-back { position: fixed; inset: 0; z-index: 70; background: rgba(0, 0, 0, 0.45); }
+  .upd-dlg {
+    position: absolute; left: 50%; top: 30%; transform: translate(-50%, -50%); min-width: 340px; max-width: 520px;
+    background: #2b2b2b; border: 1px solid #555; border-radius: 8px; padding: 16px 20px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6); font-size: 13px; line-height: 1.7; white-space: pre-line;
+  }
 
   .menu-wrap { position: relative; }
   .menu.nav { overflow: visible; min-width: 260px; }

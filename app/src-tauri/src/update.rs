@@ -40,7 +40,12 @@ pub enum CheckResult {
 pub struct DownloadProgress {
     done: u64,
     total: Option<u64>,
+    /// the download is complete and the installer starts in a moment (the app then exits)
+    installing: bool,
 }
+
+/// how long "restarting for the installation" stays on screen before the installer starts and the app exits
+const BEFORE_INSTALL: Duration = Duration::from_millis(1500);
 
 /// Asks the update endpoints for a newer version.
 #[tauri::command]
@@ -79,14 +84,21 @@ pub async fn update_install(
     }
     let update = pending.0.lock().unwrap().take().ok_or("先に更新を確認してください")?;
     let mut done = 0u64;
-    update
-        .download_and_install(
+    let mut size = None;
+    // download (signature checked by install) and install in two steps, so the page can say that the app
+    // restarts before it disappears
+    let bytes = update
+        .download(
             |chunk, total| {
                 done += chunk as u64;
-                let _ = on_progress.send(DownloadProgress { done, total });
+                size = total;
+                let _ = on_progress.send(DownloadProgress { done, total, installing: false });
             },
             || {},
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = on_progress.send(DownloadProgress { done, total: size, installing: true });
+    tokio::time::sleep(BEFORE_INSTALL).await;
+    update.install(bytes).map_err(|e| e.to_string())
 }

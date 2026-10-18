@@ -17,10 +17,11 @@ export function checkUpdate(): Promise<CheckResult> {
   return invoke<CheckResult>("update_check");
 }
 
-/** downloads and installs the update found by `checkUpdate`; on Windows the app exits when the installer starts */
-export async function installUpdate(onProgress: (done: number, total: number | null) => void): Promise<void> {
-  const ch = new Channel<{ done: number; total: number | null }>();
-  ch.onmessage = (p) => onProgress(p.done, p.total);
+/** downloads and installs the update found by `checkUpdate`; `installing`: the download is done and the installer
+ *  starts in a moment. On Windows the app exits when the installer starts (and the installer restarts it). */
+export async function installUpdate(onProgress: (done: number, total: number | null, installing: boolean) => void): Promise<void> {
+  const ch = new Channel<{ done: number; total: number | null; installing: boolean }>();
+  ch.onmessage = (p) => onProgress(p.done, p.total, p.installing);
   await invoke("update_install", { onProgress: ch });
 }
 
