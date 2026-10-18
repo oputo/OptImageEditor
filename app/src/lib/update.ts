@@ -6,14 +6,15 @@ import { isTauri } from "./source";
 export const WEB_PAGE = "https://oputo.com/apps/#optimageeditor";
 
 export type UpdateInfo = { version: string; currentVersion: string; notes: string | null };
+/** `latest`: the endpoints have this version; `notFound`: no endpoint had release information */
+export type CheckResult = ({ status: "available" } & UpdateInfo) | { status: "latest" } | { status: "notFound" };
 
 export function appVersion(): Promise<string> {
   return isTauri() ? getVersion() : Promise.resolve("browser");
 }
 
-/** the newer version on the update endpoints, or null when this build is the latest */
-export function checkUpdate(): Promise<UpdateInfo | null> {
-  return invoke<UpdateInfo | null>("update_check");
+export function checkUpdate(): Promise<CheckResult> {
+  return invoke<CheckResult>("update_check");
 }
 
 /** downloads and installs the update found by `checkUpdate`; on Windows the app exits when the installer starts */

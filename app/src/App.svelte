@@ -168,11 +168,12 @@
 
   async function checkForUpdate(manual: boolean) {
     try {
-      const u = await checkUpdate();
-      updateInfo = u;
+      const r = await checkUpdate();
+      updateInfo = r.status === "available" ? r : null;
       if (!manual) return;
-      if (u) await promptUpdate(u);
-      else await infoDialog(`お使いの版（${await appVersion()}）が最新です。`);
+      if (r.status === "available") await promptUpdate(r);
+      else if (r.status === "latest") await infoDialog(`お使いの版（${await appVersion()}）が最新です。`);
+      else await infoDialog(`更新の情報が見つかりませんでした（配信先に公開された版がありません）。\nお使いの版は ${await appVersion()} です。`);
     } catch (e) {
       console.error(e);
       if (manual) await infoDialog(`更新を確認できませんでした: ${errText(e)}`);

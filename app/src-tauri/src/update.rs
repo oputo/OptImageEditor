@@ -23,29 +23,47 @@ pub struct UpdateInfo {
     notes: Option<String>,
 }
 
+/// The result of `update_check`, as `{ status: "available", version, currentVersion, notes } | { status: "latest" }
+/// | { status: "notFound" }`.
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum CheckResult {
+    /// a newer version is on the endpoints
+    Available(UpdateInfo),
+    /// the endpoints have this version (or an older one)
+    Latest,
+    /// no endpoint had a release manifest (all of them answered 404 etc.)
+    NotFound,
+}
+
 #[derive(Clone, Serialize)]
 pub struct DownloadProgress {
     done: u64,
     total: Option<u64>,
 }
 
-/// Returns the newer version on the update endpoints, or None when this build is the latest.
+/// Asks the update endpoints for a newer version.
 #[tauri::command]
-pub async fn update_check(app: tauri::AppHandle, pending: tauri::State<'_, PendingUpdate>) -> Result<Option<UpdateInfo>, String> {
+pub async fn update_check(app: tauri::AppHandle, pending: tauri::State<'_, PendingUpdate>) -> Result<CheckResult, String> {
     let updater = app.updater_builder().timeout(Duration::from_secs(30)).build().map_err(|e| e.to_string())?;
     let update = match updater.check().await {
         Ok(u) => u,
-        // no endpoint has a release yet (all of them answered 404 etc.)
-        Err(tauri_plugin_updater::Error::ReleaseNotFound) => None,
+        Err(tauri_plugin_updater::Error::ReleaseNotFound) => {
+            *pending.0.lock().unwrap() = None;
+            return Ok(CheckResult::NotFound);
+        }
         Err(e) => return Err(e.to_string()),
     };
-    let info = update.as_ref().map(|u| UpdateInfo {
-        version: u.version.clone(),
-        current_version: u.current_version.clone(),
-        notes: u.body.clone(),
-    });
+    let result = match &update {
+        Some(u) => CheckResult::Available(UpdateInfo {
+            version: u.version.clone(),
+            current_version: u.current_version.clone(),
+            notes: u.body.clone(),
+        }),
+        None => CheckResult::Latest,
+    };
     *pending.0.lock().unwrap() = update;
-    Ok(info)
+    Ok(result)
 }
 
 /// Downloads the update found by `update_check`, checks its signature and runs the installer. On Windows the
