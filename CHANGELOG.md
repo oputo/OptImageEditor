@@ -4,6 +4,8 @@
 
 ## [未リリース]
 
+## 0.2.0（2026-10-19）
+
 ### 追加
 - 開発用の起動（`npm run app`）を配布版と別の識別子（`com.oputo.optimageeditor.dev`）で動かすようにした。設定・WebView のデータ・多重起動の判定・「プログラムから開く」の登録が配布版と混ざらない
 - ウィンドウのタイトルに実行中のビルドの名前（OptImageEditor / OptImageEditor Dev）を表示
