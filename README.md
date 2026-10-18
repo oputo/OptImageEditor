@@ -29,6 +29,15 @@
 
 - `tools/psd_scan.py` — PSD のレイヤー構成と機能の使用状況を集計する（`pip install psd-tools`）
 
+## ComfyUI 連携について（注意）
+
+AI パネルは、アプリの画面（WebView）から ComfyUI に直接接続します。そのため現在は、ComfyUI を `--enable-cors-header` 付きで起動する必要があります。
+
+- この設定では、ComfyUI を起動しているあいだ、同じ PC のブラウザで開いた**任意の Web サイト**からも ComfyUI を操作できる状態になります（生成の実行、画像や履歴の読み取りなど）。
+- AI パネルを使わないときは ComfyUI を止めるか、このフラグを外して起動してください。`--listen` で LAN に公開している場合は、特に注意してください。
+- 接続元を限定したい場合は `--enable-cors-header http://tauri.localhost` とします（配布用ビルドだけが接続できます。dev ビルド `http://localhost:1420` からは接続できなくなります）。
+- 今後、通信をアプリの Rust 側経由に変更し、このフラグを不要にする予定です。
+
 ## ライセンス
 
 - **ソースコード**: [PolyForm Noncommercial License 1.0.0](LICENSE.md)。営利目的でない個人の学習・研究・趣味での利用と、非営利団体での利用に限り、使用・改変・再配布できます。商用利用（報酬を伴う制作を含む）は、このライセンスでは許諾されません。
