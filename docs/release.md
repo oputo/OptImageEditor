@@ -16,6 +16,7 @@
   - 試験版: `0.3.0-beta.1` のように接尾辞を付ける
 - 版番号は `app/package.json` の `version` が正。`app/src-tauri/tauri.conf.json` は `"version": "../package.json"` で参照する。`app/src-tauri/Cargo.toml` の `version` は、リリース用スクリプトで同じ値にそろえる
 - 変更点は `CHANGELOG.md` の「未リリース」に書きためて、リリース時に版番号の見出しに変える
+- リリースの区切り: 細かい修正はすぐには出さずに「未リリース」に貯め、機能のまとまりなど、しっかりした区切りが付いた時に出す
 
 ## dev 版と配布版の分離
 
