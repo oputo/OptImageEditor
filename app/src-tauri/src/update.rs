@@ -5,7 +5,7 @@
 //! answer that is not JSON fails the whole check (so an endpoint must never answer 200 with an HTML page).
 
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::ipc::Channel;
@@ -46,6 +46,8 @@ pub struct DownloadProgress {
 
 /// how long "restarting for the installation" stays on screen before the installer starts and the app exits
 const BEFORE_INSTALL: Duration = Duration::from_millis(1500);
+/// download progress is sent to the page at most this often
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
 /// Asks the update endpoints for a newer version.
 #[tauri::command]
@@ -85,6 +87,10 @@ pub async fn update_install(
     let update = pending.0.lock().unwrap().take().ok_or("先に更新を確認してください")?;
     let mut done = 0u64;
     let mut size = None;
+    // the plugin calls back for every received chunk (hundreds to thousands of times); each message is a script
+    // run in the page, and when they pile up the "installing" message below came too late to be seen before the
+    // app exited. So at most one message per PROGRESS_EVERY (and the first one)
+    let mut last: Option<Instant> = None;
     // download (signature checked by install) and install in two steps, so the page can say that the app
     // restarts before it disappears
     let bytes = update
@@ -92,7 +98,10 @@ pub async fn update_install(
             |chunk, total| {
                 done += chunk as u64;
                 size = total;
-                let _ = on_progress.send(DownloadProgress { done, total, installing: false });
+                if !matches!(last, Some(t) if t.elapsed() < PROGRESS_EVERY) {
+                    last = Some(Instant::now());
+                    let _ = on_progress.send(DownloadProgress { done, total, installing: false });
+                }
             },
             || {},
         )
