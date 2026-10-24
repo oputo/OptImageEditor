@@ -668,6 +668,8 @@
         <div class="menu-sep"></div>
         <button class="item cmd" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; stampVisible(); }}>複写結合<span class="fdir">Ctrl+Alt+Shift+E</span></button>
         <div class="menu-sep"></div>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={() => { openMenu = null; copyAnnotated(); }}>表示中の画像をコピー（注釈込み）<span class="fdir">Ctrl+Shift+C</span></button>
+        <div class="menu-sep"></div>
         <button class="item cmd" role="menuitem" onclick={() => { openMenu = null; showHelp = true; }}>ショートカット一覧<span class="fdir">F1</span></button>
       </div>
     {/if}

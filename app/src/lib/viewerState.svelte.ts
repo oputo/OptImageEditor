@@ -1479,11 +1479,20 @@ export class ViewerState {
     return null;
   }
 
-  /** what Ctrl+C copies: the selected part (or all) of the active layer, or of the image without layers */
-  private copySource(tab: Tab): { x: number; y: number; w: number; h: number; px: Uint8Array } | string {
+  /** what Ctrl+C copies: the selected part (or all) of the active layer, or of the image without layers.
+   *  `annotated`: the image has annotations, so what is shown (the composite with them) is copied instead, like
+   *  Ctrl+Shift+C (annotations are for pasting into a chat; they are not in any layer). */
+  private copySource(tab: Tab, annotated: boolean): { x: number; y: number; w: number; h: number; px: Uint8Array } | string {
     const l = tab.layers;
     let src: { x: number; y: number; w: number; h: number; px: Uint8Array };
-    if (l?.status === "ready") {
+    if (annotated) {
+      const set = this.renderer?.activeSet;
+      if (!set || !this.renderer || this.active !== tab) return "画像がありません";
+      if (set.hdr) return "EXR / HDR はコピーできません";
+      const c = flattenToCanvas(this.renderer.readSet(set), set.width, set.height, tab.annot.shapes);
+      const d = c.getContext("2d")!.getImageData(0, 0, set.width, set.height).data; // straight alpha
+      src = { x: 0, y: 0, w: set.width, h: set.height, px: new Uint8Array(d.buffer, d.byteOffset, d.byteLength) };
+    } else if (l?.status === "ready") {
       const node = this.locate(l.tree, l.selectedId)?.node;
       if (!node) return "レイヤーを選択してください";
       src = node.children ? this.soloPixels(tab, node) : this.layerPixels(tab, node);
@@ -1505,10 +1514,12 @@ export class ViewerState {
   /** where the last copy came from (a paste of the same size goes back there) */
   private lastCopy: { x: number; y: number; w: number; h: number } | null = null;
 
-  /** Ctrl+C / Ctrl+X: copies to the system clipboard as PNG (`cut`: also clears it from the layer) */
+  /** Ctrl+C / Ctrl+X: copies to the system clipboard as PNG (`cut`: also clears it from the layer). With
+   *  annotations, Ctrl+C copies the image as shown with them (Ctrl+X stays a layer operation). */
   async copySelection(tab: Tab, cut = false): Promise<string> {
     if (cut) { const b = this.pixelBlocker(tab.layers && this.locate(tab.layers.tree, tab.layers.selectedId)?.node); if (b || !tab.sel) return b ?? "切り取りには選択範囲が必要です"; }
-    const p = this.copySource(tab);
+    const annotated = !cut && tab.annot.shapes.length > 0;
+    const p = this.copySource(tab, annotated);
     if (typeof p === "string") return p;
     this.lastCopy = { x: p.x, y: p.y, w: p.w, h: p.h };
     const blob = toPng(p);
@@ -1520,7 +1531,7 @@ export class ViewerState {
       if (!ok) throw e;
     }
     if (cut) { const m = this.clearSelection(tab); if (m) return m; }
-    return `${cut ? "切り取り" : "コピー"}しました（${p.w} × ${p.h}）`;
+    return `${cut ? "切り取り" : annotated ? "注釈込みでコピー" : "コピー"}しました（${p.w} × ${p.h}）`;
   }
 
   /** Ctrl+V on a document with layers: the image as a new layer above the active one (where it was copied from when
