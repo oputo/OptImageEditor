@@ -3,6 +3,7 @@ mod comfy;
 mod composite;
 mod hdr;
 mod psd_save;
+mod resample;
 mod update;
 // File access is done here so the WebView can read byte ranges of large files (PSD composite-only reads)
 // and list sibling images for folder navigation.
@@ -286,6 +287,40 @@ async fn save_psd(request: tauri::ipc::Request<'_>) -> Result<psd_save::SaveResu
         req.dst, r.bytes >> 20, r.ms, r.parse_ms, r.composite_ms, r.write_ms
     );
     Ok(r)
+}
+
+/// Resamples one image for the document image size (B-2b), the same way the saved file's channels are (resample.rs).
+/// Body (little endian): u32 kind (0: straight RGBA, 1: grey with a constant outside, 2: grey, edge repeated),
+/// u32 w, h, new w, new h, u32 filter (0 nearest, 1 bilinear, 2 bicubic), u32 outside value (kind 1),
+/// f64 kx, cx, ky, cy (see resample::Axis), then the pixels. Returns the new pixels.
+#[tauri::command]
+async fn resample_image(request: tauri::ipc::Request<'_>) -> Result<Response, String> {
+    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
+        return Err("raw body expected".into());
+    };
+    const HEAD: usize = 7 * 4 + 4 * 8;
+    if body.len() < HEAD { return Err("empty request".into()); }
+    let u = |i: usize| u32::from_le_bytes(body[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+    let d = |i: usize| f64::from_le_bytes(body[28 + i * 8..36 + i * 8].try_into().unwrap());
+    let (kind, w, h, nw, nh, filter, outside) = (u(0), u(1), u(2), u(3), u(4), u(5), u(6));
+    let f = match filter { 0 => resample::Filter::Nearest, 1 => resample::Filter::Bilinear, _ => resample::Filter::Bicubic };
+    let ax = resample::Axis { n_in: w, n_out: nw, k: d(0), c: d(1) };
+    let ay = resample::Axis { n_in: h, n_out: nh, k: d(2), c: d(3) };
+    if !(ax.k > 0.0 && ay.k > 0.0) { return Err("bad scale".into()); }
+    let px = &body[HEAD..];
+    let bpp = if kind == 0 { 4 } else { 1 };
+    if px.len() != w * h * bpp { return Err("bad image size".into()); }
+    let px = px.to_vec();
+    tauri::async_runtime::spawn_blocking(move || -> Result<Response, String> {
+        let out = match kind {
+            0 => resample::rgba(&px, w, h, &ax, &ay, f),
+            1 => resample::plane(&px, w, h, &ax, &ay, f, resample::Edge::Const(outside as f32)),
+            _ => resample::plane(&px, w, h, &ax, &ay, f, resample::Edge::Clamp),
+        };
+        Ok(Response::new(out))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Puts an image on the clipboard (fallback for navigator.clipboard.write).
@@ -683,6 +718,7 @@ pub fn run() {
             write_file,
             save_psd,
             copy_image,
+            resample_image,
             set_close_guard,
             close_ack,
             list_images,

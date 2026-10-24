@@ -11,7 +11,7 @@
       ["Ctrl+Shift+T", "閉じたタブを開き直す"], ["Ctrl+Tab / Ctrl+Shift+Tab", "タブの切り替え"],
       ["← → / PageUp PageDown", "フォルダ内の前 / 次の画像"], ["Home / End", "フォルダの最初 / 最後"], ["F5", "読み直し"],
       ["Ctrl+S / Ctrl+Shift+S", "上書き保存 / 別名で保存（PNG・JPG を編集中は、Ctrl+S で統合して上書き、Ctrl+Shift+S で PSD などに保存。貼り付けた画像は保存先を尋ねる。注釈があればレイヤーにするか確認）"],
-      ["Ctrl+Alt+Shift+W", "書き出し（PNG / JPG / WebP）"], ["Ctrl+Alt+I", "画像解像度（指定サイズで書き出し）"],
+      ["Ctrl+Alt+Shift+W", "書き出し（PNG / JPG / WebP）"], ["Ctrl+Alt+I", "画像解像度（レイヤーを保ったまま文書を拡大・縮小）"],
       ["Ctrl+Alt+C", "カンバスサイズ（PSD）"],
       ["C", "切り抜き（ハンドルで調整、Shift で縦横比を保つ、Enter で確定 / Esc で中止）"],
       ["編集 →「画像の回転」", "90° / 180° 回転・左右 / 上下反転（文書全体）"],

@@ -117,6 +117,26 @@ export async function savePsd(
   return invoke<SavePsdResult>("save_psd", body);
 }
 
+export type ResampleFilter = "nearest" | "bilinear" | "bicubic";
+/** one axis of a resampling: output sample i comes from input position (i + 0.5) / k + c (sample j covers j..j+1) */
+export type ResampleAxis = { n: number; k: number; c: number };
+
+/** Resamples straight RGBA (`grey`: one byte per pixel; `outside`: its value outside the image, null: the edge
+ *  repeats) in Rust, the same way the saved file's channels are (resample.rs). Null outside the desktop app. */
+export async function resampleImage(px: Uint8Array, w: number, h: number, ax: ResampleAxis, ay: ResampleAxis,
+  filter: ResampleFilter, grey: { outside: number | null } | null = null): Promise<Uint8Array | null> {
+  if (!isTauri()) return null;
+  const HEAD = 7 * 4 + 4 * 8;
+  const body = new Uint8Array(HEAD + px.length);
+  const dv = new DataView(body.buffer);
+  const kind = grey ? (grey.outside === null ? 2 : 1) : 0;
+  [kind, w, h, ax.n, ay.n, filter === "nearest" ? 0 : filter === "bilinear" ? 1 : 2, grey?.outside ?? 0].forEach((v, i) => dv.setUint32(i * 4, v, true));
+  [ax.k, ax.c, ay.k, ay.c].forEach((v, i) => dv.setFloat64(28 + i * 8, v, true));
+  body.set(px, HEAD);
+  const out = await invoke<ArrayBuffer>("resample_image", body);
+  return new Uint8Array(out);
+}
+
 /** Clipboard image through Rust (when navigator.clipboard.write is refused). False outside the desktop app. */
 export async function copyImageFallback(w: number, h: number, rgba: Uint8ClampedArray): Promise<boolean> {
   if (!isTauri()) return false;

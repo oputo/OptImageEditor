@@ -1,14 +1,12 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  // Export (Ctrl+Alt+Shift+W) and image size (Ctrl+Alt+I) dialog: format, quality, size, annotations.
+  // Export (Ctrl+Alt+Shift+W): format, quality, size, annotations. (The document's image size is ImageSizeDialog.)
   // The written file goes next to the original (a free name) unless "保存先を選ぶ" is used; the original is never
   // overwritten. Settings are remembered in localStorage ("oie.export").
   export type ExportOptions = { format: "png" | "jpeg" | "webp"; quality: number; w: number; h: number; annotations: boolean; ask: boolean };
 
-  let { w0, h0, name, hasAnnotations, isPsd, mode, onexport, onclose }: {
-    w0: number; h0: number; name: string; hasAnnotations: boolean; isPsd: boolean;
-    /** "size": opened as 画像解像度 (size first) */
-    mode: "export" | "size";
+  let { w0, h0, name, hasAnnotations, onexport, onclose }: {
+    w0: number; h0: number; name: string; hasAnnotations: boolean;
     onexport: (o: ExportOptions) => void;
     onclose: () => void;
   } = $props();
@@ -24,7 +22,7 @@
   let quality = $state(Math.round(saved.quality * 100));
   let annotations = $state(saved.annotations);
   // initial values only (the dialog is created per opening)
-  let scale = $state<"100" | "50" | "25" | "custom">(untrack(() => mode) === "size" ? "custom" : "100");
+  let scale = $state<"100" | "50" | "25" | "custom">("100");
   let cw = $state(untrack(() => w0)), ch = $state(untrack(() => h0));
   let keepAspect = $state(true);
   let unit = $state<"px" | "%">("px");
@@ -61,12 +59,9 @@
 </script>
 
 <div class="back" role="presentation" onmousedown={(e) => { if (e.target === e.currentTarget) onclose(); }}>
-  <div class="dlg" role="dialog" aria-modal="true" aria-label={mode === "size" ? "画像解像度" : "書き出し"}
+  <div class="dlg" role="dialog" aria-modal="true" aria-label="書き出し"
     tabindex="-1" onkeydown={(e) => { e.stopPropagation(); if (e.key === "Escape") onclose(); else if (e.key === "Enter" && !e.isComposing) go(false); }}>
-    <h2>{mode === "size" ? "画像解像度（書き出し）" : "書き出し"}</h2>
-    {#if mode === "size"}
-      <p class="note">{isPsd ? "PSD のレイヤーは拡大縮小しません。指定したサイズで画像を書き出します（元のファイルは変更しません）。" : "指定したサイズで画像を書き出します（元のファイルは上書きしません）。"}</p>
-    {/if}
+    <h2>書き出し</h2>
 
     <div class="row">
       <span class="lbl">形式</span>
@@ -121,7 +116,6 @@
   .back { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); z-index: 50; display: flex; align-items: center; justify-content: center; }
   .dlg { background: #2b2b2b; border: 1px solid #555; border-radius: 8px; padding: 14px 16px; min-width: 460px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6); font-size: 13px; outline: none; }
   h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
-  .note { margin: 0 0 10px; color: #f0c040; font-size: 12px; }
   .row { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
   .lbl { width: 72px; color: var(--muted); flex: none; }
   .val { width: 32px; text-align: right; font-variant-numeric: tabular-nums; }

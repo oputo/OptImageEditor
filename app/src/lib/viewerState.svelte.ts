@@ -15,6 +15,7 @@ import { confirmDialog, copyImageFallback, listFolderImages, savePsd, saveDialog
 import { recent } from "./recent.svelte";
 import { Annotations, drawShape, flattenToCanvas, flattenToPng, type Shape } from "./annotations.svelte";
 import { cropGrey, mapPoint, transformPixels, type CropRect, type DocTransform } from "./crop.svelte";
+import { resamplePixels, scaleSpan, type ResampleFilter } from "./resize";
 import { Painter, applyTiles, type PatchTile } from "./painter";
 import { hexToRgb, paint, rgbToHex } from "./paint.svelte";
 import { comfy, loadWorkflow, type Progress, type WorkflowKind } from "./comfy";
@@ -99,9 +100,10 @@ export type LayersState = {
 
 /** Undo history of a tab's layer tree (snapshots of the tree; pixels are not edited in 2-b). */
 /** Canvas of a layered document: size, and how far the file's layers have moved (canvas size changes not saved yet). */
-/** canvas size, and where the file's layers went: x' = m0 x + m1 y + ox, y' = m2 x + m3 y + oy (m: rotation / flip,
- *  identity when absent) */
-export type Canvas = { w: number; h: number; ox: number; oy: number; m?: [number, number, number, number] };
+/** canvas size, and where the file's layers went: x' = m0 x + m1 y + ox, y' = m2 x + m3 y + oy (m: rotation / flip
+ *  and scaling, identity when absent). Scaled (image size): `filter` resamples the file's channels when saving, and
+ *  the px sizes of layer styles are multiplied by `fx` (1 when absent). */
+export type Canvas = { w: number; h: number; ox: number; oy: number; m?: [number, number, number, number]; filter?: ResampleFilter; fx?: number };
 /** pixels changed in place by a stroke (layer `id`'s texture or mask), applied backwards / forwards by undo / redo */
 type Patch = { id: number; mask: boolean; tiles: PatchTile[]; bytes: number };
 /** `patch`: the pixel change from this state to the next one (strokes) */
@@ -938,7 +940,13 @@ export class ViewerState {
       const r: [number, number, number, number] = [N[0] * inv[0] + N[1] * inv[2], N[0] * inv[1] + N[1] * inv[3], N[2] * inv[0] + N[3] * inv[2], N[2] * inv[1] + N[3] * inv[3]];
       const ox = sn.canvas.ox - (r[0] * savedOffset.ox + r[1] * savedOffset.oy), oy = sn.canvas.oy - (r[2] * savedOffset.ox + r[3] * savedOffset.oy);
       const ident = r[0] === 1 && r[1] === 0 && r[2] === 0 && r[3] === 1;
-      sn.canvas = { w: sn.canvas.w, h: sn.canvas.h, ox: Math.round(ox), oy: Math.round(oy), ...(ident ? {} : { m: r }) };
+      // offsets stay exact (fractions after a scaling); nearly integer ones (rounding noise) become integers
+      const clean = (v: number) => (Math.abs(v - Math.round(v)) < 1e-6 ? Math.round(v) : v);
+      const fx = (sn.canvas.fx ?? 1) / (savedOffset.fx ?? 1);
+      sn.canvas = {
+        w: sn.canvas.w, h: sn.canvas.h, ox: clean(ox), oy: clean(oy), ...(ident ? {} : { m: r }),
+        ...(sn.canvas.filter ? { filter: sn.canvas.filter } : {}), ...(Math.abs(fx - 1) > 1e-9 ? { fx } : {}),
+      };
     }
     for (let i = h.undo.length - 1; i >= 0; i--) if (!fix(h.undo[i].tree)) { h.undo = h.undo.slice(i + 1); break; }
     for (let i = h.redo.length - 1; i >= 0; i--) if (!fix(h.redo[i].tree)) { h.redo = h.redo.slice(i + 1); break; }
@@ -1185,7 +1193,8 @@ export class ViewerState {
   /** one undo step that also moves the guides and annotations (`mapX` / `mapY`: a vertical / horizontal guide at
    *  v goes to [axis, value]; `mapPt`: an annotation point) */
   private transformStep(tab: Tab, mutate: (tree: DocLayer[]) => void,
-    mapGuide: (axis: "v" | "h", v: number) => ["v" | "h", number], mapPt: (x: number, y: number) => [number, number]) {
+    mapGuide: (axis: "v" | "h", v: number) => ["v" | "h", number], mapPt: (x: number, y: number) => [number, number],
+    mapShape: (s: Shape) => Shape = (s) => s) {
     const before = this.marks(tab);
     this.edit(tab, null, mutate);
     const h = this.hist(tab);
@@ -1197,7 +1206,7 @@ export class ViewerState {
     tab.annot.load(before.shapes.map((s) => {
       const pts = s.pts.slice();
       for (let i = 0; i < pts.length; i += 2) [pts[i], pts[i + 1]] = mapPt(pts[i], pts[i + 1]);
-      return { ...s, pts };
+      return mapShape({ ...s, pts });
     }));
   }
 
@@ -1309,6 +1318,7 @@ export class ViewerState {
         w: swap ? H : W, h: swap ? W : H,
         ox: M[0] * c.ox + M[1] * c.oy + tx, oy: M[2] * c.ox + M[3] * c.oy + ty,
         ...(ident ? {} : { m: nm }),
+        ...(c.filter ? { filter: c.filter } : {}), ...(c.fx !== undefined ? { fx: c.fx } : {}),
       };
       tab.sel = null;
     }, (axis, v) => {
@@ -1318,6 +1328,88 @@ export class ViewerState {
       if (t === "fh") return [axis, axis === "v" ? W - v : v];
       return [axis, axis === "h" ? H - v : v];
     }, (x, y) => mapPoint(t, x, y, W, H));
+    this.releaseUnused(tab);
+    return null;
+  }
+
+  /** Image size (B-2b, Ctrl+Alt+I): scales the whole document to `nw` x `nh`. Every layer keeps its kind (smart
+   *  objects and text are not rasterized): pixels and masks (also of groups) are resampled here for the display;
+   *  when saving, Rust resamples the file's channels the same way (resample.rs) and scales the placement of smart
+   *  objects / text / vector masks, and with `scaleStyles` the px sizes of layer styles. One undo step (guides,
+   *  annotations and the selection are scaled too). Returns a message when it cannot. */
+  async resize(tab: Tab, nw: number, nh: number, o: { filter: ResampleFilter; scaleStyles: boolean }): Promise<string | null> {
+    const l = tab.layers;
+    const doc = this.docs.get(tab.id);
+    if (!l || l.status !== "ready" || !doc) return "レイヤーが読み込まれていません";
+    nw = Math.round(nw); nh = Math.round(nh);
+    if (!(nw >= 1 && nh >= 1 && nw <= 30000 && nh <= 30000)) return "幅と高さは 1〜30000 px にしてください";
+    const W = l.canvas.w, H = l.canvas.h;
+    if (nw === W && nh === H) return null;
+    if (this.stroke?.tab === tab) this.paintEnd();
+    const sx = nw / W, sy = nh / H;
+    // the textures are made first (asynchronously); the document must not change meanwhile
+    const tree0 = l.tree, undo0 = l.undoCount, canvas0 = l.canvas;
+    const made = new Map<number, DocLayer>();
+    const scaled = async (n: DocLayer): Promise<void> => {
+      if (n.children) for (const c of n.children) await scaled(c);
+      const id = doc.nextId++;
+      const X = scaleSpan(n.x, n.w, sx), Y = scaleSpan(n.y, n.h, sy);
+      let rect = { x: n.x, y: n.y, w: n.w, h: n.h };
+      let thumb = n.thumb;
+      if (!n.children && n.w > 0 && n.h > 0 && doc.gpu.get(n.id)?.tex) {
+        const src = this.layerPixels(tab, n);
+        const px = await resamplePixels(src.px, n.w, n.h, X.axis, Y.axis, o.filter);
+        rect = px.length ? { x: X.at, y: Y.at, w: X.axis.n, h: Y.axis.n } : { x: 0, y: 0, w: 0, h: 0 };
+        this.compositor!.setLayerPixels(doc, id, px, rect.w, rect.h, null);
+        if (px.length) thumb = thumbOf(px, rect.w, rect.h);
+      } else {
+        this.compositor!.setLayerPixels(doc, id, new Uint8Array(0), 0, 0, null);
+        if (n.w > 0 && n.h > 0) rect = { x: X.at, y: Y.at, w: X.axis.n, h: Y.axis.n };
+      }
+      let mask = n.mask;
+      if (n.mask) {
+        const cur = this.maskOf(tab, n);
+        const MX = scaleSpan(cur.x, cur.w, sx), MY = scaleSpan(cur.y, cur.h, sy);
+        const px = cur.w > 0 && cur.h > 0 ? await resamplePixels(cur.px, cur.w, cur.h, MX.axis, MY.axis, o.filter, { outside: cur.def }) : new Uint8Array(0);
+        const g = px.length ? { x: MX.at, y: MY.at, w: MX.axis.n, h: MY.axis.n } : { x: 0, y: 0, w: 0, h: 0 };
+        this.compositor!.setLayerMask(doc, id, id, px.length ? px : null, g.w, g.h);
+        mask = { ...n.mask, ...g, pixels: null, thumb: px.length ? maskThumbOf(px, g.w, g.h, cur.def) : n.mask.thumb };
+      }
+      made.set(n.id, { ...n, id, ...rect, thumb, mask, warnings: [...n.warnings] });
+    };
+    for (const n of l.tree) await scaled(n);
+    let sel: Sel | null = null;
+    if (tab.sel) {
+      const s = tab.sel;
+      const X = scaleSpan(s.x, s.w, sx), Y = scaleSpan(s.y, s.h, sy);
+      const m = await resamplePixels(s.m, s.w, s.h, X.axis, Y.axis, o.filter === "nearest" ? "nearest" : "bilinear", { outside: 0 });
+      sel = m.length ? new Sel(X.at, Y.at, X.axis.n, Y.axis.n, m) : null;
+    }
+    if (tab.layers !== l || l.tree !== tree0 || l.undoCount !== undo0 || l.canvas !== canvas0 || l.status !== "ready") {
+      this.releaseUnused(tab);
+      return "拡大・縮小の途中で文書が変わったため、中止しました";
+    }
+    const k = Math.sqrt(sx * sy); // annotations / layer styles: one factor (the mean for non-proportional scaling)
+    this.transformStep(tab, (tree) => {
+      const walk = (ls: DocLayer[]) => {
+        for (let i = 0; i < ls.length; i++) {
+          const n = made.get(ls[i].id);
+          if (!n) continue;
+          if (ls[i].children) walk(ls[i].children!);
+          ls[i] = { ...n, children: ls[i].children };
+        }
+      };
+      walk(tree);
+      // the file -> document mapping becomes S ∘ (the mapping so far)
+      const c = l.canvas;
+      const m = c.m ?? [1, 0, 0, 1];
+      const nm: [number, number, number, number] = [sx * m[0], sx * m[1], sy * m[2], sy * m[3]];
+      const ident = nm[0] === 1 && nm[1] === 0 && nm[2] === 0 && nm[3] === 1;
+      const fx = (c.fx ?? 1) * (o.scaleStyles ? k : 1);
+      l.canvas = { w: nw, h: nh, ox: sx * c.ox, oy: sy * c.oy, ...(ident ? {} : { m: nm }), filter: o.filter, ...(fx !== 1 ? { fx } : {}) };
+      tab.sel = sel;
+    }, (axis, v) => [axis, axis === "v" ? v * sx : v * sy], (x, y) => [x * sx, y * sy],
+    (s) => ({ ...s, width: s.width * k, ...(s.size !== undefined ? { size: s.size * k } : {}) }));
     this.releaseUnused(tab);
     return null;
   }
@@ -2373,6 +2465,7 @@ export class ViewerState {
     const req = {
       src, dst, backup, width: doc.data.width, height: doc.data.height, layerCount: l.fileCount, plan,
       offsetX: l.canvas.ox, offsetY: l.canvas.oy, xform: l.canvas.m ?? null,
+      filter: l.canvas.filter ?? null, styleScale: l.canvas.fx ?? null,
     };
     const rgba = new Uint8Array(composite.length + offset);
     rgba.set(composite, 0);

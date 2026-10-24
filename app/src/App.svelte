@@ -9,6 +9,7 @@
   import AnnotBar from "./lib/AnnotBar.svelte";
   import ExportDialog, { type ExportOptions } from "./lib/ExportDialog.svelte";
   import CanvasDialog from "./lib/CanvasDialog.svelte";
+  import ImageSizeDialog, { type ImageSizeOptions } from "./lib/ImageSizeDialog.svelte";
   import HelpOverlay from "./lib/HelpOverlay.svelte";
   import AiPanel from "./lib/AiPanel.svelte";
   import PaintBar from "./lib/PaintBar.svelte";
@@ -236,17 +237,41 @@
   }
 
   // ---- 2-d: export / image size / canvas size / shortcut list
-  let exportDlg = $state<{ mode: "export" | "size"; w: number; h: number } | null>(null);
+  let exportDlg = $state<{ w: number; h: number } | null>(null);
   let canvasDlg = $state<{ w: number; h: number } | null>(null);
+  let sizeDlg = $state<{ w: number; h: number; isPsd: boolean } | null>(null);
   let showHelp = $state(false);
   let showAi = $state(false);
 
-  function openExport(mode: "export" | "size") {
+  function openExport() {
     openMenu = null;
     const set = renderer?.activeSet;
     if (!active?.meta || !set) { showToast("画像を開いてください"); return; }
     if (set.hdr) { showToast("EXR / HDR の書き出しは未対応です"); return; }
-    exportDlg = { mode, w: set.width, h: set.height };
+    exportDlg = { w: set.width, h: set.height };
+  }
+  // B-2b: image size of the document (layers kept)
+  function openImageSize() {
+    openMenu = null;
+    const t = active;
+    const set = renderer?.activeSet;
+    if (!t?.meta || !set) { showToast("画像を開いてください"); return; }
+    if (set.hdr) { showToast("EXR / HDR の画像解像度の変更は未対応です"); return; }
+    const c = vs.canvasOf(t);
+    sizeDlg = { w: c.w, h: c.h, isPsd: isPsd(t.name) };
+  }
+  async function doImageSize(o: ImageSizeOptions) {
+    sizeDlg = null;
+    const t = active;
+    if (!t?.meta || !(await layersOf(t))) return;
+    const { w, h } = t.layers!.canvas;
+    showToast("拡大・縮小しています…");
+    try {
+      const m = await vs.resize(t, o.w, o.h, { filter: o.filter, scaleStyles: o.scaleStyles });
+      showToast(m ?? `画像解像度を変更しました（${w} × ${h} → ${t.layers!.canvas.w} × ${t.layers!.canvas.h}）`);
+    } catch (e) {
+      showToast(`拡大・縮小できませんでした: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   async function doExport(o: ExportOptions) {
     exportDlg = null;
@@ -446,7 +471,7 @@
     if ((t.tagName === "INPUT" || t.tagName === "TEXTAREA") && ((ctrl && ["a", "c", "x", "v", "z", "y"].includes(kk)) || k === "Delete" || k === "Backspace")) return;
     let handled = true;
     const cmp = vs.compare;
-    if (exportDlg || canvasDlg || colorDlg || choice) return; // the dialog handles its keys
+    if (exportDlg || canvasDlg || sizeDlg || colorDlg || choice) return; // the dialog handles its keys
     if (showHelp && (k === "Escape" || k === "F1")) { showHelp = false; e.preventDefault(); return; }
     if (k === "Escape" && openMenu) openMenu = null;
     else if (k === "Escape" && cmp) vs.stopCompare();
@@ -489,8 +514,8 @@
     }
     else if (!ctrl && !e.altKey && !e.shiftKey && TOOL_BY_KEY[kk] && active?.meta && !cmp) setAnnotTool(TOOL_BY_KEY[kk]);
     else if (ctrl && e.shiftKey && kk === "c") copyAnnotated();
-    else if (ctrl && e.altKey && e.shiftKey && kk === "w") openExport("export");
-    else if (ctrl && e.altKey && !e.shiftKey && kk === "i") openExport("size");
+    else if (ctrl && e.altKey && e.shiftKey && kk === "w") openExport();
+    else if (ctrl && e.altKey && !e.shiftKey && kk === "i") openImageSize();
     else if (ctrl && e.altKey && !e.shiftKey && kk === "c") openCanvas();
     else if (k === "F1") showHelp = !showHelp;
     else if (k === "F8") showAi = !showAi;
@@ -635,7 +660,7 @@
         <div class="menu-sep"></div>
         <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => { openMenu = null; save(false); }}>保存<span class="fdir">Ctrl+S</span></button>
         <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => { openMenu = null; save(true); }}>別名で保存…<span class="fdir">Ctrl+Shift+S</span></button>
-        <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => openExport("export")}>書き出し…<span class="fdir">Ctrl+Alt+Shift+W</span></button>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => openExport()}>書き出し…<span class="fdir">Ctrl+Alt+Shift+W</span></button>
         {#if isTauri()}
           <div class="menu-sep"></div>
           <button class="item cmd" role="menuitem" onclick={() => registerOpenWith(true)}>「プログラムから開く」に登録</button>
@@ -649,7 +674,7 @@
       onmouseenter={() => { if (openMenu && openMenu !== "edit") { openMenu = "edit"; sub = null; } }}>編集</button>
     {#if openMenu === "edit"}
       <div class="menu nav" role="menu">
-        <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => openExport("size")}>画像解像度…<span class="fdir">Ctrl+Alt+I</span></button>
+        <button class="item cmd" role="menuitem" disabled={!active?.meta} onclick={() => openImageSize()}>画像解像度…<span class="fdir">Ctrl+Alt+I</span></button>
         <button class="item cmd" role="menuitem" disabled={!active?.meta || !!vs.compare} onclick={async () => { openMenu = null; if (active && (await layersOf(active))) openCanvas(); }}>カンバスサイズ…<span class="fdir">Ctrl+Alt+C</span></button>
         <div class="sub-wrap" role="presentation" onmouseenter={() => (sub = "rotate")} onmouseleave={() => (sub = null)}>
           <button class="item cmd" class:hot={sub === "rotate"} role="menuitem" aria-haspopup="menu" disabled={!active?.meta || !!vs.compare} onclick={() => (sub = sub === "rotate" ? null : "rotate")}>画像の回転<span class="fdir">▸</span></button>
@@ -849,13 +874,14 @@
   {#if active?.loading}<div class="busy">読み込み中…</div>{/if}
   {#if toast}<div class="toast">{toast}</div>{/if}
   {#if exportDlg && active}
-    <ExportDialog w0={exportDlg.w} h0={exportDlg.h} name={active.name} mode={exportDlg.mode}
-      hasAnnotations={active.annot.shapes.length > 0} isPsd={isPsd(active.name)}
+    <ExportDialog w0={exportDlg.w} h0={exportDlg.h} name={active.name}
+      hasAnnotations={active.annot.shapes.length > 0}
       onexport={doExport} onclose={() => (exportDlg = null)} />
   {/if}
   {#if updateStatus}<div class="upd-back" role="presentation"><div class="upd-dlg" role="status">{updateStatus}</div></div>{/if}
   {#if choice}<ChoiceDialog text={choice.text} options={choice.options} onchoose={choice.resolve} />{/if}
   {#if canvasDlg}<CanvasDialog w0={canvasDlg.w} h0={canvasDlg.h} onapply={doCanvas} onclose={() => (canvasDlg = null)} />{/if}
+  {#if sizeDlg}<ImageSizeDialog w0={sizeDlg.w} h0={sizeDlg.h} isPsd={sizeDlg.isPsd} onapply={doImageSize} onclose={() => (sizeDlg = null)} />{/if}
   {#if showHelp}<HelpOverlay onclose={() => (showHelp = false)} />{/if}
   {#if showAi}<AiPanel {vs} tab={active} onclose={() => (showAi = false)} onmsg={showToast} />{/if}
   {#if showStats && meta}

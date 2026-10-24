@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::resample::{self, Axis, Edge, Filter};
+
 /// One node of the edited layer tree, bottom -> top (same shape as `PlanNode` in psdDoc.ts).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,30 +92,109 @@ pub struct SaveRequest {
     pub layer_count: u32,
     pub plan: Vec<PlanNode>,
     /// canvas size change: the file's layers move by (offset_x, offset_y) px; `width` / `height` are the new size
+    /// (fractions after a scaling)
     #[serde(default)]
-    pub offset_x: i32,
+    pub offset_x: f64,
     #[serde(default)]
-    pub offset_y: i32,
-    /// rotation / flip of the document (90° steps): the linear part [a, b, c, d] of x' = a x + b y + offset_x,
-    /// y' = c x + d y + offset_y (none: identity)
+    pub offset_y: f64,
+    /// rotation / flip (90° steps) and scaling of the document: the linear part [a, b, c, d] of
+    /// x' = a x + b y + offset_x, y' = c x + d y + offset_y (none: identity)
     #[serde(default)]
     pub xform: Option<[f64; 4]>,
+    /// how scaled channels are resampled: "nearest" / "bilinear" / "bicubic" (default)
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// layer styles (effects, shape strokes) scaled by this: their px sizes are multiplied (none: 1)
+    #[serde(default)]
+    pub style_scale: Option<f64>,
 }
 
 /// Canvas change applied to records copied from the file.
 #[derive(Clone, Copy)]
 /// A point of the old canvas goes to (m[0] x + m[1] y + dx, m[2] x + m[3] y + dy) on the new one: a canvas size
-/// change / crop (translation) and rotations / flips in 90° steps.
-struct Shift { dx: i32, dy: i32, m: [f64; 4], old_w: f64, old_h: f64, new_w: f64, new_h: f64 }
+/// change / crop (translation), rotations / flips in 90° steps and scaling (image size). `m` is always D R with R
+/// a rotation / flip and D = diag(sx, sy), sx, sy > 0 (see `split`).
+struct Shift {
+    dx: f64, dy: f64, m: [f64; 4], old_w: f64, old_h: f64, new_w: f64, new_h: f64,
+    /// resampling of scaled channels
+    filter: Filter,
+    /// factor for the px sizes of layer styles (1: unchanged)
+    style: f64,
+}
 
 const IDENTITY: [f64; 4] = [1.0, 0.0, 0.0, 1.0];
 
 impl Shift {
-    fn is_none(&self) -> bool { self.dx == 0 && self.dy == 0 && self.m == IDENTITY && self.old_w == self.new_w && self.old_h == self.new_h }
-    /// pixels are rearranged (not only moved)
+    fn is_none(&self) -> bool {
+        self.dx == 0.0 && self.dy == 0.0 && self.m == IDENTITY && self.old_w == self.new_w && self.old_h == self.new_h && self.style == 1.0
+    }
+    /// pixels are rearranged or resampled (not only moved): channels are decoded and written again
     fn turns(&self) -> bool { self.m != IDENTITY }
     fn pt(&self, x: f64, y: f64) -> (f64, f64) {
-        (self.m[0] * x + self.m[1] * y + self.dx as f64, self.m[2] * x + self.m[3] * y + self.dy as f64)
+        (self.m[0] * x + self.m[1] * y + self.dx, self.m[2] * x + self.m[3] * y + self.dy)
+    }
+}
+
+/// m = D R: (R as a signed permutation, sx, sy)
+fn split(m: [f64; 4]) -> ([f64; 4], f64, f64) {
+    let sg = |v: f64| if v < 0.0 { -1.0 } else { 1.0 };
+    if m[1] == 0.0 && m[2] == 0.0 { ([sg(m[0]), 0.0, 0.0, sg(m[3])], m[0].abs(), m[3].abs()) }
+    else { ([0.0, sg(m[1]), sg(m[2]), 0.0], m[1].abs(), m[2].abs()) }
+}
+
+/// How a plane covering the rectangle (x, y, w, h) of the old canvas becomes the plane of the new rectangle
+/// (`shift_rect` of it): turned exactly by R, then (when scaled) resampled along the axes.
+struct PlaneMap { r: Shift, nw: usize, nh: usize, ax: Axis, ay: Axis, resample: bool }
+
+fn plane_map(x: f64, y: f64, w: usize, h: usize, s: &Shift) -> PlaneMap {
+    let (r, sx, sy) = split(s.m);
+    let rs = Shift { dx: 0.0, dy: 0.0, m: r, ..*s };
+    let (wf, hf) = (w as f64, h as f64);
+    // the turned plane's origin (in R-space) and size
+    let (ax0, ay0) = rs.pt(x, y);
+    let (bx0, by0) = rs.pt(x + wf, y + hf);
+    let (ox, oy) = (ax0.min(bx0), ay0.min(by0));
+    let (tw, th) = if r[0] == 0.0 { (h, w) } else { (w, h) };
+    // the new rectangle, rounded as shift_rect rounds it
+    let (p0x, p0y) = s.pt(x, y);
+    let (p1x, p1y) = s.pt(x + wf, y + hf);
+    let (nx0, ny0) = (p0x.min(p1x).round(), p0y.min(p1y).round());
+    let (nx1, ny1) = (p0x.max(p1x).round(), p0y.max(p1y).round());
+    let (nw, nh) = ((nx1 - nx0).max(0.0) as usize, (ny1 - ny0).max(0.0) as usize);
+    let ax = Axis { n_in: tw, n_out: nw, k: sx, c: (nx0 - s.dx) / sx - ox };
+    let ay = Axis { n_in: th, n_out: nh, k: sy, c: (ny0 - s.dy) / sy - oy };
+    let resample = sx != 1.0 || sy != 1.0 || nw != tw || nh != th;
+    PlaneMap { r: rs, nw, nh, ax, ay, resample }
+}
+
+/// A plane of the rectangle (x, y, w, h) moved / turned / scaled with the document. Returns it and its size.
+fn transform_plane(old: &[u8], x: f64, y: f64, w: usize, h: usize, s: &Shift, edge: Edge) -> (Vec<u8>, usize, usize) {
+    let pm = plane_map(x, y, w, h, s);
+    let (t, tw, th) = turn_plane(old, w, h, &pm.r);
+    if !pm.resample { return (t, tw, th); }
+    (resample::plane(&t, tw, th, &pm.ax, &pm.ay, s.filter, edge), pm.nw, pm.nh)
+}
+
+/// the rectangle of a record (top, left, bottom, right) as (x, y)
+fn rect_origin(r: &[u8]) -> (f64, f64) {
+    if r.len() < 16 { return (0.0, 0.0); }
+    let g = |i: usize| i32::from_be_bytes(r[i * 4..i * 4 + 4].try_into().unwrap()) as f64;
+    (g(1), g(0))
+}
+
+/// multiplies the px values (unit floats "UntF#Pxl") of a descriptor by `k` (layer style sizes)
+fn scale_px_units(d: &mut [u8], k: f64) {
+    let key = b"UntF#Pxl";
+    let mut i = 0;
+    while i + key.len() + 8 <= d.len() {
+        if &d[i..i + key.len()] == key {
+            let p = i + key.len();
+            let v = f64::from_be_bytes(d[p..p + 8].try_into().unwrap());
+            d[p..p + 8].copy_from_slice(&(v * k).to_be_bytes());
+            i = p + 8;
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -238,6 +319,8 @@ impl Record {
         if s.turns() { self.blocks.retain(|b| &b.key != b"vogk"); }
         for b in &mut self.blocks {
             let d = &mut b.data;
+            // layer styles (effects) and shape strokes: px sizes scaled ("スタイルを拡大・縮小")
+            if s.style != 1.0 && matches!(&b.key, b"lfx2" | b"lmfx" | b"vstk") { scale_px_units(d, s.style); }
             match &b.key {
                 b"PlLd" if d.len() > 9 && &d[0..4] == b"plcL" => {
                     // the four corners (x, y)
@@ -783,30 +866,66 @@ impl<'a> Builder<'a> {
 
     fn layer_count(&self) -> u32 { self.by_id.len() as u32 }
 
-    /// The channels of file record `orig` selected by `keep`, in file order: copied as is, or (the document is turned)
-    /// decoded, turned and written again (RLE).
+    /// The channels of file record `orig` selected by `keep`, in file order: copied as is, or (the document is turned /
+    /// scaled) decoded, turned / resampled and written again (RLE). Scaled colour is filtered together with the
+    /// layer's transparency (premultiplied); masks are resampled with their default colour outside.
     fn kept(&mut self, orig: &Record, keep: impl Fn(i16) -> bool) -> Result<(Vec<(i16, u64)>, Vec<Part>), String> {
-        let turn = self.shift.filter(|s| s.turns());
+        let Some(s) = self.shift.filter(|s| s.turns()) else {
+            let (mut chans, mut parts) = (vec![], vec![]);
+            let mut off = orig.data_off;
+            for &(id, len) in &orig.channels {
+                if keep(id) { chans.push((id, len)); parts.push(Part::Copy(off, len)); }
+                off += len;
+            }
+            return Ok((chans, parts));
+        };
         let psb = self.src.psb;
-        let (mut chans, mut parts) = (vec![], vec![]);
+        let f = self.file.as_mut().ok_or("source file not open")?;
+        let mut planes: Vec<(i16, Vec<u8>)> = vec![];
         let mut off = orig.data_off;
         for &(id, len) in &orig.channels {
             if keep(id) {
-                match turn {
-                    Some(s) => {
-                        let f = self.file.as_mut().ok_or("source file not open")?;
-                        let raw = read_at(f, off, len as usize)?;
-                        let (w, h) = channel_size(orig, id);
-                        let plane = decode_channel(&raw, w, h, psb)?;
-                        let (np, nw, nh) = turn_plane(&plane, w, h, &s);
-                        let enc = encode_gray(&np, nw, nh, psb);
-                        chans.push((id, enc.len() as u64));
-                        parts.push(Part::Bytes(enc));
-                    }
-                    None => { chans.push((id, len)); parts.push(Part::Copy(off, len)); }
-                }
+                let raw = read_at(f, off, len as usize)?;
+                let (w, h) = channel_size(orig, id);
+                planes.push((id, decode_channel(&raw, w, h, psb)?));
             }
             off += len;
+        }
+        let (x, y) = rect_origin(&orig.rect);
+        let (w, h) = rect_size(&orig.rect);
+        let pm = plane_map(x, y, w, h, &s);
+        let has_alpha = orig.channels.iter().any(|c| c.0 == -1);
+        let mut done: HashMap<i16, (Vec<u8>, usize, usize)> = HashMap::new();
+        if pm.resample && w > 0 && h > 0 {
+            if let Some(a) = planes.iter().find(|p| p.0 == -1) {
+                // colour with its transparency
+                let (ta, tw, th) = turn_plane(&a.1, w, h, &pm.r);
+                let colors: Vec<(i16, Vec<u8>)> = planes.iter().filter(|p| p.0 >= 0).map(|p| (p.0, turn_plane(&p.1, w, h, &pm.r).0)).collect();
+                let refs: Vec<&[u8]> = colors.iter().map(|c| c.1.as_slice()).collect();
+                let (na, nc) = resample::with_alpha(&ta, &refs, tw, th, &pm.ax, &pm.ay, s.filter);
+                done.insert(-1, (na, pm.nw, pm.nh));
+                for ((id, _), p) in colors.iter().zip(nc) { done.insert(*id, (p, pm.nw, pm.nh)); }
+            }
+        }
+        let n = orig.mask.len();
+        let (mut chans, mut parts) = (vec![], vec![]);
+        for (id, plane) in planes {
+            let (np, nw, nh) = match done.remove(&id) {
+                Some(v) => v,
+                None => {
+                    let (rx, ry, edge) = match id {
+                        -2 => { let (a, b) = rect_origin(&orig.mask[0..16]); (a, b, Edge::Const(orig.mask[16] as f32)) }
+                        -3 => { let (a, b) = rect_origin(&orig.mask[n - 16..n]); (a, b, Edge::Const(orig.mask[n - 17] as f32)) }
+                        _ if has_alpha => (x, y, Edge::Const(0.0)),
+                        _ => (x, y, Edge::Clamp), // a background layer: no transparency, the edge repeats
+                    };
+                    let (cw, ch) = channel_size(orig, id);
+                    transform_plane(&plane, rx, ry, cw, ch, &s, edge)
+                }
+            };
+            let enc = encode_gray(&np, nw, nh, psb);
+            chans.push((id, enc.len() as u64));
+            parts.push(Part::Bytes(enc));
         }
         Ok((chans, parts))
     }
@@ -1157,8 +1276,8 @@ fn shift_guides(block: &[u8], s: Shift) -> Vec<u8> {
         // 0 = vertical guide (x = v), 1 = horizontal (y = v); a quarter turn makes one the other
         let [a, bb, c, d] = s.m;
         let (nv, vertical) = if b[o + 4] == 0 {
-            if bb == 0.0 && a != 0.0 { (a * v + s.dx as f64, true) } else { (c * v + s.dy as f64, false) }
-        } else if c == 0.0 && d != 0.0 { (d * v + s.dy as f64, false) } else { (bb * v + s.dx as f64, true) };
+            if bb == 0.0 && a != 0.0 { (a * v + s.dx, true) } else { (c * v + s.dy, false) }
+        } else if c == 0.0 && d != 0.0 { (d * v + s.dy, false) } else { (bb * v + s.dx, true) };
         b[o..o + 4].copy_from_slice(&((nv * 32.0).round() as i32).to_be_bytes());
         b[o + 4] = if vertical { 0 } else { 1 };
     }
@@ -1168,19 +1287,24 @@ fn shift_guides(block: &[u8], s: Shift) -> Vec<u8> {
 /// Extra channels (alpha / spot) of the original merged image, as RLE rows.
 fn extra_rows(f: &mut File, src: &Source, first: usize, canvas: Option<(Shift, usize, usize)>) -> Result<Vec<Vec<u8>>, String> {
     if let Some((s, nw, nh)) = canvas {
-        // canvas size changed: decode each extra plane, place it at the offset in a new plane (0 outside), re-encode
+        // canvas changed: decode each extra plane, turn / scale it, place it in a new plane (0 outside), re-encode
         let rows = extra_rows(f, src, first, None)?;
         let (w, h) = (src.width as usize, src.height as usize);
         let mut out = vec![];
         for plane in rows.chunks(h.max(1)) {
             let mut old = vec![0u8; w * h];
             for (y, r) in plane.iter().enumerate() { unpack_bits(r, &mut old[y * w..(y + 1) * w])?; }
+            let (p, pw, ph) = transform_plane(&old, 0.0, 0.0, w, h, &s, Edge::Clamp);
+            let (p0x, p0y) = s.pt(0.0, 0.0);
+            let (p1x, p1y) = s.pt(w as f64, h as f64);
+            let (ox, oy) = (p0x.min(p1x).round() as i64, p0y.min(p1y).round() as i64);
             let mut new = vec![0u8; nw * nh];
-            for y in 0..h {
-                for x in 0..w {
-                    let (fx, fy) = s.pt(x as f64 + 0.5, y as f64 + 0.5);
-                    let (nx, ny) = (fx.floor() as i64, fy.floor() as i64);
-                    if nx >= 0 && nx < nw as i64 && ny >= 0 && ny < nh as i64 { new[ny as usize * nw + nx as usize] = old[y * w + x]; }
+            for y in 0..ph {
+                let ny = y as i64 + oy;
+                if ny < 0 || ny >= nh as i64 { continue; }
+                for x in 0..pw {
+                    let nx = x as i64 + ox;
+                    if nx >= 0 && nx < nw as i64 { new[ny as usize * nw + nx as usize] = p[y * pw + x]; }
                 }
             }
             for y in 0..nh {
@@ -1262,13 +1386,16 @@ fn encode_rle(px: &[u8], w: usize, h: usize, cb: usize) -> Vec<u8> {
     data
 }
 
-/// a channel of a smart filter cache turned with the document (any compression in, RLE out)
-fn turn_cache_channel(d: &[u8], w: usize, h: usize, s: &Shift) -> Result<Vec<u8>, String> {
+/// a channel of a smart filter cache (covering `rect`) turned / scaled with the document (any compression in, RLE
+/// out). The cache is resampled per channel with the edge repeated.
+fn turn_cache_channel(d: &[u8], rect: &[u8], s: &Shift) -> Result<Vec<u8>, String> {
+    let (w, h) = rect_size(rect);
     if w == 0 || h == 0 || d.len() < 2 { return Ok(d.to_vec()); }
+    let (x, y) = rect_origin(rect);
     let comp = u16::from_be_bytes([d[0], d[1]]);
     let cb = if comp == 1 { rle_count_width(d, h) } else { 4 };
     let plane = decode_channel(d, w, h, cb == 4)?;
-    let (np, nw, nh) = turn_plane(&plane, w, h, s);
+    let (np, nw, nh) = transform_plane(&plane, x, y, w, h, s, Edge::Clamp);
     Ok(encode_rle(&np, nw, nh, cb))
 }
 
@@ -1298,11 +1425,11 @@ fn shift_filter_effects(d: &[u8], s: Shift) -> Result<Vec<u8>, String> {
         // rectangle, depth, max channels, channels
         let mut body = vec![];
         let mut rect: [u8; 16] = d[s2..s2 + 16].try_into().unwrap();
-        let (w, h) = rect_size(&rect);
+        let old_rect = rect;
         shift_rect(&mut rect, s);
         body.extend_from_slice(&rect);
         body.extend_from_slice(&d[s2 + 16..s2 + 24]);
-        if be32(s2 + 16) != 8 && s.turns() { return err("8 bit 以外のスマートフィルターの回転は未対応です"); }
+        if be32(s2 + 16) != 8 && s.turns() { return err("8 bit 以外のスマートフィルターの回転・拡大縮小は未対応です"); }
         let maxc = be32(s2 + 20) as usize;
         let mut q = s2 + 24;
         for _ in 0..maxc + 2 {
@@ -1315,7 +1442,7 @@ fn shift_filter_effects(d: &[u8], s: Shift) -> Result<Vec<u8>, String> {
             let cl = be64(q) as usize;
             need(q + 8, cl)?;
             let ch = &d[q + 8..q + 8 + cl];
-            let nc = if s.turns() { turn_cache_channel(ch, w, h, &s)? } else { ch.to_vec() };
+            let nc = if s.turns() { turn_cache_channel(ch, &old_rect, &s)? } else { ch.to_vec() };
             body.extend_from_slice(&(nc.len() as u64).to_be_bytes());
             body.extend_from_slice(&nc);
             q += 8 + cl;
@@ -1332,12 +1459,12 @@ fn shift_filter_effects(d: &[u8], s: Shift) -> Result<Vec<u8>, String> {
             if written != 0 {
                 need(x, 26)?;
                 let mut mrect: [u8; 16] = d[x..x + 16].try_into().unwrap();
-                let (mw, mh) = rect_size(&mrect);
+                let old_mrect = mrect;
                 shift_rect(&mut mrect, s);
                 let ml = be64(x + 16) as usize;
                 need(x + 24, ml)?;
                 let ch = &d[x + 24..x + 24 + ml];
-                let nc = if s.turns() { turn_cache_channel(ch, mw, mh, &s)? } else { ch.to_vec() };
+                let nc = if s.turns() { turn_cache_channel(ch, &old_mrect, &s)? } else { ch.to_vec() };
                 e.extend_from_slice(&mrect);
                 e.extend_from_slice(&(nc.len() as u64).to_be_bytes());
                 e.extend_from_slice(&nc);
@@ -1496,6 +1623,8 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         let shift = Shift {
             dx: req.offset_x, dy: req.offset_y, m: req.xform.unwrap_or(IDENTITY),
             old_w: src.width as f64, old_h: src.height as f64, new_w: req.width as f64, new_h: req.height as f64,
+            filter: Filter::from_name(req.filter.as_deref().unwrap_or("bicubic")),
+            style: req.style_scale.unwrap_or(1.0),
         };
         if src.psb != is_psb_path(&req.dst) {
             return err("PSD と PSB の相互変換は未対応です（拡張子を元と同じにしてください）");
@@ -1505,7 +1634,7 @@ pub fn save(req: &SaveRequest, rgba: &[u8], pixels: &[u8]) -> Result<SaveResult,
         if !shift.is_none() { b.shift = Some(shift); }
         if shift.turns() {
             let depth = u16::from_be_bytes([src.header[22], src.header[23]]);
-            if depth != 8 { return err("8 bit 以外の文書の回転・反転は未対応です"); }
+            if depth != 8 { return err("8 bit 以外の文書の回転・反転・画像解像度の変更は未対応です"); }
             b.file = Some(File::open(&req.src).map_err(|e| format!("{}: {e}", req.src))?);
         }
         if b.layer_count() != req.layer_count {
